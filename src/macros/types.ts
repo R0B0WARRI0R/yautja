@@ -1,0 +1,150 @@
+import type { BrowserAction } from '../arsenal/action-types.js';
+
+/** Minimal JSON-schema-like shape for macro argument validation. */
+export interface ArgsSchema {
+  type: 'object';
+  properties: Record<string, { type: 'string' | 'number' | 'boolean'; description?: string }>;
+  required?: string[];
+}
+
+/** A macro definition exported as `default` from a built-in or user macro module. */
+export interface MacroDef<Args = Record<string, never>, Result = unknown> {
+  name: string;
+  description: string;
+  argsSchema?: ArgsSchema;
+  timeoutMs?: number;
+  run(args: Args, ctx: MacroContext): Promise<Result>;
+}
+
+/** Curated, typed subset of Helmet methods exposed to macros. */
+export interface MacroContext {
+  // Tabs
+  openTab(url: string): Promise<string>;
+  switchTab(tabId: number): Promise<string>;
+  closeTab(tabId: number): Promise<string>;
+  reattach(): Promise<string>;
+
+  // Observation
+  observe(question: string): Promise<string>;
+  inspect(domain: 'network' | 'dom' | 'console' | 'performance' | 'security'): Promise<string>;
+  diff(): Promise<string>;
+
+  // Action
+  act(action: BrowserAction): Promise<string>;
+
+  // Smart finding + typing
+  findElement(query: string, limit?: number): Promise<string>;
+  findClick(query: string): Promise<string>;
+  findType(query: string, text: string): Promise<string>;
+  smartType(query: string, text: string, opts?: { submit?: boolean; stealth?: boolean }): Promise<string>;
+
+  // Tech & stealth
+  techScan(): Promise<string>;
+  stealthCheck(): Promise<string>;
+  stealthEnable(): Promise<string>;
+  stealthDisable(): Promise<string>;
+
+  // Interception
+  interceptEnable(): Promise<string>;
+  interceptAddRule(rule: unknown): Promise<string>;
+  interceptDisable(): Promise<string>;
+  interceptLog(limit?: number): Promise<string>;
+
+  // Capture
+  captureList(filter?: { urlPattern?: string; method?: string; hasMatches?: boolean; limit?: number }): Promise<string>;
+  captureRequest(requestId: string): Promise<string>;
+  captureResponse(requestId: string): Promise<string>;
+
+  // Intel
+  osintHarvest(): Promise<string>;
+  netIntel(): Promise<string>;
+  gqlQuery(opts: { endpoint?: string; query?: string; hash?: string; operationName?: string; variables?: Record<string, unknown>; headers?: Record<string, string> }): Promise<string>;
+
+  // Site memory
+  siteMemory(): Promise<string>;
+  siteMemoryClear(domain?: string): Promise<string>;
+
+  // WebSocket
+  wsWatch(): Promise<string>;
+  wsFrames(filter?: { connectionId?: string; direction?: 'sent' | 'received'; search?: string; limit?: number }): Promise<string>;
+
+  // Utility (macro-only, not on Helmet)
+  sleep(ms: number): Promise<void>;
+  log(message: string): void;
+}
+
+/** Subset of Helmet that MacroRunner needs.
+ *  Helmet implicitly satisfies this — listed here for type-checking.
+ *  Note: `sleep` and `log` are macro-runtime utilities, NOT on Helmet. */
+export interface HelmetLike {
+  openTab(url: string): Promise<string>;
+  switchTab(tabId: number): Promise<string>;
+  closeTab(tabId: number): Promise<string>;
+  reattach(): Promise<string>;
+  observe(question: string): Promise<string>;
+  inspect(domain: string): Promise<string>;
+  diff(): Promise<string>;
+  act(action: BrowserAction): Promise<string>;
+  findElement(query: string, limit?: number): Promise<string>;
+  findClick(query: string): Promise<string>;
+  findType(query: string, text: string): Promise<string>;
+  smartType(query: string, text: string, opts?: { submit?: boolean; stealth?: boolean }): Promise<string>;
+  techScan(): Promise<string>;
+  stealthCheck(): Promise<string>;
+  stealthEnable(): Promise<string>;
+  stealthDisable(): Promise<string>;
+  interceptEnable(): Promise<string>;
+  interceptAddRule(rule: any): Promise<string>;
+  interceptDisable(): Promise<string>;
+  interceptLog(limit?: number): Promise<string>;
+  captureList(filter?: any): Promise<string>;
+  captureRequest(requestId: string): Promise<string>;
+  captureResponse(requestId: string): Promise<string>;
+  osintHarvest(): Promise<string>;
+  netIntel(): Promise<string>;
+  gqlQuery(opts: any): Promise<string>;
+  siteMemory(): Promise<string>;
+  siteMemoryClear(domain?: string): Promise<string>;
+  wsWatch(): Promise<string>;
+  wsFrames(filter?: any): Promise<string>;
+}
+
+/** One row returned by `macro_list`. */
+export interface MacroSummary {
+  name: string;
+  description: string;
+  source: MacroSource;
+  hasArgs: boolean;
+  timeoutMs?: number;
+}
+
+export type MacroSource = 'builtin' | 'user';
+
+/** Internal registry entry. */
+export interface MacroRegistryEntry {
+  def: MacroDef;
+  source: MacroSource;
+  file?: string;
+  loadedAt: number;
+}
+
+/** Result of `MacroRunner.run`. */
+export type RunResult =
+  | { success: true; result: unknown; log: string[]; elapsedMs: number; macro: MacroSummary }
+  | { success: false; error: string; stage: 'lookup' | 'validation' | 'execution' | 'timeout'; stack?: string; log?: string[]; elapsedMs?: number; macro?: MacroSummary };
+
+/** Result of `MacroRunner.registerUserMacro` (writes user file). */
+export type RegisterResult =
+  | { success: true; name: string; source: 'user'; file: string }
+  | { success: false; error: string; stage: 'validation' | 'persistence' | 'import' | 'shape' };
+
+/** Result of `MacroRunner.deleteUserMacro`. */
+export type DeleteResult =
+  | { success: true; name: string; removedFile: string }
+  | { success: false; error: string; stage: 'permission' | 'lookup' | 'io' };
+
+/** Default per-call and per-macro timeout (ms). */
+export const DEFAULT_MACRO_TIMEOUT_MS = 60_000;
+
+/** Pattern that macro names must match (filename-safe). */
+export const MACRO_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
