@@ -103,3 +103,26 @@ describe('Helmet macro tools (tools/list + tool routing)', () => {
     expect(r.stage).toBe('validation');
   });
 });
+
+describe('buildCtx integration — real ctx methods called by macro', () => {
+  // Note: This test uses the same spawn() helper and Helmet instance as above.
+  // The mock extension-server's send() returns {}, which is fine — the macro just needs
+  // to be invoked without TypeError. We register the macro inline via a macro_register call.
+
+  it('invokes a macro that calls ctx.observe without TypeError', async () => {
+    const { stdin, out } = spawn();
+    try {
+      const src = `export default { name: 'smoke', description: 'smoke', async run(_a, ctx) { const o = await ctx.observe('overview'); return { ok: true, o }; } };`;
+      const regResp = await send(stdin, out, { jsonrpc: '2.0', id: 100, method: 'tools/call', params: { name: 'macro_register', arguments: { name: 'smoke', source: src } } });
+      const regResult = JSON.parse(regResp.result.content[0].text);
+      expect(regResult.success).toBe(true);
+
+      const runResp = await send(stdin, out, { jsonrpc: '2.0', id: 101, method: 'tools/call', params: { name: 'macro_run', arguments: { name: 'smoke' } } });
+      const runResult = JSON.parse(runResp.result.content[0].text);
+      expect(runResult.success).toBe(true);
+      expect(runResult.result.ok).toBe(true);
+    } finally {
+      teardown();
+    }
+  });
+});

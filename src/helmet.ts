@@ -26,7 +26,6 @@ import { LearningLoop } from './intel/learning-loop.js';
 import { NetworkCapture } from './intel/network-capture.js';
 import { MacroRunner } from './macros/runner.js';
 import { loadBuiltins, loadUserMacros } from './macros/loader.js';
-import type { HelmetLike } from './macros/types.js';
 import type { BrowserState } from './memory/browser-state.js';
 import type { Anomaly } from './vision/base-sensor.js';
 import type { BrowserAction } from './arsenal/action-types.js';
@@ -122,7 +121,7 @@ export class Helmet {
       this.server, this.hashSeedDB, this.patternDetector, this.hashLearner, this.browserInterceptor
     );
     this.networkCapture = new NetworkCapture(this.server);
-    this.macroRunner = new MacroRunner(this as unknown as HelmetLike);
+    this.macroRunner = new MacroRunner(this);
     this.server.setNetworkCaptureCallback((msg: any) => {
       if (msg.action === 'add' && msg.entry) {
         this.networkCapture.storeRequest(msg.entry);

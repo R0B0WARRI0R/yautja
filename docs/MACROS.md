@@ -75,16 +75,9 @@ Macros receive a `ctx` with these methods (all return `Promise<string>` containi
 
 | Category | Methods |
 |----------|---------|
-| Navigation | `openTab(url)`, `switchTab(tabId)`, `closeTab(tabId)`, `reattach()` |
 | Observation | `observe(question)`, `inspect(domain)`, `diff()` |
 | Action | `act(action)` — any `BrowserAction` from `src/arsenal/action-types.ts` |
-| Smart finding | `findElement(query, limit?)`, `findClick(query)`, `findType(query, text)`, `smartType(query, text, opts?)` |
-| Tech & stealth | `techScan()`, `stealthCheck()`, `stealthEnable()`, `stealthDisable()` |
-| Interception | `interceptEnable()`, `interceptAddRule(rule)`, `interceptDisable()`, `interceptLog(limit?)` |
-| Capture | `captureList(filter?)`, `captureRequest(requestId)`, `captureResponse(requestId)` |
-| Intel | `osintHarvest()`, `netIntel()`, `gqlQuery(opts)` |
-| Site memory | `siteMemory()`, `siteMemoryClear(domain?)` |
-| WebSocket | `wsWatch()`, `wsFrames(filter?)` |
+| Tab control | `reattach()` |
 | Utility | `sleep(ms)`, `log(message)` |
 
 ## Validation
@@ -117,11 +110,11 @@ Each macro can declare `timeoutMs` (default 60000). Override per-call via `macro
 
 ## Built-in macro: page-summary
 
-The seed built-in combines `observe("summary")` with `techScan()` for a quick page overview:
+The seed built-in calls `observe("summary")` for a focused page overview:
 
 ```
 macro_run({ name: "page-summary" })
-→ { success: true, result: { observation: "...", tech: "..." }, log: ["gathering observation", "scanning tech stack"], elapsedMs: 423, macro: {...} }
+→ { success: true, result: { observation: "..." }, log: ["gathering observation"], elapsedMs: 423, macro: {...} }
 ```
 
 ## File locations
@@ -133,6 +126,10 @@ macro_run({ name: "page-summary" })
 
 Linux/macOS equivalent of `%APPDATA%`: `$HOME` (typically `~/.yautja-macros/`).
 
-## Known limitations
+## Available `ctx.*` methods
 
-- **HelmetLike interface gap**: macros can call `ctx.observe`, `ctx.techScan`, `ctx.act`, `ctx.inspect`, `ctx.diff` (these are real Helmet instance methods). Other `ctx.*` methods exist in the type but not yet as Helmet instance methods — calling them at runtime throws `TypeError: ctx.X is not a function`. To extend: implement the missing methods on `Helmet` or refactor to route through `handleToolCall`. Tracked for follow-up.
+Macros can only call the methods listed in the [MacroContext API](#macrocontext-api) section. Other Helmet capabilities (e.g. `openTab`, `switchTab`, `findElement`, `smartType`, `interceptEnable`, etc.) are not yet exposed as instance methods on `Helmet` and are therefore NOT callable as `ctx.X` — doing so will throw `TypeError: ctx.X is not a function` at runtime.
+
+Workaround for now: dispatch via `ctx.act` with a `BrowserAction` (e.g. `{ type: 'evaluate', expression: 'window.location.href = "..."' }`).
+
+Roadmap: as more Helmet instance methods are added (or as Helmet routes through `handleToolCall` more broadly), `MacroContext` will be extended. To check what's currently safe: `grep -nE '^\s*async\s+[a-z][a-zA-Z0-9_]*\s*\(' src/helmet.ts`.

@@ -4,8 +4,13 @@ import { pathToFileURL } from 'url';
 import type { RegisterResult, DeleteResult } from './types.js';
 import { MACRO_NAME_PATTERN } from './types.js';
 import { resolveUserDir } from './loader.js';
-import type { ArgsSchema, HelmetLike, MacroContext, MacroDef, MacroRegistryEntry, MacroSource, MacroSummary, RunResult } from './types.js';
+import type { ArgsSchema, MacroContext, MacroDef, MacroRegistryEntry, MacroSource, MacroSummary, RunResult } from './types.js';
 import { DEFAULT_MACRO_TIMEOUT_MS } from './types.js';
+import type { BrowserAction } from '../arsenal/action-types.js';
+
+/** Inline duck-typed surface required by MacroRunner — exactly the 5 Helmet
+ *  instance methods the curated MacroContext exposes. Avoids a separate interface. */
+type HostSurface = Pick<MacroContext, 'observe' | 'act' | 'inspect' | 'diff' | 'reattach'>;
 
 class TimeoutError extends Error {
   constructor(ms: number) {
@@ -17,7 +22,7 @@ class TimeoutError extends Error {
 export class MacroRunner {
   private registry = new Map<string, MacroRegistryEntry>();
 
-  constructor(private readonly host: HelmetLike) {
+  constructor(private readonly host: HostSurface) {
     // host is now used in buildCtx() below; the Task-2 `void this.host;` workaround is removed.
   }
 
@@ -208,36 +213,11 @@ export class MacroRunner {
   private buildCtx(logBuffer: string[]): MacroContext {
     const h = this.host;
     return {
-      openTab: (u: string) => h.openTab(u),
-      switchTab: (t: number) => h.switchTab(t),
-      closeTab: (t: number) => h.closeTab(t),
-      reattach: () => h.reattach(),
       observe: (q: string) => h.observe(q),
-      inspect: (d: any) => h.inspect(d),
+      act: (a: BrowserAction) => h.act(a),
+      inspect: (d: 'network' | 'dom' | 'console' | 'performance' | 'security') => h.inspect(d),
       diff: () => h.diff(),
-      act: (a: any) => h.act(a),
-      findElement: (q: string, l?: number) => h.findElement(q, l),
-      findClick: (q: string) => h.findClick(q),
-      findType: (q: string, t: string) => h.findType(q, t),
-      smartType: (q: string, t: string, o?: any) => h.smartType(q, t, o),
-      techScan: () => h.techScan(),
-      stealthCheck: () => h.stealthCheck(),
-      stealthEnable: () => h.stealthEnable(),
-      stealthDisable: () => h.stealthDisable(),
-      interceptEnable: () => h.interceptEnable(),
-      interceptAddRule: (r: unknown) => h.interceptAddRule(r as any),
-      interceptDisable: () => h.interceptDisable(),
-      interceptLog: (l?: number) => h.interceptLog(l),
-      captureList: (f?: any) => h.captureList(f),
-      captureRequest: (i: string) => h.captureRequest(i),
-      captureResponse: (i: string) => h.captureResponse(i),
-      osintHarvest: () => h.osintHarvest(),
-      netIntel: () => h.netIntel(),
-      gqlQuery: (o: any) => h.gqlQuery(o),
-      siteMemory: () => h.siteMemory(),
-      siteMemoryClear: (d?: string) => h.siteMemoryClear(d),
-      wsWatch: () => h.wsWatch(),
-      wsFrames: (f?: any) => h.wsFrames(f),
+      reattach: () => h.reattach(),
       sleep: (ms: number) => new Promise<void>(r => setTimeout(r, ms)),
       log: (m: string) => { logBuffer.push(m); },
     };

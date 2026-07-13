@@ -1,0 +1,328 @@
+﻿git : warning: in the working copy of 'docs/MACROS.md', LF will be replaced by CRLF the next time Git touches it
+En línea: 1 Carácter: 229
++ ... | Out-Null; git diff 325946f -- src/macros/types.ts src/macros/runner ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: in the working copy of 'src/macros/page-summary.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/macros/runner.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/macros/types.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/macros/helmet-integration.test.ts', LF will be replaced by CRLF the next time 
+Git touches it
+diff --git a/docs/MACROS.md b/docs/MACROS.md
+index 31e62f6..f46ba6e 100644
+--- a/docs/MACROS.md
++++ b/docs/MACROS.md
+@@ -75,16 +75,9 @@ Macros receive a `ctx` with these methods (all return `Promise<string>` containi
+ 
+ | Category | Methods |
+ |----------|---------|
+-| Navigation | `openTab(url)`, `switchTab(tabId)`, `closeTab(tabId)`, `reattach()` |
+ | Observation | `observe(question)`, `inspect(domain)`, `diff()` |
+ | Action | `act(action)` ÔÇö any `BrowserAction` from `src/arsenal/action-types.ts` |
+-| Smart finding | `findElement(query, limit?)`, `findClick(query)`, `findType(query, text)`, `smartType(query, text, opts?)` |
+-| Tech & stealth | `techScan()`, `stealthCheck()`, `stealthEnable()`, `stealthDisable()` |
+-| Interception | `interceptEnable()`, `interceptAddRule(rule)`, `interceptDisable()`, `interceptLog(limit?)` |
+-| Capture | `captureList(filter?)`, `captureRequest(requestId)`, `captureResponse(requestId)` |
+-| Intel | `osintHarvest()`, `netIntel()`, `gqlQuery(opts)` |
+-| Site memory | `siteMemory()`, `siteMemoryClear(domain?)` |
+-| WebSocket | `wsWatch()`, `wsFrames(filter?)` |
++| Tab control | `reattach()` |
+ | Utility | `sleep(ms)`, `log(message)` |
+ 
+ ## Validation
+@@ -117,11 +110,11 @@ Each macro can declare `timeoutMs` (default 60000). Override per-call via `macro
+ 
+ ## Built-in macro: page-summary
+ 
+-The seed built-in combines `observe("summary")` with `techScan()` for a quick page overview:
++The seed built-in calls `observe("summary")` for a focused page overview:
+ 
+ ```
+ macro_run({ name: "page-summary" })
+-ÔåÆ { success: true, result: { observation: "...", tech: "..." }, log: ["gathering observation", "scanning tech stack"], elapsedMs: 423, macro: {...} }
++ÔåÆ { success: true, result: { observation: "..." }, log: ["gathering observation"], elapsedMs: 423, macro: {...} }
+ ```
+ 
+ ## File locations
+@@ -133,6 +126,10 @@ macro_run({ name: "page-summary" })
+ 
+ Linux/macOS equivalent of `%APPDATA%`: `$HOME` (typically `~/.yautja-macros/`).
+ 
+-## Known limitations
++## Available `ctx.*` methods
+ 
+-- **HelmetLike interface gap**: macros can call `ctx.observe`, `ctx.techScan`, `ctx.act`, `ctx.inspect`, `ctx.diff` (these are real Helmet instance methods). Other `ctx.*` methods exist in the type but not yet as Helmet instance methods ÔÇö calling them at runtime throws `TypeError: ctx.X is not a function`. To extend: implement the missing methods on `Helmet` or refactor to route through `handleToolCall`. Tracked for follow-up.
++Macros can only call the methods listed in the [MacroContext API](#macrocontext-api) section. Other Helmet capabilities (e.g. `openTab`, `switchTab`, `findElement`, `smartType`, `interceptEnable`, etc.) are not yet exposed as instance methods on `Helmet` and are therefore NOT callable as `ctx.X` ÔÇö doing so will throw `TypeError: ctx.X is not a function` at runtime.
++
++Workaround for now: dispatch via `ctx.act` with a `BrowserAction` (e.g. `{ type: 'evaluate', expression: 'window.location.href = "..."' }`).
++
++Roadmap: as more Helmet instance methods are added (or as Helmet routes through `handleToolCall` more broadly), `MacroContext` will be extended. To check what's currently safe: `grep -nE '^\s*async\s+[a-z][a-zA-Z0-9_]*\s*\(' src/helmet.ts`.
+diff --git a/src/helmet.ts b/src/helmet.ts
+index 0dc23d0..6509929 100644
+--- a/src/helmet.ts
++++ b/src/helmet.ts
+@@ -26,7 +26,6 @@ import { LearningLoop } from './intel/learning-loop.js';
+ import { NetworkCapture } from './intel/network-capture.js';
+ import { MacroRunner } from './macros/runner.js';
+ import { loadBuiltins, loadUserMacros } from './macros/loader.js';
+-import type { HelmetLike } from './macros/types.js';
+ import type { BrowserState } from './memory/browser-state.js';
+ import type { Anomaly } from './vision/base-sensor.js';
+ import type { BrowserAction } from './arsenal/action-types.js';
+@@ -122,7 +121,7 @@ export class Helmet {
+       this.server, this.hashSeedDB, this.patternDetector, this.hashLearner, this.browserInterceptor
+     );
+     this.networkCapture = new NetworkCapture(this.server);
+-    this.macroRunner = new MacroRunner(this as unknown as HelmetLike);
++    this.macroRunner = new MacroRunner(this);
+     this.server.setNetworkCaptureCallback((msg: any) => {
+       if (msg.action === 'add' && msg.entry) {
+         this.networkCapture.storeRequest(msg.entry);
+diff --git a/src/macros/page-summary.ts b/src/macros/page-summary.ts
+index c814407..c750d16 100644
+--- a/src/macros/page-summary.ts
++++ b/src/macros/page-summary.ts
+@@ -3,13 +3,11 @@ import type { MacroDef } from './types.js';
+ 
+ export default {
+   name: 'page-summary',
+-  description: 'Combine observe("summary") with techScan() for a quick page overview.',
++  description: 'Capture a focused page summary via observe("summary").',
+   timeoutMs: 15_000,
+   async run(_args, ctx) {
+     ctx.log('gathering observation');
+     const observation = await ctx.observe('summary');
+-    ctx.log('scanning tech stack');
+-    const tech = await ctx.techScan();
+-    return { observation, tech };
++    return { observation };
+   },
+ } satisfies MacroDef;
+diff --git a/src/macros/runner.ts b/src/macros/runner.ts
+index 2c78361..d91dd5c 100644
+--- a/src/macros/runner.ts
++++ b/src/macros/runner.ts
+@@ -4,8 +4,13 @@ import { pathToFileURL } from 'url';
+ import type { RegisterResult, DeleteResult } from './types.js';
+ import { MACRO_NAME_PATTERN } from './types.js';
+ import { resolveUserDir } from './loader.js';
+-import type { ArgsSchema, HelmetLike, MacroContext, MacroDef, MacroRegistryEntry, MacroSource, MacroSummary, RunResult } from './types.js';
++import type { ArgsSchema, MacroContext, MacroDef, MacroRegistryEntry, MacroSource, MacroSummary, RunResult } from './types.js';
+ import { DEFAULT_MACRO_TIMEOUT_MS } from './types.js';
++import type { BrowserAction } from '../arsenal/action-types.js';
++
++/** Inline duck-typed surface required by MacroRunner ÔÇö exactly the 5 Helmet
++ *  instance methods the curated MacroContext exposes. Avoids a separate interface. */
++type HostSurface = Pick<MacroContext, 'observe' | 'act' | 'inspect' | 'diff' | 'reattach'>;
+ 
+ class TimeoutError extends Error {
+   constructor(ms: number) {
+@@ -17,7 +22,7 @@ class TimeoutError extends Error {
+ export class MacroRunner {
+   private registry = new Map<string, MacroRegistryEntry>();
+ 
+-  constructor(private readonly host: HelmetLike) {
++  constructor(private readonly host: HostSurface) {
+     // host is now used in buildCtx() below; the Task-2 `void this.host;` workaround is removed.
+   }
+ 
+@@ -208,36 +213,11 @@ export class MacroRunner {
+   private buildCtx(logBuffer: string[]): MacroContext {
+     const h = this.host;
+     return {
+-      openTab: (u: string) => h.openTab(u),
+-      switchTab: (t: number) => h.switchTab(t),
+-      closeTab: (t: number) => h.closeTab(t),
+-      reattach: () => h.reattach(),
+       observe: (q: string) => h.observe(q),
+-      inspect: (d: any) => h.inspect(d),
++      act: (a: BrowserAction) => h.act(a),
++      inspect: (d: 'network' | 'dom' | 'console' | 'performance' | 'security') => h.inspect(d),
+       diff: () => h.diff(),
+-      act: (a: any) => h.act(a),
+-      findElement: (q: string, l?: number) => h.findElement(q, l),
+-      findClick: (q: string) => h.findClick(q),
+-      findType: (q: string, t: string) => h.findType(q, t),
+-      smartType: (q: string, t: string, o?: any) => h.smartType(q, t, o),
+-      techScan: () => h.techScan(),
+-      stealthCheck: () => h.stealthCheck(),
+-      stealthEnable: () => h.stealthEnable(),
+-      stealthDisable: () => h.stealthDisable(),
+-      interceptEnable: () => h.interceptEnable(),
+-      interceptAddRule: (r: unknown) => h.interceptAddRule(r as any),
+-      interceptDisable: () => h.interceptDisable(),
+-      interceptLog: (l?: number) => h.interceptLog(l),
+-      captureList: (f?: any) => h.captureList(f),
+-      captureRequest: (i: string) => h.captureRequest(i),
+-      captureResponse: (i: string) => h.captureResponse(i),
+-      osintHarvest: () => h.osintHarvest(),
+-      netIntel: () => h.netIntel(),
+-      gqlQuery: (o: any) => h.gqlQuery(o),
+-      siteMemory: () => h.siteMemory(),
+-      siteMemoryClear: (d?: string) => h.siteMemoryClear(d),
+-      wsWatch: () => h.wsWatch(),
+-      wsFrames: (f?: any) => h.wsFrames(f),
++      reattach: () => h.reattach(),
+       sleep: (ms: number) => new Promise<void>(r => setTimeout(r, ms)),
+       log: (m: string) => { logBuffer.push(m); },
+     };
+diff --git a/src/macros/types.ts b/src/macros/types.ts
+index baddb74..66b4671 100644
+--- a/src/macros/types.ts
++++ b/src/macros/types.ts
+@@ -16,99 +16,39 @@ export interface MacroDef<Args = Record<string, never>, Result = unknown> {
+   run(args: Args, ctx: MacroContext): Promise<Result>;
+ }
+ 
+-/** Curated, typed subset of Helmet methods exposed to macros. */
++/**
++ * Curated, typed subset of Helmet methods exposed to macros.
++ *
++ * IMPORTANT: Only includes methods that Helmet ACTUALLY defines as instance
++ * methods. Everything else in Helmet is dispatched via handleToolCall(name, args)
++ * and is NOT callable directly as ctx.X ÔÇö those will throw TypeError at runtime.
++ *
++ * As Helmet grows more instance methods, extend this list. As a quick rule:
++ * `grep -nE '^\s*async\s+[a-z][a-zA-Z0-9_]*\s*\(' src/helmet.ts` shows what's defined.
++ *
++ * Macro-only utilities: `sleep` (not on Helmet), `log` (captured per-run buffer, not on Helmet).
++ */
+ export interface MacroContext {
+-  // Tabs
+-  openTab(url: string): Promise<string>;
+-  switchTab(tabId: number): Promise<string>;
+-  closeTab(tabId: number): Promise<string>;
+-  reattach(): Promise<string>;
+-
+-  // Observation
++  /** Pose a question about the current browser state; returns a focused answer. */
+   observe(question: string): Promise<string>;
++
++  /** Execute a single low-level browser action (navigate, click, type, evaluate, etc). */
++  act(action: BrowserAction): Promise<string>;
++
++  /** Deep-dive into one sensor domain: network, dom, console, performance, security. */
+   inspect(domain: 'network' | 'dom' | 'console' | 'performance' | 'security'): Promise<string>;
++
++  /** Show what changed since the last action. */
+   diff(): Promise<string>;
+ 
+-  // Action
+-  act(action: BrowserAction): Promise<string>;
++  /** Re-attach to the active browser tab (use after tab switch/close). */
++  reattach(): Promise<void>;
+ 
+-  // Smart finding + typing
+-  findElement(query: string, limit?: number): Promise<string>;
+-  findClick(query: string): Promise<string>;
+-  findType(query: string, text: string): Promise<string>;
+-  smartType(query: string, text: string, opts?: { submit?: boolean; stealth?: boolean }): Promise<string>;
+-
+-  // Tech & stealth
+-  techScan(): Promise<string>;
+-  stealthCheck(): Promise<string>;
+-  stealthEnable(): Promise<string>;
+-  stealthDisable(): Promise<string>;
+-
+-  // Interception
+-  interceptEnable(): Promise<string>;
+-  interceptAddRule(rule: unknown): Promise<string>;
+-  interceptDisable(): Promise<string>;
+-  interceptLog(limit?: number): Promise<string>;
+-
+-  // Capture
+-  captureList(filter?: { urlPattern?: string; method?: string; hasMatches?: boolean; limit?: number }): Promise<string>;
+-  captureRequest(requestId: string): Promise<string>;
+-  captureResponse(requestId: string): Promise<string>;
+-
+-  // Intel
+-  osintHarvest(): Promise<string>;
+-  netIntel(): Promise<string>;
+-  gqlQuery(opts: { endpoint?: string; query?: string; hash?: string; operationName?: string; variables?: Record<string, unknown>; headers?: Record<string, string> }): Promise<string>;
+-
+-  // Site memory
+-  siteMemory(): Promise<string>;
+-  siteMemoryClear(domain?: string): Promise<string>;
+-
+-  // WebSocket
+-  wsWatch(): Promise<string>;
+-  wsFrames(filter?: { connectionId?: string; direction?: 'sent' | 'received'; search?: string; limit?: number }): Promise<string>;
+-
+-  // Utility (macro-only, not on Helmet)
++  // Macro-only utilities (NOT on Helmet)
+   sleep(ms: number): Promise<void>;
+   log(message: string): void;
+ }
+ 
+-/** Subset of Helmet that MacroRunner needs.
+- *  Helmet implicitly satisfies this ÔÇö listed here for type-checking.
+- *  Note: `sleep` and `log` are macro-runtime utilities, NOT on Helmet. */
+-export interface HelmetLike {
+-  openTab(url: string): Promise<string>;
+-  switchTab(tabId: number): Promise<string>;
+-  closeTab(tabId: number): Promise<string>;
+-  reattach(): Promise<string>;
+-  observe(question: string): Promise<string>;
+-  inspect(domain: string): Promise<string>;
+-  diff(): Promise<string>;
+-  act(action: BrowserAction): Promise<string>;
+-  findElement(query: string, limit?: number): Promise<string>;
+-  findClick(query: string): Promise<string>;
+-  findType(query: string, text: string): Promise<string>;
+-  smartType(query: string, text: string, opts?: { submit?: boolean; stealth?: boolean }): Promise<string>;
+-  techScan(): Promise<string>;
+-  stealthCheck(): Promise<string>;
+-  stealthEnable(): Promise<string>;
+-  stealthDisable(): Promise<string>;
+-  interceptEnable(): Promise<string>;
+-  interceptAddRule(rule: any): Promise<string>;
+-  interceptDisable(): Promise<string>;
+-  interceptLog(limit?: number): Promise<string>;
+-  captureList(filter?: any): Promise<string>;
+-  captureRequest(requestId: string): Promise<string>;
+-  captureResponse(requestId: string): Promise<string>;
+-  osintHarvest(): Promise<string>;
+-  netIntel(): Promise<string>;
+-  gqlQuery(opts: any): Promise<string>;
+-  siteMemory(): Promise<string>;
+-  siteMemoryClear(domain?: string): Promise<string>;
+-  wsWatch(): Promise<string>;
+-  wsFrames(filter?: any): Promise<string>;
+-}
+-
+ /** One row returned by `macro_list`. */
+ export interface MacroSummary {
+   name: string;
+diff --git a/tests/macros/helmet-integration.test.ts b/tests/macros/helmet-integration.test.ts
+index 4c3443d..bec610c 100644
+--- a/tests/macros/helmet-integration.test.ts
++++ b/tests/macros/helmet-integration.test.ts
+@@ -103,3 +103,26 @@ describe('Helmet macro tools (tools/list + tool routing)', () => {
+     expect(r.stage).toBe('validation');
+   });
+ });
++
++describe('buildCtx integration ÔÇö real ctx methods called by macro', () => {
++  // Note: This test uses the same spawn() helper and Helmet instance as above.
++  // The mock extension-server's send() returns {}, which is fine ÔÇö the macro just needs
++  // to be invoked without TypeError. We register the macro inline via a macro_register call.
++
++  it('invokes a macro that calls ctx.observe without TypeError', async () => {
++    const { stdin, out } = spawn();
++    try {
++      const src = `export default { name: 'smoke', description: 'smoke', async run(_a, ctx) { const o = await ctx.observe('overview'); return { ok: true, o }; } };`;
++      const regResp = await send(stdin, out, { jsonrpc: '2.0', id: 100, method: 'tools/call', params: { name: 'macro_register', arguments: { name: 'smoke', source: src } } });
++      const regResult = JSON.parse(regResp.result.content[0].text);
++      expect(regResult.success).toBe(true);
++
++      const runResp = await send(stdin, out, { jsonrpc: '2.0', id: 101, method: 'tools/call', params: { name: 'macro_run', arguments: { name: 'smoke' } } });
++      const runResult = JSON.parse(runResp.result.content[0].text);
++      expect(runResult.success).toBe(true);
++      expect(runResult.result.ok).toBe(true);
++    } finally {
++      teardown();
++    }
++  });
++});

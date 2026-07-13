@@ -16,97 +16,37 @@ export interface MacroDef<Args = Record<string, never>, Result = unknown> {
   run(args: Args, ctx: MacroContext): Promise<Result>;
 }
 
-/** Curated, typed subset of Helmet methods exposed to macros. */
+/**
+ * Curated, typed subset of Helmet methods exposed to macros.
+ *
+ * IMPORTANT: Only includes methods that Helmet ACTUALLY defines as instance
+ * methods. Everything else in Helmet is dispatched via handleToolCall(name, args)
+ * and is NOT callable directly as ctx.X — those will throw TypeError at runtime.
+ *
+ * As Helmet grows more instance methods, extend this list. As a quick rule:
+ * `grep -nE '^\s*async\s+[a-z][a-zA-Z0-9_]*\s*\(' src/helmet.ts` shows what's defined.
+ *
+ * Macro-only utilities: `sleep` (not on Helmet), `log` (captured per-run buffer, not on Helmet).
+ */
 export interface MacroContext {
-  // Tabs
-  openTab(url: string): Promise<string>;
-  switchTab(tabId: number): Promise<string>;
-  closeTab(tabId: number): Promise<string>;
-  reattach(): Promise<string>;
-
-  // Observation
+  /** Pose a question about the current browser state; returns a focused answer. */
   observe(question: string): Promise<string>;
-  inspect(domain: 'network' | 'dom' | 'console' | 'performance' | 'security'): Promise<string>;
-  diff(): Promise<string>;
 
-  // Action
+  /** Execute a single low-level browser action (navigate, click, type, evaluate, etc). */
   act(action: BrowserAction): Promise<string>;
 
-  // Smart finding + typing
-  findElement(query: string, limit?: number): Promise<string>;
-  findClick(query: string): Promise<string>;
-  findType(query: string, text: string): Promise<string>;
-  smartType(query: string, text: string, opts?: { submit?: boolean; stealth?: boolean }): Promise<string>;
+  /** Deep-dive into one sensor domain: network, dom, console, performance, security. */
+  inspect(domain: 'network' | 'dom' | 'console' | 'performance' | 'security'): Promise<string>;
 
-  // Tech & stealth
-  techScan(): Promise<string>;
-  stealthCheck(): Promise<string>;
-  stealthEnable(): Promise<string>;
-  stealthDisable(): Promise<string>;
+  /** Show what changed since the last action. */
+  diff(): Promise<string>;
 
-  // Interception
-  interceptEnable(): Promise<string>;
-  interceptAddRule(rule: unknown): Promise<string>;
-  interceptDisable(): Promise<string>;
-  interceptLog(limit?: number): Promise<string>;
+  /** Re-attach to the active browser tab (use after tab switch/close). */
+  reattach(): Promise<void>;
 
-  // Capture
-  captureList(filter?: { urlPattern?: string; method?: string; hasMatches?: boolean; limit?: number }): Promise<string>;
-  captureRequest(requestId: string): Promise<string>;
-  captureResponse(requestId: string): Promise<string>;
-
-  // Intel
-  osintHarvest(): Promise<string>;
-  netIntel(): Promise<string>;
-  gqlQuery(opts: { endpoint?: string; query?: string; hash?: string; operationName?: string; variables?: Record<string, unknown>; headers?: Record<string, string> }): Promise<string>;
-
-  // Site memory
-  siteMemory(): Promise<string>;
-  siteMemoryClear(domain?: string): Promise<string>;
-
-  // WebSocket
-  wsWatch(): Promise<string>;
-  wsFrames(filter?: { connectionId?: string; direction?: 'sent' | 'received'; search?: string; limit?: number }): Promise<string>;
-
-  // Utility (macro-only, not on Helmet)
+  // Macro-only utilities (NOT on Helmet)
   sleep(ms: number): Promise<void>;
   log(message: string): void;
-}
-
-/** Subset of Helmet that MacroRunner needs.
- *  Helmet implicitly satisfies this — listed here for type-checking.
- *  Note: `sleep` and `log` are macro-runtime utilities, NOT on Helmet. */
-export interface HelmetLike {
-  openTab(url: string): Promise<string>;
-  switchTab(tabId: number): Promise<string>;
-  closeTab(tabId: number): Promise<string>;
-  reattach(): Promise<string>;
-  observe(question: string): Promise<string>;
-  inspect(domain: string): Promise<string>;
-  diff(): Promise<string>;
-  act(action: BrowserAction): Promise<string>;
-  findElement(query: string, limit?: number): Promise<string>;
-  findClick(query: string): Promise<string>;
-  findType(query: string, text: string): Promise<string>;
-  smartType(query: string, text: string, opts?: { submit?: boolean; stealth?: boolean }): Promise<string>;
-  techScan(): Promise<string>;
-  stealthCheck(): Promise<string>;
-  stealthEnable(): Promise<string>;
-  stealthDisable(): Promise<string>;
-  interceptEnable(): Promise<string>;
-  interceptAddRule(rule: any): Promise<string>;
-  interceptDisable(): Promise<string>;
-  interceptLog(limit?: number): Promise<string>;
-  captureList(filter?: any): Promise<string>;
-  captureRequest(requestId: string): Promise<string>;
-  captureResponse(requestId: string): Promise<string>;
-  osintHarvest(): Promise<string>;
-  netIntel(): Promise<string>;
-  gqlQuery(opts: any): Promise<string>;
-  siteMemory(): Promise<string>;
-  siteMemoryClear(domain?: string): Promise<string>;
-  wsWatch(): Promise<string>;
-  wsFrames(filter?: any): Promise<string>;
 }
 
 /** One row returned by `macro_list`. */
