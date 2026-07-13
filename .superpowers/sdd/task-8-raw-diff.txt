@@ -1,0 +1,125 @@
+﻿git : warning: in the working copy of 'src/helmet.ts', LF will be replaced by CRLF the next time Git touches it
+En línea: 1 Carácter: 1
++ git diff fa8539c -- src/helmet.ts 2>&1 | Out-File -Encoding utf8 "D:\ ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+diff --git a/src/helmet.ts b/src/helmet.ts
+index 4fef18f..0dc23d0 100644
+--- a/src/helmet.ts
++++ b/src/helmet.ts
+@@ -24,6 +24,9 @@ import { HashLearner } from './intel/hash-learner.js';
+ import { BrowserInterceptorManager } from './intel/browser-interceptor.js';
+ import { LearningLoop } from './intel/learning-loop.js';
+ import { NetworkCapture } from './intel/network-capture.js';
++import { MacroRunner } from './macros/runner.js';
++import { loadBuiltins, loadUserMacros } from './macros/loader.js';
++import type { HelmetLike } from './macros/types.js';
+ import type { BrowserState } from './memory/browser-state.js';
+ import type { Anomaly } from './vision/base-sensor.js';
+ import type { BrowserAction } from './arsenal/action-types.js';
+@@ -85,6 +88,7 @@ export class Helmet {
+   private browserInterceptor: BrowserInterceptorManager;
+   private learningLoop: LearningLoop;
+   private networkCapture: NetworkCapture;
++  private macroRunner: MacroRunner;
+   private attached = false;
+ 
+   constructor(config?: Partial<HelmetConfig>) {
+@@ -118,6 +122,7 @@ export class Helmet {
+       this.server, this.hashSeedDB, this.patternDetector, this.hashLearner, this.browserInterceptor
+     );
+     this.networkCapture = new NetworkCapture(this.server);
++    this.macroRunner = new MacroRunner(this as unknown as HelmetLike);
+     this.server.setNetworkCaptureCallback((msg: any) => {
+       if (msg.action === 'add' && msg.entry) {
+         this.networkCapture.storeRequest(msg.entry);
+@@ -169,6 +174,17 @@ export class Helmet {
+     this.motion.subscribe();
+     this.threat.subscribe();
+ 
++    // Load macros (fail-soft ÔÇö boot continues even if loading fails)
++    try {
++      const builtinsResult = await loadBuiltins(this.macroRunner);
++      const userResult = await loadUserMacros(this.macroRunner);
++      process.stderr.write(
++        `[Yautja] Macros loaded: ${builtinsResult.loaded.length} builtin, ${userResult.loaded.length} user\n`,
++      );
++    } catch (err) {
++      process.stderr.write(`[Yautja] macro loading failed (continuing): ${err}\n`);
++    }
++
+     for (const domain of ['Network', 'Page', 'Runtime', 'Performance', 'Security']) {
+       try { await this.server.enableDomains([domain]); } catch {}
+     }
+@@ -733,6 +749,20 @@ export class Helmet {
+       case 'gqlCacheList': {
+         return JSON.stringify({ domains: this.gqlCache.listDomains() }, null, 2);
+       }
++      case 'macro_list':
++        return JSON.stringify({ macros: this.macroRunner.list() });
++      case 'macro_run': {
++        const result = await this.macroRunner.run(args.name, args.args, args.timeoutMs);
++        return JSON.stringify(result);
++      }
++      case 'macro_register': {
++        const result = await this.macroRunner.registerUserMacro(args.name, args.source, args.overwrite === true);
++        return JSON.stringify(result);
++      }
++      case 'macro_delete': {
++        const result = await this.macroRunner.deleteUserMacro(args.name);
++        return JSON.stringify(result);
++      }
+       default:
+         return `Unknown tool: ${name}`;
+     }
+@@ -1228,6 +1258,48 @@ const MCP_TOOLS = [
+     description: 'Clear all captured requests from memory (does not delete files).',
+     inputSchema: { type: 'object' as const, properties: {} },
+   },
++  {
++    name: 'macro_list',
++    description: 'List all registered macros (built-in and user-defined). Use this first to discover available macros before calling macro_run.',
++    inputSchema: { type: 'object' as const, properties: {} },
++  },
++  {
++    name: 'macro_run',
++    description: 'Invoke a macro by name. Use macro_list first to see names and whether they take args.',
++    inputSchema: {
++      type: 'object' as const,
++      properties: {
++        name: { type: 'string', description: 'Macro name (from macro_list)' },
++        args: { type: 'object', description: "Macro arguments (validated against the macro's argsSchema if present)" },
++        timeoutMs: { type: 'number', description: 'Override the macro default timeout (ms)' },
++      },
++      required: ['name'],
++    },
++  },
++  {
++    name: 'macro_register',
++    description: "Register a new user macro by writing its source to %APPDATA%\\.yautja-macros\\<name>.js and importing it. Source must export default a MacroDef object with { name, description, run }.",
++    inputSchema: {
++      type: 'object' as const,
++      properties: {
++        name: { type: 'string', description: 'Macro name, filename-safe [a-z0-9_-]+' },
++        source: { type: 'string', description: 'Full JavaScript source of the macro module' },
++        overwrite: { type: 'boolean', description: 'Overwrite existing macro with same name (default false)' },
++      },
++      required: ['name', 'source'],
++    },
++  },
++  {
++    name: 'macro_delete',
++    description: 'Delete a user-defined macro. Cannot delete built-in macros.',
++    inputSchema: {
++      type: 'object' as const,
++      properties: {
++        name: { type: 'string', description: 'Macro name to delete' },
++      },
++      required: ['name'],
++    },
++  },
+ ];
+ 
+ const FALLBACK_DOM = {
