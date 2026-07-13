@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Yautja Bridge",
+  "version": "0.1.0",
+  "description": "Bio-helmet bridge — lets Yautja control this browser without debug ports",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "activeTab",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Yautja Bridge",
+    "default_icon": {
+      "32": "icon32.png",
+      "192": "icon192.png"
+    }
+  },
+  "icons": {
+    "32": "icon32.png",
+    "192": "icon192.png",
+    "512": "icon512.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://localhost:* http://localhost:*"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-gql.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}
