@@ -83,3 +83,55 @@ describe('MacroRunner.registerUserMacro', () => {
     if (!r.success) expect(r.stage).toBe('import');
   });
 });
+
+describe('MacroRunner.deleteUserMacro', () => {
+  let dir: string;
+  let runner: MacroRunner;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yautja-del-'));
+    process.env.YAUTJA_USER_DIR = dir;
+    runner = new MacroRunner(mockCtx as any);
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    delete process.env.YAUTJA_USER_DIR;
+  });
+
+  it('deletes existing user macro and removes file', async () => {
+    await runner.registerUserMacro('demo', `export default { name: 'demo', description: 'd', async run() { return 1; } };`);
+    expect(fs.existsSync(path.join(dir, 'demo.js'))).toBe(true);
+
+    const r = await runner.deleteUserMacro('demo');
+    expect(r.success).toBe(true);
+    if (r.success) expect(fs.existsSync(r.removedFile)).toBe(false);
+    expect(runner.get('demo')).toBeUndefined();
+  });
+
+  it('refuses to delete built-in macro', async () => {
+    runner.register({ name: 'builtin1', description: 'b', async run() { return 0; } }, 'builtin');
+    const r = await runner.deleteUserMacro('builtin1');
+    expect(r.success).toBe(false);
+    if (!r.success) expect(r.stage).toBe('permission');
+    expect(runner.get('builtin1')).toBeDefined();
+  });
+
+  it('returns lookup error for unknown macro', async () => {
+    const r = await runner.deleteUserMacro('ghost');
+    expect(r.success).toBe(false);
+    if (!r.success) expect(r.stage).toBe('lookup');
+  });
+
+  it('returns io error if file missing but registry has it', async () => {
+    runner.register(
+      { name: 'phantom', description: 'p', async run() { return 0; } },
+      'user',
+      path.join(dir, 'phantom.js'),
+    );
+    const r = await runner.deleteUserMacro('phantom');
+    expect(r.success).toBe(false);
+    if (!r.success) expect(r.stage).toBe('io');
+    expect(runner.get('phantom')).toBeUndefined();
+  });
+});

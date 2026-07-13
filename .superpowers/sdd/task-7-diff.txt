@@ -1,0 +1,115 @@
+﻿git : warning: in the working copy of 'src/macros/runner.ts', LF will be replaced by CRLF the next time Git touches it
+En línea: 1 Carácter: 87
++ ... | Out-Null; git diff 6b3a4b6 -- src/macros/runner.ts tests/macros/reg ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: in the working copy of 'tests/macros/register-delete.test.ts', LF will be replaced by CRLF the next time Git 
+touches it
+diff --git a/src/macros/runner.ts b/src/macros/runner.ts
+index 481f56b..2c78361 100644
+--- a/src/macros/runner.ts
++++ b/src/macros/runner.ts
+@@ -1,7 +1,7 @@
+ import fs from 'fs';
+ import path from 'path';
+ import { pathToFileURL } from 'url';
+-import type { RegisterResult } from './types.js';
++import type { RegisterResult, DeleteResult } from './types.js';
+ import { MACRO_NAME_PATTERN } from './types.js';
+ import { resolveUserDir } from './loader.js';
+ import type { ArgsSchema, HelmetLike, MacroContext, MacroDef, MacroRegistryEntry, MacroSource, MacroSummary, RunResult } from './types.js';
+@@ -80,6 +80,30 @@ export class MacroRunner {
+     return { success: true, name, source: 'user', file };
+   }
+ 
++  async deleteUserMacro(name: string): Promise<DeleteResult> {
++    const entry = this.registry.get(name);
++    if (!entry) {
++      return { success: false, error: `unknown macro: ${name}`, stage: 'lookup' };
++    }
++    if (entry.source === 'builtin') {
++      return { success: false, error: `cannot delete built-in macro: ${name}`, stage: 'permission' };
++    }
++    this.registry.delete(name);
++
++    if (!entry.file) {
++      return { success: false, error: `macro ${name} has no source file`, stage: 'io' };
++    }
++    try {
++      if (!fs.existsSync(entry.file)) {
++        return { success: false, error: `file not found: ${entry.file}`, stage: 'io' };
++      }
++      fs.unlinkSync(entry.file);
++    } catch (err) {
++      return { success: false, error: `delete failed: ${err}`, stage: 'io' };
++    }
++    return { success: true, name, removedFile: entry.file };
++  }
++
+   get(name: string): MacroRegistryEntry | undefined {
+     return this.registry.get(name);
+   }
+diff --git a/tests/macros/register-delete.test.ts b/tests/macros/register-delete.test.ts
+index 37cda10..ca3d901 100644
+--- a/tests/macros/register-delete.test.ts
++++ b/tests/macros/register-delete.test.ts
+@@ -82,4 +82,56 @@ describe('MacroRunner.registerUserMacro', () => {
+     expect(r.success).toBe(false);
+     if (!r.success) expect(r.stage).toBe('import');
+   });
++});
++
++describe('MacroRunner.deleteUserMacro', () => {
++  let dir: string;
++  let runner: MacroRunner;
++
++  beforeEach(() => {
++    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yautja-del-'));
++    process.env.YAUTJA_USER_DIR = dir;
++    runner = new MacroRunner(mockCtx as any);
++  });
++
++  afterEach(() => {
++    fs.rmSync(dir, { recursive: true, force: true });
++    delete process.env.YAUTJA_USER_DIR;
++  });
++
++  it('deletes existing user macro and removes file', async () => {
++    await runner.registerUserMacro('demo', `export default { name: 'demo', description: 'd', async run() { return 1; } };`);
++    expect(fs.existsSync(path.join(dir, 'demo.js'))).toBe(true);
++
++    const r = await runner.deleteUserMacro('demo');
++    expect(r.success).toBe(true);
++    if (r.success) expect(fs.existsSync(r.removedFile)).toBe(false);
++    expect(runner.get('demo')).toBeUndefined();
++  });
++
++  it('refuses to delete built-in macro', async () => {
++    runner.register({ name: 'builtin1', description: 'b', async run() { return 0; } }, 'builtin');
++    const r = await runner.deleteUserMacro('builtin1');
++    expect(r.success).toBe(false);
++    if (!r.success) expect(r.stage).toBe('permission');
++    expect(runner.get('builtin1')).toBeDefined();
++  });
++
++  it('returns lookup error for unknown macro', async () => {
++    const r = await runner.deleteUserMacro('ghost');
++    expect(r.success).toBe(false);
++    if (!r.success) expect(r.stage).toBe('lookup');
++  });
++
++  it('returns io error if file missing but registry has it', async () => {
++    runner.register(
++      { name: 'phantom', description: 'p', async run() { return 0; } },
++      'user',
++      path.join(dir, 'phantom.js'),
++    );
++    const r = await runner.deleteUserMacro('phantom');
++    expect(r.success).toBe(false);
++    if (!r.success) expect(r.stage).toBe('io');
++    expect(runner.get('phantom')).toBeUndefined();
++  });
+ });
+\ No newline at end of file

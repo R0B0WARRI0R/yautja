@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
-import type { RegisterResult } from './types.js';
+import type { RegisterResult, DeleteResult } from './types.js';
 import { MACRO_NAME_PATTERN } from './types.js';
 import { resolveUserDir } from './loader.js';
 import type { ArgsSchema, HelmetLike, MacroContext, MacroDef, MacroRegistryEntry, MacroSource, MacroSummary, RunResult } from './types.js';
@@ -78,6 +78,30 @@ export class MacroRunner {
 
     this.register(def, 'user', file);
     return { success: true, name, source: 'user', file };
+  }
+
+  async deleteUserMacro(name: string): Promise<DeleteResult> {
+    const entry = this.registry.get(name);
+    if (!entry) {
+      return { success: false, error: `unknown macro: ${name}`, stage: 'lookup' };
+    }
+    if (entry.source === 'builtin') {
+      return { success: false, error: `cannot delete built-in macro: ${name}`, stage: 'permission' };
+    }
+    this.registry.delete(name);
+
+    if (!entry.file) {
+      return { success: false, error: `macro ${name} has no source file`, stage: 'io' };
+    }
+    try {
+      if (!fs.existsSync(entry.file)) {
+        return { success: false, error: `file not found: ${entry.file}`, stage: 'io' };
+      }
+      fs.unlinkSync(entry.file);
+    } catch (err) {
+      return { success: false, error: `delete failed: ${err}`, stage: 'io' };
+    }
+    return { success: true, name, removedFile: entry.file };
   }
 
   get(name: string): MacroRegistryEntry | undefined {
