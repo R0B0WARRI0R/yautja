@@ -1,0 +1,130 @@
+﻿git : warning: in the working copy of 'src/macros/runner.ts', LF will be replaced by CRLF the next time Git touches it
+En línea: 1 Carácter: 67
++ ... st.ts 2>&1; git diff 20c60fb -- src/macros/runner.ts tests/macros/run ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: in the working copy of 'tests/macros/runner.test.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/src/macros/runner.ts b/src/macros/runner.ts
+new file mode 100644
+index 0000000..dda2ae7
+--- /dev/null
++++ b/src/macros/runner.ts
+@@ -0,0 +1,37 @@
++import type { HelmetLike, MacroDef, MacroRegistryEntry, MacroSource, MacroSummary } from './types.js';
++
++export class MacroRunner {
++  private registry = new Map<string, MacroRegistryEntry>();
++
++  constructor(private readonly host: HelmetLike) {
++    void this.host;
++  }
++
++  register(def: MacroDef, source: MacroSource, file?: string): void {
++    this.registry.set(def.name, { def, source, file, loadedAt: Date.now() });
++  }
++
++  unregister(name: string): boolean {
++    return this.registry.delete(name);
++  }
++
++  get(name: string): MacroRegistryEntry | undefined {
++    return this.registry.get(name);
++  }
++
++  list(): MacroSummary[] {
++    return [...this.registry.values()].map((e) => this.toSummary(e));
++  }
++
++  private toSummary(entry: MacroRegistryEntry): MacroSummary {
++    const { def, source } = entry;
++    const summary: MacroSummary = {
++      name: def.name,
++      description: def.description,
++      source,
++      hasArgs: def.argsSchema !== undefined,
++    };
++    if (def.timeoutMs !== undefined) summary.timeoutMs = def.timeoutMs;
++    return summary;
++  }
++}
+\ No newline at end of file
+diff --git a/tests/macros/runner.test.ts b/tests/macros/runner.test.ts
+new file mode 100644
+index 0000000..61903b1
+--- /dev/null
++++ b/tests/macros/runner.test.ts
+@@ -0,0 +1,71 @@
++import { describe, it, expect, beforeEach, vi } from 'vitest';
++import { MacroRunner } from '../../src/macros/runner.js';
++import type { MacroContext, MacroDef } from '../../src/macros/types.js';
++
++function makeMockCtx(): MacroContext {
++  return {
++    openTab: vi.fn(async () => '{}'), switchTab: vi.fn(async () => '{}'),
++    closeTab: vi.fn(async () => '{}'), reattach: vi.fn(async () => '{}'),
++    observe: vi.fn(async () => '{}'), inspect: vi.fn(async () => '{}'),
++    diff: vi.fn(async () => '{}'), act: vi.fn(async () => '{}'),
++    findElement: vi.fn(async () => '{}'), findClick: vi.fn(async () => '{}'),
++    findType: vi.fn(async () => '{}'), smartType: vi.fn(async () => '{}'),
++    techScan: vi.fn(async () => '{}'), stealthCheck: vi.fn(async () => '{}'),
++    stealthEnable: vi.fn(async () => '{}'), stealthDisable: vi.fn(async () => '{}'),
++    interceptEnable: vi.fn(async () => '{}'), interceptAddRule: vi.fn(async () => '{}'),
++    interceptDisable: vi.fn(async () => '{}'), interceptLog: vi.fn(async () => '{}'),
++    captureList: vi.fn(async () => '{}'), captureRequest: vi.fn(async () => '{}'),
++    captureResponse: vi.fn(async () => '{}'), osintHarvest: vi.fn(async () => '{}'),
++    netIntel: vi.fn(async () => '{}'), gqlQuery: vi.fn(async () => '{}'),
++    siteMemory: vi.fn(async () => '{}'), siteMemoryClear: vi.fn(async () => '{}'),
++    wsWatch: vi.fn(async () => '{}'), wsFrames: vi.fn(async () => '{}'),
++    sleep: vi.fn(async () => {}), log: vi.fn(),
++  };
++}
++
++const sampleDef: MacroDef = { name: 'sample', description: 'A sample macro', async run() { return 'done'; } };
++
++describe('MacroRunner registry', () => {
++  let runner: MacroRunner;
++  beforeEach(() => {
++    runner = new MacroRunner({} as any); // host unused in Task 2
++  });
++
++  it('registers a macro and lists it as builtin by default', () => {
++    runner.register(sampleDef, 'builtin');
++    const list = runner.list();
++    expect(list).toHaveLength(1);
++    expect(list[0]).toMatchObject({ name: 'sample', source: 'builtin', hasArgs: false });
++  });
++
++  it('registers with argsSchema and reports hasArgs=true', () => {
++    runner.register({
++      name: 'login',
++      description: 'login flow',
++      argsSchema: { type: 'object', properties: { user: { type: 'string' } }, required: ['user'] },
++      async run() { return 'ok'; },
++    }, 'builtin');
++    expect(runner.list()[0].hasArgs).toBe(true);
++  });
++
++  it('get returns the entry; unknown returns undefined', () => {
++    runner.register(sampleDef, 'builtin');
++    expect(runner.get('sample')?.def.name).toBe('sample');
++    expect(runner.get('nope')).toBeUndefined();
++  });
++
++  it('unregister removes and returns true; false if absent', () => {
++    runner.register(sampleDef, 'builtin');
++    expect(runner.unregister('sample')).toBe(true);
++    expect(runner.list()).toHaveLength(0);
++    expect(runner.unregister('sample')).toBe(false);
++  });
++
++  it('re-registering same name overwrites', () => {
++    runner.register(sampleDef, 'builtin');
++    runner.register({ ...sampleDef, description: 'updated' }, 'user');
++    expect(runner.list()).toHaveLength(1);
++    expect(runner.list()[0].description).toBe('updated');
++    expect(runner.list()[0].source).toBe('user');
++  });
++});
+\ No newline at end of file
