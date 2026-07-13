@@ -1,0 +1,124 @@
+﻿git : warning: in the working copy of 'src/macros/loader.ts', LF will be replaced by CRLF the next time Git touches it
+En línea: 1 Carácter: 78
++ ... | Out-Null; git diff 1a86467 -- src/macros/loader.ts tests/macros/loa ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: in the working copy of 'tests/macros/loader.test.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/src/macros/loader.ts b/src/macros/loader.ts
+index 396829d..8c04a21 100644
+--- a/src/macros/loader.ts
++++ b/src/macros/loader.ts
+@@ -60,4 +60,46 @@ export async function loadBuiltins(runner: MacroRunner): Promise<LoadResult> {
+     }
+   }
+   return result;
++}
++
++export function resolveUserDir(): string {
++  if (process.env.YAUTJA_USER_DIR) return process.env.YAUTJA_USER_DIR;
++  return path.join(process.env.APPDATA || process.env.HOME || '/tmp', '.yautja-macros');
++}
++
++export async function loadUserMacros(runner: MacroRunner): Promise<LoadResult> {
++  const dir = resolveUserDir();
++  const result: LoadResult = { loaded: [], skipped: [] };
++
++  try {
++    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
++  } catch (err) {
++    process.stderr.write(`[Yautja] cannot create user macro dir ${dir}: ${err}\n`);
++    return result;
++  }
++
++  let files: string[];
++  try {
++    files = fs.readdirSync(dir).filter(f => f.endsWith('.js') && !f.startsWith('.'));
++  } catch {
++    return result;
++  }
++
++  for (const f of files) {
++    const full = path.join(dir, f);
++    try {
++      const def = await importMacro(full, true);
++      if (!isValidMacro(def)) {
++        process.stderr.write(`[Yautja] user macro ${f}: invalid shape\n`);
++        result.skipped.push(f);
++        continue;
++      }
++      runner.register(def, 'user', full);
++      result.loaded.push(def.name);
++    } catch (err) {
++      process.stderr.write(`[Yautja] user macro ${f}: ${err instanceof Error ? err.message : String(err)}\n`);
++      result.skipped.push(f);
++    }
++  }
++  return result;
+ }
+\ No newline at end of file
+diff --git a/tests/macros/loader.test.ts b/tests/macros/loader.test.ts
+index 64d1d41..bf53b0f 100644
+--- a/tests/macros/loader.test.ts
++++ b/tests/macros/loader.test.ts
+@@ -3,7 +3,7 @@ import fs from 'fs';
+ import path from 'path';
+ import os from 'os';
+ import { MacroRunner } from '../../src/macros/runner.js';
+-import { loadBuiltins } from '../../src/macros/loader.js';
++import { loadBuiltins, loadUserMacros } from '../../src/macros/loader.js';
+ import type { MacroContext } from '../../src/macros/types.js';
+ 
+ const mockCtx: MacroContext = {
+@@ -80,4 +80,49 @@ describe('loadBuiltins', () => {
+     expect(result.loaded).toEqual([]);
+     expect(result.skipped).toEqual([]);
+   });
++});
++
++describe('loadUserMacros', () => {
++  let dir: string;
++  beforeEach(() => {
++    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yautja-user-'));
++    process.env.YAUTJA_USER_DIR = dir;
++  });
++  afterEach(() => {
++    fs.rmSync(dir, { recursive: true, force: true });
++    delete process.env.YAUTJA_USER_DIR;
++  });
++
++  it('loads .js file with cache-busting query param', async () => {
++    fs.writeFileSync(path.join(dir, 'scrape.js'), `
++      export default { name: 'scrape', description: 'scrapes', async run() { return 'data'; } };
++    `);
++    const runner = new MacroRunner(mockCtx as any);
++    const result = await loadUserMacros(runner);
++    expect(result.loaded).toEqual(['scrape']);
++    expect(runner.get('scrape')?.source).toBe('user');
++    expect(runner.get('scrape')?.file).toBe(path.join(dir, 'scrape.js'));
++  });
++
++  it('skips hidden files (starting with .)', async () => {
++    fs.writeFileSync(path.join(dir, '.hidden.js'), `export default {};`);
++    const runner = new MacroRunner(mockCtx as any);
++    const result = await loadUserMacros(runner);
++    expect(result.loaded).toEqual([]);
++  });
++
++  it('creates user dir if missing, loads nothing', async () => {
++    process.env.YAUTJA_USER_DIR = path.join(dir, 'newdir');
++    const runner = new MacroRunner(mockCtx as any);
++    const result = await loadUserMacros(runner);
++    expect(result.loaded).toEqual([]);
++    expect(fs.existsSync(process.env.YAUTJA_USER_DIR!)).toBe(true);
++  });
++
++  it('skips malformed file, records in skipped', async () => {
++    fs.writeFileSync(path.join(dir, 'bad.js'), `throw new Error('syntax');`);
++    const runner = new MacroRunner(mockCtx as any);
++    const result = await loadUserMacros(runner);
++    expect(result.skipped).toEqual(['bad.js']);
++  });
+ });
+\ No newline at end of file

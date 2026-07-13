@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { MacroRunner } from '../../src/macros/runner.js';
-import { loadBuiltins } from '../../src/macros/loader.js';
+import { loadBuiltins, loadUserMacros } from '../../src/macros/loader.js';
 import type { MacroContext } from '../../src/macros/types.js';
 
 const mockCtx: MacroContext = {
@@ -79,5 +79,50 @@ describe('loadBuiltins', () => {
     const result = await loadBuiltins(runner);
     expect(result.loaded).toEqual([]);
     expect(result.skipped).toEqual([]);
+  });
+});
+
+describe('loadUserMacros', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yautja-user-'));
+    process.env.YAUTJA_USER_DIR = dir;
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    delete process.env.YAUTJA_USER_DIR;
+  });
+
+  it('loads .js file with cache-busting query param', async () => {
+    fs.writeFileSync(path.join(dir, 'scrape.js'), `
+      export default { name: 'scrape', description: 'scrapes', async run() { return 'data'; } };
+    `);
+    const runner = new MacroRunner(mockCtx as any);
+    const result = await loadUserMacros(runner);
+    expect(result.loaded).toEqual(['scrape']);
+    expect(runner.get('scrape')?.source).toBe('user');
+    expect(runner.get('scrape')?.file).toBe(path.join(dir, 'scrape.js'));
+  });
+
+  it('skips hidden files (starting with .)', async () => {
+    fs.writeFileSync(path.join(dir, '.hidden.js'), `export default {};`);
+    const runner = new MacroRunner(mockCtx as any);
+    const result = await loadUserMacros(runner);
+    expect(result.loaded).toEqual([]);
+  });
+
+  it('creates user dir if missing, loads nothing', async () => {
+    process.env.YAUTJA_USER_DIR = path.join(dir, 'newdir');
+    const runner = new MacroRunner(mockCtx as any);
+    const result = await loadUserMacros(runner);
+    expect(result.loaded).toEqual([]);
+    expect(fs.existsSync(process.env.YAUTJA_USER_DIR!)).toBe(true);
+  });
+
+  it('skips malformed file, records in skipped', async () => {
+    fs.writeFileSync(path.join(dir, 'bad.js'), `throw new Error('syntax');`);
+    const runner = new MacroRunner(mockCtx as any);
+    const result = await loadUserMacros(runner);
+    expect(result.skipped).toEqual(['bad.js']);
   });
 });
