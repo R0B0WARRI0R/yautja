@@ -1,3 +1,9 @@
+import fs from 'fs';
+import path from 'path';
+import { pathToFileURL } from 'url';
+import type { RegisterResult } from './types.js';
+import { MACRO_NAME_PATTERN } from './types.js';
+import { resolveUserDir } from './loader.js';
 import type { ArgsSchema, HelmetLike, MacroContext, MacroDef, MacroRegistryEntry, MacroSource, MacroSummary, RunResult } from './types.js';
 import { DEFAULT_MACRO_TIMEOUT_MS } from './types.js';
 
@@ -21,6 +27,57 @@ export class MacroRunner {
 
   unregister(name: string): boolean {
     return this.registry.delete(name);
+  }
+
+  async registerUserMacro(name: string, source: string, overwrite = false): Promise<RegisterResult> {
+    if (!MACRO_NAME_PATTERN.test(name)) {
+      return { success: false, error: `name must match ${MACRO_NAME_PATTERN.source}`, stage: 'validation' };
+    }
+    const dir = resolveUserDir();
+    const file = path.join(dir, `${name}.js`);
+
+    const existing = this.registry.get(name);
+    if (existing && !overwrite) {
+      return { success: false, error: `macro ${name} already exists (use overwrite: true)`, stage: 'persistence' };
+    }
+
+    try {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    } catch (err) {
+      return { success: false, error: `cannot create dir ${dir}: ${err}`, stage: 'persistence' };
+    }
+
+    const tmp = file + '.tmp';
+    try {
+      fs.writeFileSync(tmp, source, 'utf8');
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      try { fs.unlinkSync(tmp); } catch {}
+      return { success: false, error: `write failed: ${err}`, stage: 'persistence' };
+    }
+
+    let def: MacroDef;
+    try {
+      const url = pathToFileURL(file).href + `?v=${Date.now()}`;
+      const mod = await import(url);
+      def = mod.default;
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err), stage: 'import' };
+    }
+
+    if (!def
+      || typeof def.name !== 'string'
+      || typeof def.description !== 'string'
+      || typeof def.run !== 'function') {
+      return { success: false, error: 'macro must export default with name, description, run', stage: 'shape' };
+    }
+
+    if (def.name !== name) {
+      return { success: false, error: `macro name '${def.name}' does not match filename '${name}'`, stage: 'shape' };
+    }
+
+    this.register(def, 'user', file);
+    return { success: true, name, source: 'user', file };
   }
 
   get(name: string): MacroRegistryEntry | undefined {

@@ -1,0 +1,173 @@
+﻿git : warning: in the working copy of 'src/macros/runner.ts', LF will be replaced by CRLF the next time Git touches it
+En línea: 1 Carácter: 87
++ ... | Out-Null; git diff b0134b4 -- src/macros/runner.ts tests/macros/reg ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: in the working copy of 'tests/macros/register-delete.test.ts', LF will be replaced by CRLF the next time Git 
+touches it
+diff --git a/src/macros/runner.ts b/src/macros/runner.ts
+index 6c09ef0..481f56b 100644
+--- a/src/macros/runner.ts
++++ b/src/macros/runner.ts
+@@ -1,3 +1,9 @@
++import fs from 'fs';
++import path from 'path';
++import { pathToFileURL } from 'url';
++import type { RegisterResult } from './types.js';
++import { MACRO_NAME_PATTERN } from './types.js';
++import { resolveUserDir } from './loader.js';
+ import type { ArgsSchema, HelmetLike, MacroContext, MacroDef, MacroRegistryEntry, MacroSource, MacroSummary, RunResult } from './types.js';
+ import { DEFAULT_MACRO_TIMEOUT_MS } from './types.js';
+ 
+@@ -23,6 +29,57 @@ export class MacroRunner {
+     return this.registry.delete(name);
+   }
+ 
++  async registerUserMacro(name: string, source: string, overwrite = false): Promise<RegisterResult> {
++    if (!MACRO_NAME_PATTERN.test(name)) {
++      return { success: false, error: `name must match ${MACRO_NAME_PATTERN.source}`, stage: 'validation' };
++    }
++    const dir = resolveUserDir();
++    const file = path.join(dir, `${name}.js`);
++
++    const existing = this.registry.get(name);
++    if (existing && !overwrite) {
++      return { success: false, error: `macro ${name} already exists (use overwrite: true)`, stage: 'persistence' };
++    }
++
++    try {
++      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
++    } catch (err) {
++      return { success: false, error: `cannot create dir ${dir}: ${err}`, stage: 'persistence' };
++    }
++
++    const tmp = file + '.tmp';
++    try {
++      fs.writeFileSync(tmp, source, 'utf8');
++      fs.renameSync(tmp, file);
++    } catch (err) {
++      try { fs.unlinkSync(tmp); } catch {}
++      return { success: false, error: `write failed: ${err}`, stage: 'persistence' };
++    }
++
++    let def: MacroDef;
++    try {
++      const url = pathToFileURL(file).href + `?v=${Date.now()}`;
++      const mod = await import(url);
++      def = mod.default;
++    } catch (err) {
++      return { success: false, error: err instanceof Error ? err.message : String(err), stage: 'import' };
++    }
++
++    if (!def
++      || typeof def.name !== 'string'
++      || typeof def.description !== 'string'
++      || typeof def.run !== 'function') {
++      return { success: false, error: 'macro must export default with name, description, run', stage: 'shape' };
++    }
++
++    if (def.name !== name) {
++      return { success: false, error: `macro name '${def.name}' does not match filename '${name}'`, stage: 'shape' };
++    }
++
++    this.register(def, 'user', file);
++    return { success: true, name, source: 'user', file };
++  }
++
+   get(name: string): MacroRegistryEntry | undefined {
+     return this.registry.get(name);
+   }
+diff --git a/tests/macros/register-delete.test.ts b/tests/macros/register-delete.test.ts
+new file mode 100644
+index 0000000..37cda10
+--- /dev/null
++++ b/tests/macros/register-delete.test.ts
+@@ -0,0 +1,85 @@
++import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
++import fs from 'fs';
++import path from 'path';
++import os from 'os';
++import { MacroRunner } from '../../src/macros/runner.js';
++import type { MacroContext } from '../../src/macros/types.js';
++
++const mockCtx: MacroContext = {
++  openTab: vi.fn(async () => '{}'), switchTab: vi.fn(async () => '{}'),
++  closeTab: vi.fn(async () => '{}'), reattach: vi.fn(async () => '{}'),
++  observe: vi.fn(async () => '{}'), inspect: vi.fn(async () => '{}'),
++  diff: vi.fn(async () => '{}'), act: vi.fn(async () => '{}'),
++  findElement: vi.fn(async () => '{}'), findClick: vi.fn(async () => '{}'),
++  findType: vi.fn(async () => '{}'), smartType: vi.fn(async () => '{}'),
++  techScan: vi.fn(async () => '{}'), stealthCheck: vi.fn(async () => '{}'),
++  stealthEnable: vi.fn(async () => '{}'), stealthDisable: vi.fn(async () => '{}'),
++  interceptEnable: vi.fn(async () => '{}'), interceptAddRule: vi.fn(async () => '{}'),
++  interceptDisable: vi.fn(async () => '{}'), interceptLog: vi.fn(async () => '{}'),
++  captureList: vi.fn(async () => '{}'), captureRequest: vi.fn(async () => '{}'),
++  captureResponse: vi.fn(async () => '{}'), osintHarvest: vi.fn(async () => '{}'),
++  netIntel: vi.fn(async () => '{}'), gqlQuery: vi.fn(async () => '{}'),
++  siteMemory: vi.fn(async () => '{}'), siteMemoryClear: vi.fn(async () => '{}'),
++  wsWatch: vi.fn(async () => '{}'), wsFrames: vi.fn(async () => '{}'),
++  sleep: vi.fn(async () => {}), log: vi.fn(),
++};
++
++describe('MacroRunner.registerUserMacro', () => {
++  let dir: string;
++  let runner: MacroRunner;
++
++  beforeEach(() => {
++    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yautja-reg-'));
++    process.env.YAUTJA_USER_DIR = dir;
++    runner = new MacroRunner(mockCtx as any);
++  });
++
++  afterEach(() => {
++    fs.rmSync(dir, { recursive: true, force: true });
++    delete process.env.YAUTJA_USER_DIR;
++  });
++
++  const validSource = `export default { name: 'demo', description: 'demo', async run() { return 1; } };`;
++
++  it('writes file, imports, registers with source=user', async () => {
++    const r = await runner.registerUserMacro('demo', validSource);
++    expect(r.success).toBe(true);
++    if (r.success) {
++      expect(r.source).toBe('user');
++      expect(fs.existsSync(r.file)).toBe(true);
++    }
++    expect(runner.get('demo')?.source).toBe('user');
++  });
++
++  it('rejects invalid name', async () => {
++    const r = await runner.registerUserMacro('Bad Name!', validSource);
++    expect(r.success).toBe(false);
++    if (!r.success) expect(r.stage).toBe('validation');
++  });
++
++  it('refuses existing macro without overwrite=true', async () => {
++    await runner.registerUserMacro('demo', validSource);
++    const r = await runner.registerUserMacro('demo', validSource);
++    expect(r.success).toBe(false);
++    if (!r.success) expect(r.stage).toBe('persistence');
++  });
++
++  it('overwrites with overwrite=true', async () => {
++    await runner.registerUserMacro('demo', validSource);
++    const r = await runner.registerUserMacro('demo', validSource, true);
++    expect(r.success).toBe(true);
++  });
++
++  it('rejects source with no default export (shape)', async () => {
++    const r = await runner.registerUserMacro('badshape', `export const x = 1;`);
++    expect(r.success).toBe(false);
++    if (!r.success) expect(r.stage).toBe('shape');
++    expect(runner.get('badshape')).toBeUndefined();
++  });
++
++  it('rejects source that throws on import', async () => {
++    const r = await runner.registerUserMacro('badsrc', `throw new Error('boom');`);
++    expect(r.success).toBe(false);
++    if (!r.success) expect(r.stage).toBe('import');
++  });
++});
+\ No newline at end of file

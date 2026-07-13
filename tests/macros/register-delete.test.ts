@@ -1,0 +1,85 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { MacroRunner } from '../../src/macros/runner.js';
+import type { MacroContext } from '../../src/macros/types.js';
+
+const mockCtx: MacroContext = {
+  openTab: vi.fn(async () => '{}'), switchTab: vi.fn(async () => '{}'),
+  closeTab: vi.fn(async () => '{}'), reattach: vi.fn(async () => '{}'),
+  observe: vi.fn(async () => '{}'), inspect: vi.fn(async () => '{}'),
+  diff: vi.fn(async () => '{}'), act: vi.fn(async () => '{}'),
+  findElement: vi.fn(async () => '{}'), findClick: vi.fn(async () => '{}'),
+  findType: vi.fn(async () => '{}'), smartType: vi.fn(async () => '{}'),
+  techScan: vi.fn(async () => '{}'), stealthCheck: vi.fn(async () => '{}'),
+  stealthEnable: vi.fn(async () => '{}'), stealthDisable: vi.fn(async () => '{}'),
+  interceptEnable: vi.fn(async () => '{}'), interceptAddRule: vi.fn(async () => '{}'),
+  interceptDisable: vi.fn(async () => '{}'), interceptLog: vi.fn(async () => '{}'),
+  captureList: vi.fn(async () => '{}'), captureRequest: vi.fn(async () => '{}'),
+  captureResponse: vi.fn(async () => '{}'), osintHarvest: vi.fn(async () => '{}'),
+  netIntel: vi.fn(async () => '{}'), gqlQuery: vi.fn(async () => '{}'),
+  siteMemory: vi.fn(async () => '{}'), siteMemoryClear: vi.fn(async () => '{}'),
+  wsWatch: vi.fn(async () => '{}'), wsFrames: vi.fn(async () => '{}'),
+  sleep: vi.fn(async () => {}), log: vi.fn(),
+};
+
+describe('MacroRunner.registerUserMacro', () => {
+  let dir: string;
+  let runner: MacroRunner;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'yautja-reg-'));
+    process.env.YAUTJA_USER_DIR = dir;
+    runner = new MacroRunner(mockCtx as any);
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    delete process.env.YAUTJA_USER_DIR;
+  });
+
+  const validSource = `export default { name: 'demo', description: 'demo', async run() { return 1; } };`;
+
+  it('writes file, imports, registers with source=user', async () => {
+    const r = await runner.registerUserMacro('demo', validSource);
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.source).toBe('user');
+      expect(fs.existsSync(r.file)).toBe(true);
+    }
+    expect(runner.get('demo')?.source).toBe('user');
+  });
+
+  it('rejects invalid name', async () => {
+    const r = await runner.registerUserMacro('Bad Name!', validSource);
+    expect(r.success).toBe(false);
+    if (!r.success) expect(r.stage).toBe('validation');
+  });
+
+  it('refuses existing macro without overwrite=true', async () => {
+    await runner.registerUserMacro('demo', validSource);
+    const r = await runner.registerUserMacro('demo', validSource);
+    expect(r.success).toBe(false);
+    if (!r.success) expect(r.stage).toBe('persistence');
+  });
+
+  it('overwrites with overwrite=true', async () => {
+    await runner.registerUserMacro('demo', validSource);
+    const r = await runner.registerUserMacro('demo', validSource, true);
+    expect(r.success).toBe(true);
+  });
+
+  it('rejects source with no default export (shape)', async () => {
+    const r = await runner.registerUserMacro('badshape', `export const x = 1;`);
+    expect(r.success).toBe(false);
+    if (!r.success) expect(r.stage).toBe('shape');
+    expect(runner.get('badshape')).toBeUndefined();
+  });
+
+  it('rejects source that throws on import', async () => {
+    const r = await runner.registerUserMacro('badsrc', `throw new Error('boom');`);
+    expect(r.success).toBe(false);
+    if (!r.success) expect(r.stage).toBe('import');
+  });
+});
