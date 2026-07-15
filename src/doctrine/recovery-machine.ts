@@ -1,4 +1,4 @@
-import type { YautjaResponse, OperationMeta, StateMeta, EvidenceMeta, ContextMeta } from './types.js';
+import type { YautjaResponse, OperationMeta, StateMeta, ContextMeta } from './types.js';
 import { failure, success } from './types.js';
 import { toYautjaError, lookupCode } from './registry.js';
 import { RetryEngine, type RetryPolicy } from './retry-engine.js';
@@ -109,7 +109,7 @@ export class RecoveryMachine {
     return this.makeError(lastErrorCode ?? 'YJ.NET.REQUEST_TIMEOUT', opts, policy.max_attempts, policy.max_attempts, operation_id);
   }
 
-  private makeOperation(opts: ExecuteOptions, attempt: number, maxAttempts: number, opId: string): OperationMeta {
+  private makeOperation<T>(opts: ExecuteOptions<T>, attempt: number, maxAttempts: number, opId: string): OperationMeta {
     return {
       tool: opts.tool,
       action_type: opts.action_type,
@@ -121,7 +121,7 @@ export class RecoveryMachine {
     };
   }
 
-  private makeState(opts: ExecuteOptions): StateMeta {
+  private makeState<T>(opts: ExecuteOptions<T>): StateMeta {
     return {
       session_id: opts.session_id ?? this.config.tracker.session_id(),
       tab_id: opts.tab_id ?? 0,
@@ -140,9 +140,9 @@ export class RecoveryMachine {
     };
   }
 
-  private makeError(
+  private makeError<T>(
     code: string,
-    opts: ExecuteOptions,
+    opts: ExecuteOptions<T>,
     attempt: number,
     maxAttempts: number,
     operation_id?: string,
