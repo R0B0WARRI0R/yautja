@@ -45,3 +45,10 @@ export function makeError(type: ArsenalErrorType, message: string, hint?: string
     recoveryHint: hint,
   };
 }
+
+import { classifyLegacyError } from '../doctrine/classifier.js';
+import type { YautjaError } from '../doctrine/types.js';
+
+export function arsenalToDoctrine(err: ArsenalError): YautjaError {
+  return classifyLegacyError(err);
+}
