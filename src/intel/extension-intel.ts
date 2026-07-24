@@ -36,8 +36,9 @@ export class ExtensionIntel {
   // ─── Profile detection ──────────────────────────────────────
 
   /**
-   * Auto-detect the Chrome User Data directory.
+   * Auto-detect the Chromium-based browser User Data directory.
    * Override with YAUTJA_CHROME_USER_DATA env var.
+   * Auto-detects: Brave, Chrome, Edge, Vivaldi (in that order).
    */
   private async getUserDataDir(): Promise<string> {
     if (this.userDataDir) return this.userDataDir;
@@ -53,7 +54,10 @@ export class ExtensionIntel {
       join(process.env.USERPROFILE || process.env.HOME || '', 'AppData', 'Local');
 
     const candidates = [
+      join(localAppData, 'BraveSoftware', 'Brave-Browser', 'User Data'),
       join(localAppData, 'Google', 'Chrome', 'User Data'),
+      join(localAppData, 'Microsoft', 'Edge', 'User Data'),
+      join(localAppData, 'Vivaldi', 'User Data'),
     ];
 
     for (const dir of candidates) {
@@ -66,7 +70,7 @@ export class ExtensionIntel {
       }
     }
     throw new Error(
-      'Chrome User Data directory not found. Set YAUTJA_CHROME_USER_DATA env var.'
+      'Chromium browser User Data directory not found. Set YAUTJA_CHROME_USER_DATA env var.'
     );
   }
 
