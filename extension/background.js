@@ -449,6 +449,66 @@ async function handleCommand(msg) {
       break;
     }
 
+    // ─── Tampermonkey bridge (chrome.runtime.connect) ────────────
+    // Connects to TM's background SW via onConnectExternal and sends
+    // a message. TM routes it through the same handler as its own pages.
+    case 'tmMessage': {
+      const { tmExtId, message, timeout: timeoutMs } = msg;
+      const TM_DEFAULT = 'dhdgffkkebhmkfjojejmpbldmpobfkfo';
+      const targetId = tmExtId || TM_DEFAULT;
+      const wait = timeoutMs || 15000;
+
+      let responded = false;
+      let timer = null;
+      let port = null;
+
+      try {
+        port = chrome.runtime.connect(targetId, { name: 'yautja-bridge' });
+
+        timer = setTimeout(() => {
+          if (!responded) {
+            responded = true;
+            try { port.disconnect(); } catch {}
+            sendToYautja({ id, type: 'result', result: { error: 'timeout', detail: `No response after ${wait}ms` } });
+          }
+        }, wait);
+
+        port.onMessage.addListener((response) => {
+          if (responded) return;
+          // Collect response — TM may send partial/progress messages
+          if (response && (response.error || response.success || response.items !== undefined)) {
+            responded = true;
+            clearTimeout(timer);
+            try { port.disconnect(); } catch {}
+            sendToYautja({ id, type: 'result', result: response });
+          }
+        });
+
+        port.onDisconnect.addListener(() => {
+          if (!responded) {
+            responded = true;
+            clearTimeout(timer);
+            const err = chrome.runtime.lastError;
+            sendToYautja({ id, type: 'result', result: {
+              error: err ? err.message : 'disconnected',
+              hint: 'Tampermonkey may not allow external connections. Check TM Settings → Security → External Connect (set to "all").'
+            }});
+          }
+        });
+
+        // Send the actual message
+        port.postMessage(message);
+      } catch (e) {
+        if (!responded) {
+          responded = true;
+          if (timer) clearTimeout(timer);
+          if (port) try { port.disconnect(); } catch {}
+          sendToYautja({ id, type: 'error', error: `tmMessage failed: ${e.message}` });
+        }
+      }
+      break;
+    }
+
     default:
       sendToYautja({ id, type: 'error', error: `Unknown command type: ${msg.type}` });
   }

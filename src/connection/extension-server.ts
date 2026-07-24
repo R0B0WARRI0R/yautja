@@ -421,6 +421,11 @@ export class ExtensionServer {
     }
   }
 
+  /** Public alias for sendCommand — used by tm* tools for direct extension-to-extension messaging */
+  async sendRaw(msg: any, timeoutMs?: number): Promise<any> {
+    return this.sendCommand(msg, timeoutMs);
+  }
+
   private sendCommand(msg: any, timeoutMs = 30000): Promise<any> {
     return new Promise((resolve, reject) => {
       if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {

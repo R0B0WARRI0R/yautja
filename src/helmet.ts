@@ -1032,72 +1032,24 @@ export class Helmet {
           return JSON.stringify({ error: 'Either code (userscript source) or url (install URL) required' });
         }
 
-        const prevTabId = this.server.getCurrentTabId();
         try {
-          // Open TM options page in background
-          const opened = await this.server.openTab(`chrome-extension://${tmId}/options.html`);
-          await sleep(3000); // wait for TM dashboard to fully initialize
+          const message: Record<string, any> = code
+            ? { name: 'installFromUrl', data: { source: code } }
+            : { name: 'installFromUrl', data: { url: installUrl } };
 
-          // Attach debugger to the options page
-          await this.server.detachAll();
-          try {
-            await this.server.attachTab(opened.tabId);
-          } catch {
-            await sleep(1500);
-            await this.server.attachTab(opened.tabId);
-          }
-          await this.server.enableDomains(['Runtime']);
-          await sleep(500);
+          const result = await this.server.sendRaw({
+            type: 'tmMessage',
+            tmExtId: tmId,
+            message,
+            timeout: 20000,
+          });
 
-          // Build the install expression
-          const installData = installUrl
-            ? `{name:"installFromUrl",data:{url:${JSON.stringify(installUrl)}}}`
-            : `{name:"installFromUrl",data:{source:${JSON.stringify(code)}}}`;
-
-          const jsExpr = `new Promise((resolve) => {
-            if (typeof window.sendMessage !== 'function') {
-              resolve(JSON.stringify({error:'sendMessage not ready - page not fully loaded'}));
-              return;
-            }
-            let done = false;
-            const handler = (result) => {
-              if (done) return;
-              done = true;
-              resolve(JSON.stringify(result));
-            };
-            window.sendMessage(${installData}, handler);
-            setTimeout(() => {
-              if (!done) { done = true; resolve(JSON.stringify({error:'timeout - no response from Tampermonkey'})); }
-            }, 15000);
-          })`;
-
-          const result = await this.translator.execute({ type: 'evaluateAsync', expression: jsExpr });
-
-          // Close the temporary TM tab
-          try { await this.server.closeTab(opened.tabId); } catch {}
-
-          // Restore previous tab
-          if (prevTabId) {
-            try {
-              await this.server.attachTab(prevTabId);
-              await this.server.enableDomains(['Network', 'Page', 'Runtime']);
-            } catch {}
-          }
-
-          let parsed: any = result.ok ? result.value : result;
-          if (typeof parsed === 'string') {
-            try { parsed = JSON.parse(parsed); } catch {}
-          }
           return JSON.stringify({
-            success: !parsed?.error,
-            result: parsed,
+            success: !result?.error,
+            result,
           }, null, 2);
         } catch (e: any) {
-          // Restore previous tab on error
-          if (prevTabId) {
-            try { await this.server.attachTab(prevTabId); } catch {}
-          }
-          return JSON.stringify({ error: e.message, hint: 'Make sure Tampermonkey is installed and enabled' });
+          return JSON.stringify({ error: e.message, hint: 'Make sure Tampermonkey is installed and "External Connect" is set to "all" in TM Settings → Security' });
         }
       }
       case 'tmToggleScript': {
@@ -1109,68 +1061,28 @@ export class Helmet {
           return JSON.stringify({ error: 'uuid and enabled (boolean) required' });
         }
 
-        const prevTabId = this.server.getCurrentTabId();
         try {
-          const opened = await this.server.openTab(`chrome-extension://${tmId}/options.html`);
-          await sleep(3000);
-
-          await this.server.detachAll();
-          try {
-            await this.server.attachTab(opened.tabId);
-          } catch {
-            await sleep(1500);
-            await this.server.attachTab(opened.tabId);
-          }
-          await this.server.enableDomains(['Runtime']);
-          await sleep(500);
-
-          const jsExpr = `new Promise((resolve) => {
-            if (typeof window.sendMessage !== 'function') {
-              resolve(JSON.stringify({error:'sendMessage not ready'}));
-              return;
-            }
-            let done = false;
-            const handler = (result) => {
-              if (done) return;
-              done = true;
-              resolve(JSON.stringify(result || {success:true}));
-            };
-            window.sendMessage({
-              method:"modifyScriptOptions",
-              uuid:${JSON.stringify(uuid)},
-              enabled:${enabled},
-              reload:false
-            }, handler);
-            setTimeout(() => {
-              if (!done) { done = true; resolve(JSON.stringify({error:'timeout'})); }
-            }, 10000);
-          })`;
-
-          const result = await this.translator.execute({ type: 'evaluateAsync', expression: jsExpr });
-
-          try { await this.server.closeTab(opened.tabId); } catch {}
-
-          if (prevTabId) {
-            try {
-              await this.server.attachTab(prevTabId);
-              await this.server.enableDomains(['Network', 'Page', 'Runtime']);
-            } catch {}
-          }
-
-          let parsed: any = result.ok ? result.value : result;
-          if (typeof parsed === 'string') {
-            try { parsed = JSON.parse(parsed); } catch {}
-          }
-          return JSON.stringify({
-            success: !parsed?.error,
+          const message = {
+            method: 'modifyScriptOptions',
             uuid,
             enabled,
-            result: parsed,
+            reload: false,
+          };
+
+          const result = await this.server.sendRaw({
+            type: 'tmMessage',
+            tmExtId: tmId,
+            message,
+            timeout: 10000,
+          });
+
+          return JSON.stringify({
+            success: !result?.error,
+            uuid,
+            enabled,
+            result,
           }, null, 2);
         } catch (e: any) {
-          if (prevTabId) {
-            try { await this.server.attachTab(prevTabId); } catch {}
-          }
           return JSON.stringify({ error: e.message });
         }
       }
