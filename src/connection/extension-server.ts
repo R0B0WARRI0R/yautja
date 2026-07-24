@@ -334,6 +334,13 @@ export class ExtensionServer {
         this.notifyStatus({ connected: true, extensionVersion: msg.version });
         break;
 
+      case 'ping':
+        // Keepalive ping from extension — reply with pong to generate bidirectional activity
+        if (this.socket) {
+          this.socket.send(JSON.stringify({ type: 'pong' }));
+        }
+        break;
+
       case 'pong':
         break;
 

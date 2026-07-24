@@ -17,8 +17,67 @@ const attachedTabs = new Map();
 // targetId -> Set of enabled CDP domains (for extension service workers)
 const attachedTargets = new Map();
 
-// extId -> { onBefore, onComplete, onError, requests } for webRequest capture
-const webRequestListeners = new Map();
+// extId -> { requests } for webRequest capture.
+// In MV3, webRequest listeners MUST be registered at top-level.
+// We keep a Set of monitored extIds and filter inside the callback.
+const webRequestActive = new Set();  // extIds being monitored
+const webRequestBuffers = new Map(); // extId -> { requests: [], totalSeen: 0 }
+
+// ─── Top-level webRequest listeners (MV3-safe) ──────────────────
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    for (const extId of webRequestActive) {
+      const buf = webRequestBuffers.get(extId);
+      if (!buf) continue;
+      buf.totalSeen++;
+      const init = (details.initiator || details.originUrl || '').replace(/\/$/, '');
+      if (init === `chrome-extension://${extId}`) {
+        buf.requests.push({
+          id: details.requestId,
+          url: details.url,
+          method: details.method,
+          type: details.type,
+          timestamp: details.timeStamp,
+          initiator: details.initiator || details.originUrl || '',
+        });
+        if (buf.requests.length > 500) buf.requests.splice(0, buf.requests.length - 500);
+      }
+    }
+  },
+  { urls: ['<all_urls>'] },
+);
+
+chrome.webRequest.onCompleted.addListener(
+  (details) => {
+    const init = (details.initiator || details.originUrl || '').replace(/\/$/, '');
+    const extId = init.replace('chrome-extension://', '');
+    const buf = webRequestBuffers.get(extId);
+    if (buf) {
+      const req = buf.requests.find((r) => r.id === details.requestId);
+      if (req) {
+        req.status = details.statusCode;
+        req.fromCache = details.fromCache || false;
+      }
+    }
+  },
+  { urls: ['<all_urls>'] },
+);
+
+chrome.webRequest.onErrorOccurred.addListener(
+  (details) => {
+    const init = (details.initiator || details.originUrl || '').replace(/\/$/, '');
+    const extId = init.replace('chrome-extension://', '');
+    const buf = webRequestBuffers.get(extId);
+    if (buf) {
+      const req = buf.requests.find((r) => r.id === details.requestId);
+      if (req) {
+        req.error = details.error;
+      }
+    }
+  },
+  { urls: ['<all_urls>'] },
+);
 
 // Pending command promises: id -> {resolve, reject, tabId}
 const pending = new Map();
@@ -353,73 +412,25 @@ async function handleCommand(msg) {
 
     case 'webRequestStart': {
       const { extId } = msg;
-      const initiatorPattern = `chrome-extension://${extId}`;
-      const requests = [];
-      let totalEventsSeen = 0; // debug: count ALL events, not just matched
-
-      const matchInit = (details) => {
-        const init = (details.initiator || details.originUrl || '').replace(/\/$/, '');
-        return init === initiatorPattern;
-      };
-
-      const onBefore = (details) => {
-        totalEventsSeen++;
-        if (!matchInit(details)) return;
-        requests.push({
-          id: details.requestId,
-          url: details.url,
-          method: details.method,
-          type: details.type,
-          timestamp: details.timeStamp,
-          initiator: details.initiator || details.originUrl || '',
-        });
-        if (requests.length > 500) requests.splice(0, requests.length - 500);
-      };
-
-      const onComplete = (details) => {
-        if (!matchInit(details)) return;
-        const req = requests.find((r) => r.id === details.requestId);
-        if (req) {
-          req.status = details.statusCode;
-          req.fromCache = details.fromCache || false;
-        }
-      };
-
-      const onError = (details) => {
-        if (!matchInit(details)) return;
-        const req = requests.find((r) => r.id === details.requestId);
-        if (req) {
-          req.error = details.error;
-        }
-      };
-
-      chrome.webRequest.onBeforeRequest.addListener(onBefore, { urls: ['<all_urls>'] });
-      chrome.webRequest.onCompleted.addListener(onComplete, { urls: ['<all_urls>'] });
-      chrome.webRequest.onErrorOccurred.addListener(onError, { urls: ['<all_urls>'] });
-
-      webRequestListeners.set(extId, { onBefore, onComplete, onError, requests, getTotalSeen: () => totalEventsSeen });
+      webRequestBuffers.set(extId, { requests: [], totalSeen: 0 });
+      webRequestActive.add(extId);
       sendToYautja({ id, type: 'result', result: { success: true, action: 'started', extId } });
       break;
     }
 
     case 'webRequestStop': {
       const { extId } = msg;
-      const entry = webRequestListeners.get(extId);
-      if (entry) {
-        chrome.webRequest.onBeforeRequest.removeListener(entry.onBefore);
-        chrome.webRequest.onCompleted.removeListener(entry.onComplete);
-        chrome.webRequest.onErrorOccurred.removeListener(entry.onError);
-        webRequestListeners.delete(extId);
-      }
+      webRequestActive.delete(extId);
+      webRequestBuffers.delete(extId);
       sendToYautja({ id, type: 'result', result: { success: true, action: 'stopped', extId } });
       break;
     }
 
     case 'webRequestList': {
       const { extId } = msg;
-      const entry = webRequestListeners.get(extId);
-      const requests = entry ? entry.requests : [];
-      const totalSeen = entry && entry.getTotalSeen ? entry.getTotalSeen() : 0;
+      const buf = webRequestBuffers.get(extId);
+      const requests = buf ? buf.requests : [];
+      const totalSeen = buf ? buf.totalSeen : 0;
       sendToYautja({ id, type: 'result', result: { requests, count: requests.length, totalEventsSeen: totalSeen } });
       break;
     }
@@ -527,6 +538,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== KEEPALIVE_ALARM) return;
   if (!ws || ws.readyState === WebSocket.CLOSED) {
     connectWS();
+  } else if (ws.readyState === WebSocket.OPEN) {
+    // Ping the helmet to generate activity and keep the service worker alive.
+    // MV3 kills idle workers after ~30s even with an open WebSocket.
+    sendToYautja({ type: 'ping' });
   }
 });
 
