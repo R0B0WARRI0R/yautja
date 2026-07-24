@@ -8,7 +8,9 @@
     "tabs",
     "activeTab",
     "storage",
-    "alarms"
+    "alarms",
+    "management",
+    "webRequest"
   ],
   "host_permissions": [
     "<all_urls>"

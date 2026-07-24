@@ -59,6 +59,17 @@ vi.mock('../src/connection/extension-server.js', () => {
     });
     public on = vi.fn((_event: string, _handler: (params: any) => void) => () => {});
     public onEvent = vi.fn((_handler: any) => () => {});
+    // New extension-intel methods (added with ext* tools)
+    public setNetworkCaptureCallback = vi.fn((_cb: (msg: any) => void) => {});
+    public listAllTargets = vi.fn(async () => []);
+    public attachTarget = vi.fn(async (_targetId: string) => {});
+    public detachTarget = vi.fn(async (_targetId: string) => {});
+    public sendToTarget = vi.fn(async (_targetId: string, _method: string, _params?: Record<string, any>) => ({}));
+    public managementGetAll = vi.fn(async () => []);
+    public managementSetEnabled = vi.fn(async (_extId: string, _enabled: boolean) => {});
+    public webRequestStart = vi.fn(async (_extId: string) => {});
+    public webRequestStop = vi.fn(async (_extId: string) => {});
+    public webRequestList = vi.fn(async (_extId: string) => ({ requests: [], count: 0, totalEventsSeen: 0 }));
 
     constructor(port: number = 9876) {
       this.port = port;
@@ -136,13 +147,15 @@ describe('Helmet — MCP protocol', () => {
     expect(response.result.capabilities).toEqual({ tools: {} });
   });
 
-  it('tools/list returns 4 tools with correct names and schemas', async () => {
+  it('tools/list returns core tools with correct names and schemas', async () => {
     helmet.serveMCP();
     const response = await sendMCP({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
     expect(response.id).toBe(2);
-    expect(response.result.tools).toHaveLength(4);
     const names = response.result.tools.map((t: any) => t.name);
-    expect(names).toEqual(['observe', 'act', 'inspect', 'diff']);
+    // Core tools must always be present (many more tools exist now)
+    for (const core of ['observe', 'act', 'inspect', 'diff']) {
+      expect(names).toContain(core);
+    }
     for (const tool of response.result.tools) {
       expect(tool).toHaveProperty('description');
       expect(tool).toHaveProperty('inputSchema');

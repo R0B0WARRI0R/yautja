@@ -14,6 +14,8 @@ export interface ExtensionEvent {
   tabId: number;
   method: string;
   params: any;
+  /** Present only for events originating from an extension service-worker target. */
+  targetId?: string;
 }
 
 type EventHandler = (event: ExtensionEvent) => void;
@@ -22,6 +24,15 @@ type StatusHandler = (status: ExtensionStatus) => void;
 interface ExtensionStatus {
   connected: boolean;
   extensionVersion?: string;
+}
+
+export interface CdpTarget {
+  id: string;
+  type: string;
+  title: string;
+  url: string;
+  attached: boolean;
+  tabId: number | null;
 }
 
 interface PendingCommand {
@@ -184,6 +195,60 @@ export class ExtensionServer {
     await this.sendCommand({ type: 'switchToTab', tabId });
   }
 
+  // ─── Extension target commands ──────────────────────────────────
+
+  async listAllTargets(): Promise<CdpTarget[]> {
+    const result = await this.sendCommand({ type: 'listAllTargets' });
+    return result.targets || [];
+  }
+
+  async attachTarget(targetId: string): Promise<void> {
+    await this.sendCommand({ type: 'attachTarget', targetId });
+  }
+
+  async detachTarget(targetId: string): Promise<void> {
+    await this.sendCommand({ type: 'detachTarget', targetId });
+  }
+
+  async sendToTarget(targetId: string, method: string, params?: Record<string, any>): Promise<any> {
+    if (!this.isExtensionConnected()) {
+      throw new Error(`ExtensionServer: cannot send to target — extension not connected`);
+    }
+    const result = await this.sendCommand({
+      type: 'commandTarget',
+      targetId,
+      method,
+      params: params ?? {},
+    });
+    return result;
+  }
+
+  // ─── Management API (chrome.management) ───────────────────────
+
+  async managementGetAll(): Promise<any[]> {
+    const result = await this.sendCommand({ type: 'managementGetAll' });
+    return result.extensions || [];
+  }
+
+  async managementSetEnabled(extId: string, enabled: boolean): Promise<void> {
+    await this.sendCommand({ type: 'managementSetEnabled', extId, enabled });
+  }
+
+  // ─── webRequest API (extension network capture) ───────────────
+
+  async webRequestStart(extId: string): Promise<void> {
+    await this.sendCommand({ type: 'webRequestStart', extId });
+  }
+
+  async webRequestStop(extId: string): Promise<void> {
+    await this.sendCommand({ type: 'webRequestStop', extId });
+  }
+
+  async webRequestList(extId: string): Promise<{ requests: any[]; count: number; totalEventsSeen: number }> {
+    const result = await this.sendCommand({ type: 'webRequestList', extId });
+    return { requests: result.requests || [], count: result.count || 0, totalEventsSeen: result.totalEventsSeen || 0 };
+  }
+
   // ─── CDP-level commands (same as CDPSessionManager) ──────────────
 
   async send(method: string, params?: Record<string, any>): Promise<any> {
@@ -309,9 +374,21 @@ export class ExtensionServer {
             handler(event);
           } catch {}
         }
+
+        // Also forward target-based events (extension service workers)
+        if (msg.targetId) {
+          const targetEvent = { ...event, targetId: msg.targetId };
+          for (const handler of this.eventHandlers) {
+            try {
+              handler(targetEvent as ExtensionEvent);
+            } catch {}
+          }
+        }
         break;
       }
 
+      case 'targetAttached':
+      case 'targetDetached':
       case 'attached':
       case 'detached':
       case 'tabClosed':

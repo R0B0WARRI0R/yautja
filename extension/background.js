@@ -14,6 +14,12 @@ let reconnectTimer = null;
 // tabId -> Set of enabled CDP domains
 const attachedTabs = new Map();
 
+// targetId -> Set of enabled CDP domains (for extension service workers)
+const attachedTargets = new Map();
+
+// extId -> { onBefore, onComplete, onError, requests } for webRequest capture
+const webRequestListeners = new Map();
+
 // Pending command promises: id -> {resolve, reject, tabId}
 const pending = new Map();
 let nextId = 1;
@@ -224,6 +230,200 @@ async function handleCommand(msg) {
       break;
     }
 
+    // ─── Extension target commands ───────────────────────────────
+
+    case 'listAllTargets': {
+      try {
+        const targets = await chrome.debugger.getTargets();
+        const result = targets
+          .filter((t) => t.url && t.url.startsWith('chrome-extension://'))
+          .map((t) => ({
+            id: t.id,
+            type: t.type,
+            title: t.title || '',
+            url: t.url || '',
+            attached: t.attached || false,
+            tabId: t.tabId || null,
+          }));
+        sendToYautja({ id, type: 'result', result: { targets: result } });
+      } catch (e) {
+        sendToYautja({ id, type: 'error', error: `listAllTargets failed: ${e.message}` });
+      }
+      break;
+    }
+
+    case 'attachTarget': {
+      const { targetId } = msg;
+      if (attachedTargets.has(targetId)) {
+        sendToYautja({ id, type: 'result', result: { alreadyAttached: true } });
+        break;
+      }
+      try {
+        await chrome.debugger.attach({ targetId }, DEBUGGER_VERSION);
+        attachedTargets.set(targetId, new Set());
+        sendToYautja({ type: 'targetAttached', targetId });
+        sendToYautja({ id, type: 'result', result: { attached: true } });
+      } catch (e) {
+        sendToYautja({ id, type: 'error', error: `attachTarget failed: ${e.message}` });
+      }
+      break;
+    }
+
+    case 'detachTarget': {
+      const { targetId } = msg;
+      try {
+        await chrome.debugger.detach({ targetId });
+        attachedTargets.delete(targetId);
+        sendToYautja({ type: 'targetDetached', targetId });
+        sendToYautja({ id, type: 'result', result: { detached: true } });
+      } catch (e) {
+        attachedTargets.delete(targetId);
+        sendToYautja({ id, type: 'result', result: { detached: true, note: e.message } });
+      }
+      break;
+    }
+
+    case 'commandTarget': {
+      const { targetId, method, params } = msg;
+      if (!attachedTargets.has(targetId)) {
+        sendToYautja({ id, type: 'error', error: `Target ${targetId} not attached` });
+        break;
+      }
+      try {
+        const result = await chrome.debugger.sendCommand(
+          { targetId },
+          method,
+          params || {},
+        );
+
+        if (method && method.endsWith('.enable')) {
+          const domain = method.slice(0, -7);
+          attachedTargets.get(targetId).add(domain);
+        }
+        if (method && method.endsWith('.disable')) {
+          const domain = method.slice(0, -8);
+          attachedTargets.get(targetId).delete(domain);
+        }
+
+        sendToYautja({ id, type: 'result', result: result || {} });
+      } catch (e) {
+        sendToYautja({ id, type: 'error', error: `CDP target ${method} failed: ${e.message}` });
+      }
+      break;
+    }
+
+    // ─── Management API (chrome.management) ──────────────────────
+
+    case 'managementGetAll': {
+      try {
+        const all = await chrome.management.getAll();
+        const extensions = all
+          .filter((e) => e.type === 'extension')
+          .map((e) => ({
+            id: e.id,
+            name: e.name,
+            version: e.version,
+            enabled: e.enabled,
+            type: e.type,
+            installType: e.installType,
+            description: e.description || '',
+            permissions: e.permissions || [],
+            hostPermissions: e.hostPermissions || [],
+            mayDisable: e.mayDisable !== false,
+          }));
+        sendToYautja({ id, type: 'result', result: { extensions } });
+      } catch (e) {
+        sendToYautja({ id, type: 'error', error: `managementGetAll failed: ${e.message}` });
+      }
+      break;
+    }
+
+    case 'managementSetEnabled': {
+      const { extId, enabled } = msg;
+      try {
+        await chrome.management.setEnabled(extId, enabled);
+        sendToYautja({ id, type: 'result', result: { success: true } });
+      } catch (e) {
+        sendToYautja({ id, type: 'error', error: `managementSetEnabled failed: ${e.message}` });
+      }
+      break;
+    }
+
+    // ─── webRequest API (extension network capture) ──────────────
+
+    case 'webRequestStart': {
+      const { extId } = msg;
+      const initiatorPattern = `chrome-extension://${extId}`;
+      const requests = [];
+      let totalEventsSeen = 0; // debug: count ALL events, not just matched
+
+      const matchInit = (details) => {
+        const init = (details.initiator || details.originUrl || '').replace(/\/$/, '');
+        return init === initiatorPattern;
+      };
+
+      const onBefore = (details) => {
+        totalEventsSeen++;
+        if (!matchInit(details)) return;
+        requests.push({
+          id: details.requestId,
+          url: details.url,
+          method: details.method,
+          type: details.type,
+          timestamp: details.timeStamp,
+          initiator: details.initiator || details.originUrl || '',
+        });
+        if (requests.length > 500) requests.splice(0, requests.length - 500);
+      };
+
+      const onComplete = (details) => {
+        if (!matchInit(details)) return;
+        const req = requests.find((r) => r.id === details.requestId);
+        if (req) {
+          req.status = details.statusCode;
+          req.fromCache = details.fromCache || false;
+        }
+      };
+
+      const onError = (details) => {
+        if (!matchInit(details)) return;
+        const req = requests.find((r) => r.id === details.requestId);
+        if (req) {
+          req.error = details.error;
+        }
+      };
+
+      chrome.webRequest.onBeforeRequest.addListener(onBefore, { urls: ['<all_urls>'] });
+      chrome.webRequest.onCompleted.addListener(onComplete, { urls: ['<all_urls>'] });
+      chrome.webRequest.onErrorOccurred.addListener(onError, { urls: ['<all_urls>'] });
+
+      webRequestListeners.set(extId, { onBefore, onComplete, onError, requests, getTotalSeen: () => totalEventsSeen });
+      sendToYautja({ id, type: 'result', result: { success: true, action: 'started', extId } });
+      break;
+    }
+
+    case 'webRequestStop': {
+      const { extId } = msg;
+      const entry = webRequestListeners.get(extId);
+      if (entry) {
+        chrome.webRequest.onBeforeRequest.removeListener(entry.onBefore);
+        chrome.webRequest.onCompleted.removeListener(entry.onComplete);
+        chrome.webRequest.onErrorOccurred.removeListener(entry.onError);
+        webRequestListeners.delete(extId);
+      }
+      sendToYautja({ id, type: 'result', result: { success: true, action: 'stopped', extId } });
+      break;
+    }
+
+    case 'webRequestList': {
+      const { extId } = msg;
+      const entry = webRequestListeners.get(extId);
+      const requests = entry ? entry.requests : [];
+      const totalSeen = entry && entry.getTotalSeen ? entry.getTotalSeen() : 0;
+      sendToYautja({ id, type: 'result', result: { requests, count: requests.length, totalEventsSeen: totalSeen } });
+      break;
+    }
+
     default:
       sendToYautja({ id, type: 'error', error: `Unknown command type: ${msg.type}` });
   }
@@ -233,23 +433,40 @@ async function handleCommand(msg) {
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
-  if (tabId == null) return;
-  sendToYautja({
-    type: 'event',
-    tabId,
-    method,
-    params,
-  });
+  const targetId = source.targetId;
+
+  if (tabId == null && targetId == null) return;
+
+  if (targetId != null) {
+    // Extension target event
+    sendToYautja({
+      type: 'event',
+      targetId,
+      method,
+      params,
+    });
+  } else {
+    // Regular tab event
+    sendToYautja({
+      type: 'event',
+      tabId,
+      method,
+      params,
+    });
+  }
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   const tabId = source.tabId;
-  attachedTabs.delete(tabId);
-  sendToYautja({
-    type: 'detached',
-    tabId,
-    reason: reason || 'unknown',
-  });
+  const targetId = source.targetId;
+  if (tabId != null) {
+    attachedTabs.delete(tabId);
+    sendToYautja({ type: 'detached', tabId, reason: reason || 'unknown' });
+  }
+  if (targetId != null) {
+    attachedTargets.delete(targetId);
+    sendToYautja({ type: 'targetDetached', targetId, reason: reason || 'unknown' });
+  }
 });
 
 // ─── Tab lifecycle ────────────────────────────────────────────────

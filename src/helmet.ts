@@ -26,6 +26,8 @@ import { LearningLoop } from './intel/learning-loop.js';
 import { NetworkCapture } from './intel/network-capture.js';
 import { MacroRunner } from './macros/runner.js';
 import { loadBuiltins, loadUserMacros } from './macros/loader.js';
+import { ExtensionIntel } from './intel/extension-intel.js';
+import { CdpRemoteClient } from './connection/cdp-remote.js';
 import type { BrowserState } from './memory/browser-state.js';
 import type { Anomaly } from './vision/base-sensor.js';
 import type { BrowserAction } from './arsenal/action-types.js';
@@ -88,6 +90,8 @@ export class Helmet {
   private learningLoop: LearningLoop;
   private networkCapture: NetworkCapture;
   private macroRunner: MacroRunner;
+  private extIntel: ExtensionIntel;
+  private cdpRemote: CdpRemoteClient;
   private attached = false;
 
   constructor(config?: Partial<HelmetConfig>) {
@@ -122,6 +126,8 @@ export class Helmet {
     );
     this.networkCapture = new NetworkCapture(this.server);
     this.macroRunner = new MacroRunner(this);
+    this.extIntel = new ExtensionIntel();
+    this.cdpRemote = new CdpRemoteClient(9222);
     this.server.setNetworkCaptureCallback((msg: any) => {
       if (msg.action === 'add' && msg.entry) {
         this.networkCapture.storeRequest(msg.entry);
@@ -762,6 +768,100 @@ export class Helmet {
         const result = await this.macroRunner.deleteUserMacro(args.name);
         return JSON.stringify(result);
       }
+      // ─── Extension inspection tools (hybrid: disk + management + CDP) ──
+      case 'extList': {
+        // Try chrome.management first (richer data), fall back to debugger.getTargets
+        try {
+          const extensions = await this.server.managementGetAll();
+          const filtered = args.type
+            ? extensions.filter((e: any) => e.type === args.type)
+            : extensions;
+          return JSON.stringify({ extensions: filtered, count: filtered.length, source: 'management' }, null, 2);
+        } catch {
+          const targets = await this.server.listAllTargets();
+          const filtered = args.type
+            ? targets.filter((t) => t.type === args.type)
+            : targets;
+          return JSON.stringify({ extensions: filtered, count: filtered.length, source: 'debugger-targets' }, null, 2);
+        }
+      }
+      case 'extAttach': {
+        // Deprecated — no longer needed. Disk/management/CDP backends operate by extId directly.
+        return JSON.stringify({
+          success: true,
+          note: 'extAttach is no longer required. extManifest/extSource/extStorage read from disk; extNetwork uses webRequest; extEval uses CDP remote on :9222.',
+        });
+      }
+      case 'extManifest': {
+        const extId = args.extId;
+        if (!extId) return JSON.stringify({ error: 'extId required' });
+        try {
+          const manifest = await this.extIntel.readManifest(extId);
+          return JSON.stringify({ extId, manifest }, null, 2);
+        } catch (e: any) {
+          return JSON.stringify({ error: e.message });
+        }
+      }
+      case 'extSource': {
+        const extId = args.extId;
+        const filePath = args.path || 'manifest.json';
+        if (!extId) return JSON.stringify({ error: 'extId required' });
+        try {
+          const content = await this.extIntel.readSource(extId, filePath);
+          return JSON.stringify({ extId, path: filePath, content });
+        } catch (e: any) {
+          return JSON.stringify({ error: e.message });
+        }
+      }
+      case 'extStorage': {
+        const extId = args.extId;
+        if (!extId) return JSON.stringify({ error: 'extId required' });
+        const key = args.key;
+        try {
+          const data = await this.extIntel.readStorage(extId, key);
+          return JSON.stringify({ extId, area: 'local', keys: Object.keys(data).length, data });
+        } catch (e: any) {
+          return JSON.stringify({ error: e.message });
+        }
+      }
+      case 'extNetwork': {
+        const extId = args.extId;
+        const action = args.action || 'list';
+        if (!extId) return JSON.stringify({ error: 'extId required' });
+        try {
+          if (action === 'start') {
+            await this.server.webRequestStart(extId);
+            return JSON.stringify({ success: true, action: 'started', extId });
+          }
+          if (action === 'stop') {
+            await this.server.webRequestStop(extId);
+            return JSON.stringify({ success: true, action: 'stopped', extId });
+          }
+          const { requests, count, totalEventsSeen } = await this.server.webRequestList(extId);
+          return JSON.stringify({ requests, count, totalEventsSeen });
+        } catch (e: any) {
+          return JSON.stringify({ error: e.message });
+        }
+      }
+      case 'extEval': {
+        const extId = args.extId;
+        const expression = args.expression;
+        if (!extId || !expression) return JSON.stringify({ error: 'extId and expression required' });
+        const available = await this.cdpRemote.isAvailable();
+        if (!available) {
+          return JSON.stringify({
+            error: 'Remote debugging port not available. Launch Chrome with --remote-debugging-port=9222 to use extEval.',
+          });
+        }
+        try {
+          const { result, exceptionDetails } = await this.cdpRemote.evaluate(
+            extId, expression, args.awaitPromise ?? false,
+          );
+          return JSON.stringify({ result, exceptionDetails });
+        } catch (e: any) {
+          return JSON.stringify({ error: e.message });
+        }
+      }
       default:
         return `Unknown tool: ${name}`;
     }
@@ -1297,6 +1397,89 @@ const MCP_TOOLS = [
         name: { type: 'string', description: 'Macro name to delete' },
       },
       required: ['name'],
+    },
+  },
+  // ─── Extension inspection tools ───────────────────────────────────
+  {
+    name: 'extList',
+    description: 'List all installed Chrome extensions. Uses chrome.management API (richer data: permissions, enabled state, install type). Falls back to debugger targets if management permission unavailable.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        type: { type: 'string', description: 'Filter by target type (e.g. "service_worker")' },
+      },
+    },
+  },
+  {
+    name: 'extAttach',
+    description: 'Deprecated. No longer required — extManifest, extSource, extStorage, extNetwork work by extId directly without attach. Returns a no-op success for backward compat.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        extId: { type: 'string', description: 'Chrome extension ID (32-char alphanumeric from chrome://extensions)' },
+      },
+      required: ['extId'],
+    },
+  },
+  {
+    name: 'extEval',
+    description: 'Evaluate JavaScript in an extension service worker at runtime. Requires Chrome launched with --remote-debugging-port=9222. Has full chrome.* API access in the target extension context.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        extId: { type: 'string', description: 'Extension ID' },
+        expression: { type: 'string', description: 'JavaScript expression to evaluate' },
+        awaitPromise: { type: 'boolean', description: 'Await the result if it returns a Promise (default false)' },
+      },
+      required: ['extId', 'expression'],
+    },
+  },
+  {
+    name: 'extStorage',
+    description: 'Read chrome.storage.local from disk (LevelDB). No Chrome changes needed — reads the extension storage directory directly. Returns all keys or a specific key.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        extId: { type: 'string', description: 'Extension ID' },
+        area: { type: 'string', enum: ['local', 'sync', 'session'], description: 'Storage area (default "local")' },
+        key: { type: 'string', description: 'Specific key to read (default: all keys)' },
+      },
+      required: ['extId'],
+    },
+  },
+  {
+    name: 'extSource',
+    description: 'Read the source code of a file within an extension from disk. No Chrome changes needed. Default path is manifest.json.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        extId: { type: 'string', description: 'Extension ID' },
+        path: { type: 'string', description: 'File path within the extension (default "manifest.json")' },
+      },
+      required: ['extId'],
+    },
+  },
+  {
+    name: 'extManifest',
+    description: 'Read the manifest.json of an extension from disk. No Chrome changes needed. Returns parsed JSON.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        extId: { type: 'string', description: 'Extension ID' },
+      },
+      required: ['extId'],
+    },
+  },
+  {
+    name: 'extNetwork',
+    description: 'Capture HTTP requests made by an extension. Uses chrome.webRequest filtered by initiator origin. action="start" to begin, action="list" to see captured requests, action="stop" to stop. Requires webRequest permission in Yautja extension.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        extId: { type: 'string', description: 'Extension ID' },
+        action: { type: 'string', enum: ['start', 'stop', 'list'], description: 'Action to perform (default "list")' },
+      },
+      required: ['extId'],
     },
   },
 ];
