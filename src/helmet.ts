@@ -903,6 +903,277 @@ export class Helmet {
           return JSON.stringify({ error: e.message });
         }
       }
+      // ─── Tampermonkey integration tools ──────────────────────────────
+      case 'tmListScripts': {
+        const tmId = args.extId || 'dhdgffkkebhmkfjojejmpbldmpobfkfo';
+        try {
+          const data = await this.extIntel.readStorage(tmId);
+          const scripts: any[] = [];
+          for (const [key, raw] of Object.entries(data)) {
+            if (key.startsWith('@meta#')) {
+              const uuid = key.substring(6);
+              const meta = raw as any;
+              if (!meta || meta.deleted) continue;
+              scripts.push({
+                uuid,
+                name: meta.name || '(unnamed)',
+                version: meta.version || '',
+                namespace: meta.namespace || '',
+                description: (meta.description || '').substring(0, 200),
+                enabled: meta.options?.enabled !== false,
+                matches: meta.matches || [],
+                includes: meta.includes || [],
+                excludes: meta.excludes || [],
+                run_at: meta['run-at'] || 'document-idle',
+                grants: meta.grant || [],
+                requires: (meta.requires || []).map((r: any) => r.abs_url || r.unsafe_url).filter(Boolean),
+                resources: (meta.resources || []).map((r: any) => r.name).filter(Boolean),
+                url: meta.url || meta.downloadURL || '',
+                lastModified: meta.lastModified || 0,
+                system: meta.system || false,
+              });
+            }
+          }
+          scripts.sort((a, b) => a.name.localeCompare(b.name));
+          return JSON.stringify({ scripts, count: scripts.length, extId: tmId }, null, 2);
+        } catch (e: any) {
+          return JSON.stringify({ error: e.message, hint: 'Tampermonkey may not be installed or no profile found' });
+        }
+      }
+      case 'tmGetScript': {
+        const tmId = args.extId || 'dhdgffkkebhmkfjojejmpbldmpobfkfo';
+        const uuid = args.uuid;
+        if (!uuid) return JSON.stringify({ error: 'uuid required' });
+        try {
+          const data = await this.extIntel.readStorage(tmId);
+          const metaKey = `@meta#${uuid}`;
+          const sourceKey = `@source#${uuid}`;
+          const meta = data[metaKey];
+          const source = data[sourceKey];
+          if (!meta) return JSON.stringify({ error: `Script with UUID ${uuid} not found` });
+          return JSON.stringify({
+            uuid,
+            name: meta.name,
+            version: meta.version,
+            namespace: meta.namespace,
+            description: meta.description,
+            enabled: meta.options?.enabled !== false,
+            matches: meta.matches || [],
+            excludes: meta.excludes || [],
+            includes: meta.includes || [],
+            grants: meta.grant || [],
+            code: source || '(source not found in storage)',
+            codeSize: source ? source.length : 0,
+          }, null, 2);
+        } catch (e: any) {
+          return JSON.stringify({ error: e.message });
+        }
+      }
+      case 'tmSearchScripts': {
+        const query = args.query as string | undefined;
+        const domain = args.domain as string | undefined;
+        const limit = (args.limit as number) || 20;
+
+        try {
+          let url: string;
+          if (domain) {
+            url = `https://greasyfork.org/en/scripts/by-site/${encodeURIComponent(domain)}.json?per_page=${limit}`;
+          } else if (query) {
+            url = `https://greasyfork.org/en/scripts.json?q=${encodeURIComponent(query)}&per_page=${limit}`;
+          } else {
+            return JSON.stringify({ error: 'Either query or domain required' });
+          }
+
+          const resp = await fetch(url, {
+            headers: { 'Accept': 'application/json' },
+            signal: AbortSignal.timeout(15000),
+          });
+          if (!resp.ok) {
+            return JSON.stringify({ error: `GreasyFork API returned ${resp.status}` });
+          }
+          const data = await resp.json() as any;
+          const results = (data.query || []).map((s: any) => ({
+            id: s.id,
+            name: s.name,
+            description: s.description?.substring(0, 300),
+            author: s.users?.map((u: any) => u.name).join(', ') || '',
+            version: s.version || '',
+            url: s.url,
+            code_url: s.code_url,
+            code_size: s.code_size || 0,
+            daily_installs: s.daily_installs || 0,
+            total_installs: s.total_installs || 0,
+            fan_score: s.fan_score || '0',
+            good_ratings: s.good_ratings || 0,
+            bad_ratings: s.bad_ratings || 0,
+            created_at: s.created_at,
+            code_updated_at: s.code_updated_at,
+            license: s.license || '',
+            locale: s.locale || '',
+          }));
+
+          return JSON.stringify({
+            results,
+            count: results.length,
+            source: 'greasyfork.org',
+            searchType: domain ? 'by-site' : 'query',
+            query: query || domain,
+          }, null, 2);
+        } catch (e: any) {
+          return JSON.stringify({ error: e.message });
+        }
+      }
+      case 'tmInstallScript': {
+        const tmId = args.extId || 'dhdgffkkebhmkfjojejmpbldmpobfkfo';
+        const code = args.code as string | undefined;
+        const installUrl = args.url as string | undefined;
+
+        if (!code && !installUrl) {
+          return JSON.stringify({ error: 'Either code (userscript source) or url (install URL) required' });
+        }
+
+        const prevTabId = this.server.getCurrentTabId();
+        try {
+          // Open TM options page in background
+          const opened = await this.server.openTab(`chrome-extension://${tmId}/options.html`);
+          await sleep(3000); // wait for TM dashboard to fully initialize
+
+          // Attach debugger to the options page
+          await this.server.detachAll();
+          try {
+            await this.server.attachTab(opened.tabId);
+          } catch {
+            await sleep(1500);
+            await this.server.attachTab(opened.tabId);
+          }
+          await this.server.enableDomains(['Runtime']);
+          await sleep(500);
+
+          // Build the install expression
+          const installData = installUrl
+            ? `{name:"installFromUrl",data:{url:${JSON.stringify(installUrl)}}}`
+            : `{name:"installFromUrl",data:{source:${JSON.stringify(code)}}}`;
+
+          const jsExpr = `new Promise((resolve) => {
+            if (typeof window.sendMessage !== 'function') {
+              resolve(JSON.stringify({error:'sendMessage not ready - page not fully loaded'}));
+              return;
+            }
+            let done = false;
+            const handler = (result) => {
+              if (done) return;
+              done = true;
+              resolve(JSON.stringify(result));
+            };
+            window.sendMessage(${installData}, handler);
+            setTimeout(() => {
+              if (!done) { done = true; resolve(JSON.stringify({error:'timeout - no response from Tampermonkey'})); }
+            }, 15000);
+          })`;
+
+          const result = await this.translator.execute({ type: 'evaluateAsync', expression: jsExpr });
+
+          // Close the temporary TM tab
+          try { await this.server.closeTab(opened.tabId); } catch {}
+
+          // Restore previous tab
+          if (prevTabId) {
+            try {
+              await this.server.attachTab(prevTabId);
+              await this.server.enableDomains(['Network', 'Page', 'Runtime']);
+            } catch {}
+          }
+
+          let parsed: any = result.ok ? result.value : result;
+          if (typeof parsed === 'string') {
+            try { parsed = JSON.parse(parsed); } catch {}
+          }
+          return JSON.stringify({
+            success: !parsed?.error,
+            result: parsed,
+          }, null, 2);
+        } catch (e: any) {
+          // Restore previous tab on error
+          if (prevTabId) {
+            try { await this.server.attachTab(prevTabId); } catch {}
+          }
+          return JSON.stringify({ error: e.message, hint: 'Make sure Tampermonkey is installed and enabled' });
+        }
+      }
+      case 'tmToggleScript': {
+        const tmId = args.extId || 'dhdgffkkebhmkfjojejmpbldmpobfkfo';
+        const uuid = args.uuid as string | undefined;
+        const enabled = args.enabled as boolean | undefined;
+
+        if (!uuid || enabled === undefined) {
+          return JSON.stringify({ error: 'uuid and enabled (boolean) required' });
+        }
+
+        const prevTabId = this.server.getCurrentTabId();
+        try {
+          const opened = await this.server.openTab(`chrome-extension://${tmId}/options.html`);
+          await sleep(3000);
+
+          await this.server.detachAll();
+          try {
+            await this.server.attachTab(opened.tabId);
+          } catch {
+            await sleep(1500);
+            await this.server.attachTab(opened.tabId);
+          }
+          await this.server.enableDomains(['Runtime']);
+          await sleep(500);
+
+          const jsExpr = `new Promise((resolve) => {
+            if (typeof window.sendMessage !== 'function') {
+              resolve(JSON.stringify({error:'sendMessage not ready'}));
+              return;
+            }
+            let done = false;
+            const handler = (result) => {
+              if (done) return;
+              done = true;
+              resolve(JSON.stringify(result || {success:true}));
+            };
+            window.sendMessage({
+              method:"modifyScriptOptions",
+              uuid:${JSON.stringify(uuid)},
+              enabled:${enabled},
+              reload:false
+            }, handler);
+            setTimeout(() => {
+              if (!done) { done = true; resolve(JSON.stringify({error:'timeout'})); }
+            }, 10000);
+          })`;
+
+          const result = await this.translator.execute({ type: 'evaluateAsync', expression: jsExpr });
+
+          try { await this.server.closeTab(opened.tabId); } catch {}
+
+          if (prevTabId) {
+            try {
+              await this.server.attachTab(prevTabId);
+              await this.server.enableDomains(['Network', 'Page', 'Runtime']);
+            } catch {}
+          }
+
+          let parsed: any = result.ok ? result.value : result;
+          if (typeof parsed === 'string') {
+            try { parsed = JSON.parse(parsed); } catch {}
+          }
+          return JSON.stringify({
+            success: !parsed?.error,
+            uuid,
+            enabled,
+            result: parsed,
+          }, null, 2);
+        } catch (e: any) {
+          if (prevTabId) {
+            try { await this.server.attachTab(prevTabId); } catch {}
+          }
+          return JSON.stringify({ error: e.message });
+        }
+      }
       default:
         return `Unknown tool: ${name}`;
     }
@@ -1521,6 +1792,66 @@ const MCP_TOOLS = [
         action: { type: 'string', enum: ['start', 'stop', 'list'], description: 'Action to perform (default "list")' },
       },
       required: ['extId'],
+    },
+  },
+  // ─── Tampermonkey integration tools ──────────────────────────────
+  {
+    name: 'tmListScripts',
+    description: 'List all userscripts installed in Tampermonkey. Reads from chrome.storage.local on disk (no browser interaction needed). Returns script metadata: name, version, enabled state, URL matches, grants, etc.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        extId: { type: 'string', description: 'Tampermonkey extension ID (default: auto-detected)' },
+      },
+    },
+  },
+  {
+    name: 'tmGetScript',
+    description: 'Get the full source code and metadata of a specific Tampermonkey userscript by UUID. Use tmListScripts first to find the UUID.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        uuid: { type: 'string', description: 'Script UUID (from tmListScripts)' },
+        extId: { type: 'string', description: 'Tampermonkey extension ID (default: auto-detected)' },
+      },
+      required: ['uuid'],
+    },
+  },
+  {
+    name: 'tmSearchScripts',
+    description: 'Search GreasyFork.org for userscripts. Search by keyword query or by domain (finds scripts that run on a specific website). Returns name, description, author, install counts, ratings, and code_url for each result.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        query: { type: 'string', description: 'Search keyword (e.g. "dark mode", "adblock")' },
+        domain: { type: 'string', description: 'Find scripts for a specific site (e.g. "youtube.com", "github.com")' },
+        limit: { type: 'number', description: 'Max results (default 20, max 100)' },
+      },
+    },
+  },
+  {
+    name: 'tmInstallScript',
+    description: 'Install a userscript into Tampermonkey. Provide the full userscript source code (with ==UserScript== header) or a URL to install from. Opens TM options page briefly, calls the internal API, then restores your tab.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        code: { type: 'string', description: 'Full userscript source code (including ==UserScript== header block)' },
+        url: { type: 'string', description: 'URL to install from (alternative to code)' },
+        extId: { type: 'string', description: 'Tampermonkey extension ID (default: auto-detected)' },
+      },
+    },
+  },
+  {
+    name: 'tmToggleScript',
+    description: 'Enable or disable a Tampermonkey userscript by UUID. Opens TM options page briefly to call the internal API, then restores your tab.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        uuid: { type: 'string', description: 'Script UUID (from tmListScripts)' },
+        enabled: { type: 'boolean', description: 'true to enable, false to disable' },
+        extId: { type: 'string', description: 'Tampermonkey extension ID (default: auto-detected)' },
+      },
+      required: ['uuid', 'enabled'],
     },
   },
 ];
