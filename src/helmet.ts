@@ -28,6 +28,7 @@ import { MacroRunner } from './macros/runner.js';
 import { loadBuiltins, loadUserMacros } from './macros/loader.js';
 import { ExtensionIntel } from './intel/extension-intel.js';
 import { CdpRemoteClient } from './connection/cdp-remote.js';
+import { MitmProxyServer } from './proxy/mitm-proxy.js';
 import type { BrowserState } from './memory/browser-state.js';
 import type { Anomaly } from './vision/base-sensor.js';
 import type { BrowserAction } from './arsenal/action-types.js';
@@ -92,6 +93,7 @@ export class Helmet {
   private macroRunner: MacroRunner;
   private extIntel: ExtensionIntel;
   private cdpRemote: CdpRemoteClient;
+  private mitmProxy: MitmProxyServer;
   private attached = false;
 
   constructor(config?: Partial<HelmetConfig>) {
@@ -128,6 +130,7 @@ export class Helmet {
     this.macroRunner = new MacroRunner(this);
     this.extIntel = new ExtensionIntel();
     this.cdpRemote = new CdpRemoteClient(9222);
+    this.mitmProxy = new MitmProxyServer(9877);
     this.server.setNetworkCaptureCallback((msg: any) => {
       if (msg.action === 'add' && msg.entry) {
         this.networkCapture.storeRequest(msg.entry);
@@ -201,6 +204,11 @@ export class Helmet {
     this.audio.unsubscribe();
     this.motion.unsubscribe();
     this.threat.unsubscribe();
+    // Stop MITM proxy if running and clear browser proxy settings
+    if (this.mitmProxy.isRunning()) {
+      await this.server.proxyStop().catch(() => {});
+      await this.mitmProxy.stop();
+    }
     await this.server.stop();
   }
 
@@ -379,38 +387,22 @@ export class Helmet {
       }
       case 'openTab': {
         const targetUrl = args.url || 'about:blank';
-        await this.translator.execute({ type: 'evaluate', expression: `window.open(${JSON.stringify(targetUrl)}, '_blank')` });
+        // Use the extension's native chrome.tabs.create (works even without an attached tab)
+        const opened = await this.server.openTab(targetUrl);
         
-        let targetTab: any = null;
-        for (let attempt = 0; attempt < 5; attempt++) {
-          await sleep(500 + attempt * 500);
-          const tabs = await this.server.listTabs();
-          targetTab = tabs.find((t) => t.url === targetUrl) 
-                   || tabs.find((t) => t.url.startsWith(targetUrl.replace(/\?.*$/, '')))
-                   || tabs[tabs.length - 1];
-          if (targetTab && !targetTab.url.includes('chrome://') && !targetTab.url.includes('about:blank')) break;
-          targetTab = null;
-        }
+        await sleep(1500); // let the page start loading
         
-        if (!targetTab) {
-          const tabs2 = await this.server.listTabs();
-          targetTab = tabs2[tabs2.length - 1];
+        await this.server.detachAll();
+        try {
+          await this.server.attachTab(opened.tabId);
+        } catch {
+          await sleep(1000);
+          try { await this.server.attachTab(opened.tabId); } catch {}
         }
-        
-        if (targetTab) {
-          await this.server.detachAll();
-          try {
-            await this.server.attachTab(targetTab.tabId);
-          } catch {
-            await sleep(1000);
-            try { await this.server.attachTab(targetTab.tabId); } catch {}
-          }
-          for (const domain of ['Network', 'Page', 'Runtime', 'Performance', 'Security']) {
-            try { await this.server.enableDomains([domain]); } catch {}
-          }
-          return JSON.stringify({ success: true, tabId: targetTab.tabId, url: targetTab.url });
+        for (const domain of ['Network', 'Page', 'Runtime', 'Performance', 'Security']) {
+          try { await this.server.enableDomains([domain]); } catch {}
         }
-        return JSON.stringify({ success: false, error: 'Could not find or attach to new tab' });
+        return JSON.stringify({ success: true, tabId: opened.tabId, url: opened.url });
       }
       case 'closeTab': {
         const tabId = args.tabId;
@@ -830,15 +822,64 @@ export class Helmet {
         if (!extId) return JSON.stringify({ error: 'extId required' });
         try {
           if (action === 'start') {
-            await this.server.webRequestStart(extId);
-            return JSON.stringify({ success: true, action: 'started', extId });
+            // Start the tunnel proxy if not running
+            if (!this.mitmProxy.isRunning()) {
+              await this.mitmProxy.start();
+              // Tell the extension to route through our proxy
+              await this.server.proxyStart(9877);
+              return JSON.stringify({
+                success: true,
+                action: 'started',
+                extId,
+                method: 'tunnel-proxy',
+                proxyPort: 9877,
+                caCertInstalled: true,
+                note: 'HTTPS traffic captured via CONNECT tunneling (domain only, no content decryption)',
+              });
+            }
+            // Proxy already running — just clear buffer for fresh capture
+            await this.mitmProxy.clear();
+            await this.server.proxyStart(9877);
+            return JSON.stringify({ success: true, action: 'started', extId, method: 'tunnel-proxy', note: 'Proxy already running, buffer cleared' });
           }
           if (action === 'stop') {
-            await this.server.webRequestStop(extId);
+            // Stop routing through proxy
+            await this.server.proxyStop();
             return JSON.stringify({ success: true, action: 'stopped', extId });
           }
-          const { requests, count, totalEventsSeen } = await this.server.webRequestList(extId);
-          return JSON.stringify({ requests, count, totalEventsSeen });
+          if (action === 'installCert') {
+            if (!this.mitmProxy.hasCaCert()) {
+              // Need to start proxy once to generate cert
+              if (!this.mitmProxy.isRunning()) {
+                await this.mitmProxy.start();
+              }
+              await this.mitmProxy.stop();
+            }
+            // Install CA cert into Windows trust store
+            const { exec } = await import('child_process');
+            const realPath = this.mitmProxy.getCaCertPath();
+            return new Promise((resolve) => {
+              exec(`certutil -user -addstore Root "${realPath}"`, (err, stdout) => {
+                if (err) {
+                  resolve(JSON.stringify({ success: false, error: err.message, hint: `Run manually: certutil -user -addstore Root "${realPath}"` }));
+                } else {
+                  resolve(JSON.stringify({ success: true, installed: true, certPath: realPath, output: stdout }));
+                }
+              });
+            }).then(s => s as string);
+          }
+          // action === 'list': return requests captured by the MITM proxy
+          const hostPattern = args.hostPattern;
+          const { requests, count, total } = await this.mitmProxy.getRequests({ hostPattern, limit: args.limit || 100 });
+          const stats = await this.mitmProxy.stats();
+          return JSON.stringify({
+            requests,
+            count,
+            method: 'tunnel-proxy',
+            totalProxyRequests: total,
+            uniqueHosts: stats.uniqueHosts,
+            topHosts: Object.entries(stats.hosts).sort((a, b) => b[1] - a[1]).slice(0, 20),
+          });
         } catch (e: any) {
           return JSON.stringify({ error: e.message });
         }

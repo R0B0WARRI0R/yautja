@@ -170,6 +170,11 @@ export class ExtensionServer {
     }
   }
 
+  async openTab(url: string): Promise<{ tabId: number; url: string }> {
+    const result = await this.sendCommand({ type: 'openTab', url });
+    return { tabId: result.tabId, url: result.url || url };
+  }
+
   async closeTab(tabId: number): Promise<void> {
     await this.sendCommand({ type: 'closeTab', tabId });
     if (this.currentTabId === tabId) {
@@ -244,12 +249,20 @@ export class ExtensionServer {
     await this.sendCommand({ type: 'webRequestStop', extId });
   }
 
-  async webRequestList(extId: string): Promise<{ requests: any[]; count: number; totalEventsSeen: number }> {
+  async webRequestList(extId: string): Promise<{ requests: any[]; count: number; totalEventsSeen: number; wrAllEvents: number }> {
     const result = await this.sendCommand({ type: 'webRequestList', extId });
-    return { requests: result.requests || [], count: result.count || 0, totalEventsSeen: result.totalEventsSeen || 0 };
+    return { requests: result.requests || [], count: result.count || 0, totalEventsSeen: result.totalEventsSeen || 0, wrAllEvents: result.wrAllEvents || 0 };
   }
 
   // ─── CDP-level commands (same as CDPSessionManager) ──────────────
+
+  async proxyStart(port: number): Promise<any> {
+    return await this.sendCommand({ type: 'proxyStart', port });
+  }
+
+  async proxyStop(): Promise<any> {
+    return await this.sendCommand({ type: 'proxyStop' });
+  }
 
   async send(method: string, params?: Record<string, any>): Promise<any> {
     if (!this.isExtensionConnected()) {

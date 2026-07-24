@@ -120,6 +120,10 @@ export class NetworkCapture {
 
   clear(): void { this.requests.clear(); }
 
+  getAllRequests(): CapturedRequest[] {
+    return Array.from(this.requests.values());
+  }
+
   stats(): { total: number; withBody: number; withMatches: number; uniqueMatches: Set<string> } {
     const all = Array.from(this.requests.values());
     const withBody = all.filter(r => r.requestBody || r.responseBody);

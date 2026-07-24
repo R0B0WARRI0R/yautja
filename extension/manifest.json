@@ -10,7 +10,8 @@
     "storage",
     "alarms",
     "management",
-    "webRequest"
+    "webRequest",
+    "proxy"
   ],
   "host_permissions": [
     "<all_urls>"

@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "classic-level": "^3.0.0",
+    "http-mitm-proxy": "^1.1.0",
     "playwright": "^1.49.0",
     "ulid": "^3.0.2",
     "ws": "^8.18.0",

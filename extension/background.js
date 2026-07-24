@@ -17,29 +17,27 @@ const attachedTabs = new Map();
 // targetId -> Set of enabled CDP domains (for extension service workers)
 const attachedTargets = new Map();
 
-// extId -> { requests } for webRequest capture.
-// In MV3, webRequest listeners MUST be registered at top-level.
-// We keep a Set of monitored extIds and filter inside the callback.
-const webRequestActive = new Set();  // extIds being monitored
-const webRequestBuffers = new Map(); // extId -> { requests: [], totalSeen: 0 }
-
-// ─── Top-level webRequest listeners (MV3-safe) ──────────────────
+// ─── webRequest capture (top-level, MV3-safe) ─────────────────────────────
+const webRequestActive = new Set();   // extIds being monitored
+const webRequestBuffers = new Map();  // extId -> { requests: [], totalSeen: 0 }
+let _wrTotalEvents = 0;               // diagnostic: count ALL events seen by listener
 
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
-    for (const extId of webRequestActive) {
-      const buf = webRequestBuffers.get(extId);
-      if (!buf) continue;
-      buf.totalSeen++;
-      const init = (details.initiator || details.originUrl || '').replace(/\/$/, '');
-      if (init === `chrome-extension://${extId}`) {
+    _wrTotalEvents++;
+    const init = (details.initiator || '').replace(/\/$/, '');
+    const fromExt = init.startsWith('chrome-extension://') ? init.replace('chrome-extension://', '') : null;
+    if (fromExt && webRequestActive.has(fromExt)) {
+      const buf = webRequestBuffers.get(fromExt);
+      if (buf) {
+        buf.totalSeen++;
         buf.requests.push({
           id: details.requestId,
           url: details.url,
           method: details.method,
           type: details.type,
           timestamp: details.timeStamp,
-          initiator: details.initiator || details.originUrl || '',
+          initiator: init,
         });
         if (buf.requests.length > 500) buf.requests.splice(0, buf.requests.length - 500);
       }
@@ -50,15 +48,12 @@ chrome.webRequest.onBeforeRequest.addListener(
 
 chrome.webRequest.onCompleted.addListener(
   (details) => {
-    const init = (details.initiator || details.originUrl || '').replace(/\/$/, '');
-    const extId = init.replace('chrome-extension://', '');
-    const buf = webRequestBuffers.get(extId);
-    if (buf) {
+    const init = (details.initiator || '').replace(/\/$/, '');
+    const fromExt = init.startsWith('chrome-extension://') ? init.replace('chrome-extension://', '') : null;
+    if (fromExt && webRequestBuffers.has(fromExt)) {
+      const buf = webRequestBuffers.get(fromExt);
       const req = buf.requests.find((r) => r.id === details.requestId);
-      if (req) {
-        req.status = details.statusCode;
-        req.fromCache = details.fromCache || false;
-      }
+      if (req) { req.status = details.statusCode; req.fromCache = details.fromCache || false; }
     }
   },
   { urls: ['<all_urls>'] },
@@ -66,14 +61,12 @@ chrome.webRequest.onCompleted.addListener(
 
 chrome.webRequest.onErrorOccurred.addListener(
   (details) => {
-    const init = (details.initiator || details.originUrl || '').replace(/\/$/, '');
-    const extId = init.replace('chrome-extension://', '');
-    const buf = webRequestBuffers.get(extId);
-    if (buf) {
+    const init = (details.initiator || '').replace(/\/$/, '');
+    const fromExt = init.startsWith('chrome-extension://') ? init.replace('chrome-extension://', '') : null;
+    if (fromExt && webRequestBuffers.has(fromExt)) {
+      const buf = webRequestBuffers.get(fromExt);
       const req = buf.requests.find((r) => r.id === details.requestId);
-      if (req) {
-        req.error = details.error;
-      }
+      if (req) { req.error = details.error; }
     }
   },
   { urls: ['<all_urls>'] },
@@ -147,32 +140,17 @@ async function handleCommand(msg) {
   const { id } = msg;
 
   switch (msg.type) {
-    case 'ping':
-      sendToYautja({ id, type: 'pong' });
-      break;
-
-    case 'listTabs': {
-      try {
-        const tabs = await chrome.tabs.query({});
-        const result = tabs
-          .filter((t) => t.id != null)
-          .map((t) => ({
-            tabId: t.id,
-            url: t.url || '',
-            title: t.title || '',
-            active: t.active,
-            index: t.index,
-            windowId: t.windowId,
-          }));
-        sendToYautja({ id, type: 'tabs', tabs: result });
-      } catch (e) {
-        sendToYautja({ id, type: 'error', error: `listTabs failed: ${e.message}` });
-      }
+    case 'ping': {
+      sendToYautja({ id, type: 'result', result: { pong: true, wrTotalEvents: _wrTotalEvents } });
       break;
     }
 
     case 'attach': {
-      const { tabId } = msg;
+      const tabId = msg.tabId;
+      if (!tabId && tabId !== 0) {
+        sendToYautja({ id, type: 'error', error: 'attach requires tabId' });
+        break;
+      }
       if (attachedTabs.has(tabId)) {
         sendToYautja({ id, type: 'result', result: { alreadyAttached: true } });
         break;
@@ -189,14 +167,13 @@ async function handleCommand(msg) {
     }
 
     case 'detach': {
-      const { tabId } = msg;
+      const tabId = msg.tabId;
       try {
         await chrome.debugger.detach({ tabId });
         attachedTabs.delete(tabId);
         sendToYautja({ type: 'detached', tabId });
         sendToYautja({ id, type: 'result', result: { detached: true } });
       } catch (e) {
-        // Already detached is fine
         attachedTabs.delete(tabId);
         sendToYautja({ id, type: 'result', result: { detached: true, note: e.message } });
       }
@@ -204,30 +181,30 @@ async function handleCommand(msg) {
     }
 
     case 'detachAll': {
-      for (const tabId of attachedTabs.keys()) {
+      const detached = [];
+      for (const tabId of [...attachedTabs.keys()]) {
         try {
           await chrome.debugger.detach({ tabId });
-        } catch {}
+          detached.push(tabId);
+        } catch {
+          // Already detached or error — remove from tracking anyway
+        }
+        attachedTabs.delete(tabId);
       }
-      attachedTabs.clear();
-      sendToYautja({ id, type: 'result', result: { detachedAll: true } });
+      sendToYautja({ id, type: 'result', result: { detached: true, tabs: detached } });
       break;
     }
 
     case 'command': {
-      const { tabId, method, params } = msg;
+      const tabId = msg.tabId;
+      const method = msg.method;
+      const params = msg.params || {};
       if (!attachedTabs.has(tabId)) {
         sendToYautja({ id, type: 'error', error: `Tab ${tabId} not attached` });
         break;
       }
       try {
-        const result = await chrome.debugger.sendCommand(
-          { tabId },
-          method,
-          params || {},
-        );
-
-        // Track enabled domains for re-attach after reconnect
+        const result = await chrome.debugger.sendCommand({ tabId }, method, params);
         if (method && method.endsWith('.enable')) {
           const domain = method.slice(0, -7);
           attachedTabs.get(tabId).add(domain);
@@ -236,7 +213,6 @@ async function handleCommand(msg) {
           const domain = method.slice(0, -8);
           attachedTabs.get(tabId).delete(domain);
         }
-
         sendToYautja({ id, type: 'result', result: result || {} });
       } catch (e) {
         sendToYautja({ id, type: 'error', error: `CDP ${method} failed: ${e.message}` });
@@ -244,48 +220,55 @@ async function handleCommand(msg) {
       break;
     }
 
-    case 'switchToTab': {
-      const { tabId } = msg;
+    case 'listTabs': {
       try {
-        await chrome.tabs.update(tabId, { active: true });
-        sendToYautja({ id, type: 'result', result: { switched: true } });
+        const tabs = await chrome.tabs.query({});
+        const result = tabs.map((t) => ({
+          tabId: t.id,
+          url: t.url || '',
+          title: t.title || '',
+          active: t.active,
+          index: t.index,
+          windowId: t.windowId,
+        }));
+        sendToYautja({ id, type: 'result', result: { tabs: result } });
       } catch (e) {
-        sendToYautja({ id, type: 'error', error: `switchToTab failed: ${e.message}` });
+        sendToYautja({ id, type: 'error', error: `listTabs failed: ${e.message}` });
+      }
+      break;
+    }
+
+    case 'openTab': {
+      try {
+        const tab = await chrome.tabs.create({ url: msg.url, active: true });
+        sendToYautja({ id, type: 'result', result: { tabId: tab.id, url: tab.url || msg.url } });
+      } catch (e) {
+        sendToYautja({ id, type: 'error', error: `openTab failed: ${e.message}` });
       }
       break;
     }
 
     case 'closeTab': {
-      const { tabId } = msg;
       try {
-        if (attachedTabs.has(tabId)) {
-          try { await chrome.debugger.detach({ tabId }); } catch {}
-          attachedTabs.delete(tabId);
-        }
-        await chrome.tabs.remove(tabId);
-        sendToYautja({ id, type: 'result', result: { closed: true } });
+        await chrome.tabs.remove(msg.tabId);
+        sendToYautja({ id, type: 'result', result: { closed: true, tabId: msg.tabId } });
       } catch (e) {
         sendToYautja({ id, type: 'error', error: `closeTab failed: ${e.message}` });
       }
       break;
     }
 
-    case 'getCapturedGql': {
-      const tabId = msg.tabId;
-      const limit = msg.limit || 100;
-      let data = lastCapturedGql;
-      if (tabId !== undefined) data = data.filter(c => c.tabId === tabId);
-      sendToYautja({ id, type: 'result', result: { items: data.slice(-limit), total: data.length } });
-      break;
-    }
-
-    case 'clearCapturedGql': {
-      if (msg.tabId !== undefined) {
-        lastCapturedGql = lastCapturedGql.filter(c => c.tabId !== msg.tabId);
-      } else {
-        lastCapturedGql = [];
+    case 'switchToTab': {
+      try {
+        await chrome.tabs.update(msg.tabId, { active: true });
+        const tab = await chrome.tabs.get(msg.tabId);
+        if (tab.windowId) {
+          await chrome.windows.update(tab.windowId, { focused: true });
+        }
+        sendToYautja({ id, type: 'result', result: { tabId: msg.tabId } });
+      } catch (e) {
+        sendToYautja({ id, type: 'error', error: `switchToTab failed: ${e.message}` });
       }
-      sendToYautja({ id, type: 'result', result: { cleared: true } });
       break;
     }
 
@@ -414,7 +397,7 @@ async function handleCommand(msg) {
       const { extId } = msg;
       webRequestBuffers.set(extId, { requests: [], totalSeen: 0 });
       webRequestActive.add(extId);
-      sendToYautja({ id, type: 'result', result: { success: true, action: 'started', extId } });
+      sendToYautja({ id, type: 'result', result: { success: true, action: 'started', extId, wrTotalEvents: _wrTotalEvents } });
       break;
     }
 
@@ -431,7 +414,38 @@ async function handleCommand(msg) {
       const buf = webRequestBuffers.get(extId);
       const requests = buf ? buf.requests : [];
       const totalSeen = buf ? buf.totalSeen : 0;
-      sendToYautja({ id, type: 'result', result: { requests, count: requests.length, totalEventsSeen: totalSeen } });
+      sendToYautja({ id, type: 'result', result: { requests, count: requests.length, totalEventsSeen: totalSeen, wrAllEvents: _wrTotalEvents } });
+      break;
+    }
+
+    // ─── Local proxy control (chrome.proxy API) ──────────────────
+
+    case 'proxyStart': {
+      const proxyPort = msg.port || 9877;
+      chrome.proxy.settings.set({
+        value: {
+          mode: 'fixed_servers',
+          rules: {
+            singleProxy: {
+              scheme: 'http',
+              host: '127.0.0.1',
+              port: proxyPort,
+            },
+            bypassList: ['localhost', '127.0.0.1'],
+          },
+        },
+        scope: 'regular',
+      }, () => {
+        const err = chrome.runtime.lastError;
+        sendToYautja({ id, type: 'result', result: err ? { success: false, error: err.message } : { success: true, port: proxyPort } });
+      });
+      break;
+    }
+
+    case 'proxyStop': {
+      chrome.proxy.settings.clear({ scope: 'regular' }, () => {
+        sendToYautja({ id, type: 'result', result: { success: true, cleared: true } });
+      });
       break;
     }
 
@@ -478,54 +492,6 @@ chrome.debugger.onDetach.addListener((source, reason) => {
     attachedTargets.delete(targetId);
     sendToYautja({ type: 'targetDetached', targetId, reason: reason || 'unknown' });
   }
-});
-
-// ─── Tab lifecycle ────────────────────────────────────────────────
-
-chrome.tabs.onRemoved.addListener((tabId) => {
-  if (attachedTabs.has(tabId)) {
-    attachedTabs.delete(tabId);
-    sendToYautja({ type: 'tabClosed', tabId });
-  }
-});
-
-// ─── Content script messages (GQL captures) ────────────────────────────────────────────────
-
-let lastCapturedGql = [];
-
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === 'yautja-gql-request') {
-    lastCapturedGql.push({
-      url: msg.url,
-      ops: msg.ops || [],
-      hash: msg.hash,
-      timestamp: Date.now(),
-      tabId: sender.tab?.id,
-    });
-    if (lastCapturedGql.length > 500) lastCapturedGql = lastCapturedGql.slice(-500);
-    return false;
-  }
-});
-
-// ─── Popup communication ──────────────────────────────────────────────────────────────────
-
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === 'getState') {
-    sendResponse({
-      connected,
-      attachedTabs: attachedTabs.size,
-    });
-    return false;
-  }
-  if (msg.type === 'forceReconnect') {
-    if (ws) {
-      try { ws.close(); } catch {}
-    }
-    setTimeout(() => connectWS(), 200);
-    sendResponse({ ok: true });
-    return false;
-  }
-  return false;
 });
 
 // ─── Service worker keep-alive ────────────────────────────────────
