@@ -2,10 +2,13 @@
 
 ## What changed
 
-Two commits since `e787fe4`:
+Several commits since `e787fe4`:
 
-- **`e92b97e`** — Replaced the dead `tmMessage` bridge with `tmInstallViaBridge`. Generic: accepts any TM method via `message: { method, ...params }`. Open a hidden tab on `greasyfork.org`, attach CDP, inject `chrome.runtime.connect(TM_ID).postMessage(message)` from the page context → TM's `onMessageExternal` accepts it (page-side bridge, NOT `onConnectExternal`).
+- **`e92b97e`** — Replaced the dead `tmMessage` bridge with `tmInstallViaBridge`. Generic: accepts any TM method via `message: { method, ...params }`. Open a hidden tab on `greasyfork.org`, attach CDP, inject from the page context → TM's `onMessageExternal` accepts it (page-side bridge, NOT `onConnectExternal`).
 - **`650e723`** — `tmToggleScript` reads the raw meta (`@meta#<uuid>`) directly from LevelDB instead of using the simplified `tmGetScript` shape, then sends `saveScript` via the bridge.
+- **`145ccd5`** — Switched from `functionDeclaration + arguments` to `expression` with `JSON.stringify`-embedded values (CDP `BINDINGS` quirk).
+- **`08c270c`** — Added wait loop for `chrome.runtime` (lazy on hidden tabs).
+- **`31d1dca`** — **Switched from `chrome.runtime.connect` to `chrome.runtime.sendMessage`**. Chrome only exposes `sendMessage` (not `connect`) to web pages on `externally_connectable` origins. The previous `connect` call hit `Cannot read properties of undefined (reading 'connect')` because `chrome.runtime.connect` is undefined on web pages.
 
 ## Steps to test
 
