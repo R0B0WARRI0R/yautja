@@ -512,16 +512,30 @@ async function handleCommand(msg) {
         // is accepted by TM's onMessageExternal handler (NOT onConnectExternal).
         // Embed values via JSON.stringify — avoids CDP's BINDINGS quirk when using
         // functionDeclaration + arguments params together.
+        // Also retry: chrome.runtime is sometimes not immediately available on
+        // freshly-loaded hidden tabs.
         const expression = `
-          (function() {
+          (async function() {
             window.__tmInstallResult = null;
             window.__tmInstallError = null;
+            const waitFor = ${wait};
+            const targetId = ${JSON.stringify(targetId)};
+            const message = ${JSON.stringify(message)};
+            // Wait for chrome.runtime (up to 3s) — hidden tabs sometimes load lazily
+            const startWait = Date.now();
+            while (typeof chrome === 'undefined' || typeof chrome.runtime === 'undefined') {
+              if (Date.now() - startWait > 3000) {
+                window.__tmInstallError = 'chrome.runtime unavailable after 3s on ' + location.hostname;
+                return;
+              }
+              await new Promise((r) => setTimeout(r, 50));
+            }
             try {
-              const port = chrome.runtime.connect(${JSON.stringify(targetId)}, { name: 'importEx' });
+              const port = chrome.runtime.connect(targetId, { name: 'importEx' });
               const timer = setTimeout(() => {
                 try { port.disconnect(); } catch (e) {}
                 window.__tmInstallError = 'timeout';
-              }, ${wait});
+              }, waitFor);
               port.onMessage.addListener((response) => {
                 clearTimeout(timer);
                 window.__tmInstallResult = response;
@@ -533,7 +547,7 @@ async function handleCommand(msg) {
                   window.__tmInstallError = chrome.runtime.lastError.message || 'disconnected';
                 }
               });
-              port.postMessage(${JSON.stringify(message)});
+              port.postMessage(message);
             } catch (e) {
               window.__tmInstallError = e.message || String(e);
             }
@@ -542,6 +556,7 @@ async function handleCommand(msg) {
 
         await chrome.debugger.sendCommand({ tabId: bridgeTabId }, 'Runtime.evaluate', {
           expression,
+          awaitPromise: true,
           returnByValue: true,
         });
 
