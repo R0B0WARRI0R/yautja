@@ -1076,27 +1076,25 @@ export class Helmet {
         }
 
         try {
-          // Disable/enable a script via greasyfork.org bridge + saveScript.
-          // We need the full script object — fetch it via tmGetScript first.
-          const scriptJson = await this.handleToolCall('tmGetScript', { uuid, extId: tmId });
-          let script;
-          try {
-            const parsed = JSON.parse(scriptJson);
-            script = parsed.script || parsed;
-          } catch {
-            return JSON.stringify({ error: 'Failed to fetch script for toggle', detail: scriptJson });
+          // Read the raw TM meta object (full internal structure) —
+          // tmGetScript returns a simplified shape, but saveScript
+          // needs every field TM has stored.
+          const data = await this.extIntel.readStorage(tmId);
+          const metaKey = `@meta#${uuid}`;
+          const meta = data[metaKey];
+          if (!meta) {
+            return JSON.stringify({ error: `Script ${uuid} not found` });
           }
 
-          if (!script || !script.uuid) {
-            return JSON.stringify({ error: 'Script not found', uuid });
-          }
+          // Toggle the enabled flag in-place
+          if (!meta.options) meta.options = {};
+          meta.options.enabled = enabled;
 
-          script.enabled = enabled;
-
+          // Send via bridge: TM's saveScript accepts the full meta object
           const result = await this.server.sendRaw({
             type: 'tmInstallViaBridge',
             tmExtId: tmId,
-            message: { method: 'saveScript', script },
+            message: { method: 'saveScript', script: meta },
             timeout: 20000,
           });
 
