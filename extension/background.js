@@ -509,43 +509,59 @@ async function handleCommand(msg) {
 
         // 4. Inject the bridge function from the page context.
         // The page is on a TM-whitelisted origin, so chrome.runtime.sendMessage(TM_ID)
-        // is accepted by TM's onMessageExternal handler. Note: chrome.runtime.connect
-        // is NOT exposed to web pages (only sendMessage + id + getURL on
-        // externally_connectable origins).
-        // Embed values via JSON.stringify — avoids CDP's BINDINGS quirk.
+        // should be accepted by TM's onMessageExternal handler.
+        // Wait for chrome.runtime to appear (lazy on hidden tabs) then send.
         const expression = `
-          (function() {
+          (async function() {
             window.__tmInstallResult = null;
             window.__tmInstallError = null;
             const waitFor = ${wait};
             const targetId = ${JSON.stringify(targetId)};
             const message = ${JSON.stringify(message)};
-            if (typeof chrome === 'undefined' || typeof chrome.runtime === 'undefined' || typeof chrome.runtime.sendMessage !== 'function') {
-              window.__tmInstallError = 'chrome.runtime.sendMessage unavailable. hasChrome=' + (typeof chrome !== 'undefined') + ' hasRuntime=' + (typeof chrome !== 'undefined' && typeof chrome.runtime !== 'undefined') + ' hasSendMessage=' + (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage);
+            // Wait up to 5s for chrome.runtime to be available
+            const startWait = Date.now();
+            const dump = () => ({
+              hasChrome: typeof chrome !== 'undefined',
+              hasRuntime: typeof chrome !== 'undefined' && typeof chrome.runtime !== 'undefined',
+              hasSendMessage: typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage,
+              hasConnect: typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.connect,
+              chromeKeys: typeof chrome !== 'undefined' ? Object.keys(chrome).slice(0, 30) : [],
+              runtimeKeys: typeof chrome !== 'undefined' && chrome.runtime ? Object.keys(chrome.runtime).slice(0, 30) : [],
+              readyState: document.readyState,
+              url: location.href,
+            });
+            while (Date.now() - startWait < 5000) {
+              if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+                break;
+              }
+              await new Promise((r) => setTimeout(r, 100));
+            }
+            if (typeof chrome === 'undefined' || !chrome.runtime || typeof chrome.runtime.sendMessage !== 'function') {
+              window.__tmInstallError = 'sendMessage unavailable. diag=' + JSON.stringify(dump());
               return;
             }
             try {
               chrome.runtime.sendMessage(targetId, message, function(response) {
                 if (chrome.runtime.lastError) {
-                  window.__tmInstallError = chrome.runtime.lastError.message || 'lastError';
+                  window.__tmInstallError = 'sendMessage-rejected: ' + (chrome.runtime.lastError.message || 'lastError');
                 } else {
                   window.__tmInstallResult = response;
                 }
               });
-              // Safety timeout for the callback
               setTimeout(() => {
                 if (!window.__tmInstallResult && !window.__tmInstallError) {
                   window.__tmInstallError = 'timeout';
                 }
               }, waitFor);
             } catch (e) {
-              window.__tmInstallError = e.message || String(e);
+              window.__tmInstallError = 'throw: ' + (e.message || String(e));
             }
           })();
         `;
 
         await chrome.debugger.sendCommand({ tabId: bridgeTabId }, 'Runtime.evaluate', {
           expression,
+          awaitPromise: true,
           returnByValue: true,
         });
 
