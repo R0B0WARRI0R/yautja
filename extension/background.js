@@ -510,16 +510,18 @@ async function handleCommand(msg) {
         // 4. Inject the bridge function from the page context.
         // The page is on a TM-whitelisted origin, so chrome.runtime.connect(TM_ID)
         // is accepted by TM's onMessageExternal handler (NOT onConnectExternal).
-        const fnDecl = `
-          (function(message, tmId, timeoutMs) {
+        // Embed values via JSON.stringify — avoids CDP's BINDINGS quirk when using
+        // functionDeclaration + arguments params together.
+        const expression = `
+          (function() {
             window.__tmInstallResult = null;
             window.__tmInstallError = null;
             try {
-              const port = chrome.runtime.connect(tmId, { name: 'importEx' });
+              const port = chrome.runtime.connect(${JSON.stringify(targetId)}, { name: 'importEx' });
               const timer = setTimeout(() => {
                 try { port.disconnect(); } catch (e) {}
                 window.__tmInstallError = 'timeout';
-              }, timeoutMs);
+              }, ${wait});
               port.onMessage.addListener((response) => {
                 clearTimeout(timer);
                 window.__tmInstallResult = response;
@@ -531,20 +533,15 @@ async function handleCommand(msg) {
                   window.__tmInstallError = chrome.runtime.lastError.message || 'disconnected';
                 }
               });
-              port.postMessage(message);
+              port.postMessage(${JSON.stringify(message)});
             } catch (e) {
               window.__tmInstallError = e.message || String(e);
             }
-          })
+          })();
         `;
 
         await chrome.debugger.sendCommand({ tabId: bridgeTabId }, 'Runtime.evaluate', {
-          functionDeclaration: fnDecl,
-          arguments: [
-            { value: message },
-            { value: targetId },
-            { value: wait },
-          ],
+          expression,
           returnByValue: true,
         });
 
