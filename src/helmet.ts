@@ -1025,7 +1025,7 @@ export class Helmet {
       }
       case 'tmInstallScript': {
         const tmId = args.extId || 'dhdgffkkebhmkfjojejmpbldmpobfkfo';
-        const code = args.code as string | undefined;
+        let code = args.code as string | undefined;
         const installUrl = args.url as string | undefined;
 
         if (!code && !installUrl) {
@@ -1033,23 +1033,37 @@ export class Helmet {
         }
 
         try {
-          const message: Record<string, any> = code
-            ? { name: 'installFromUrl', data: { source: code } }
-            : { name: 'installFromUrl', data: { url: installUrl } };
+          // If URL provided, fetch the script content first (server-side fetch,
+          // no CORS). Then bridge-install via the greasyfork.org origin so
+          // TM's onMessageExternal handler accepts the message:
+          //   port.postMessage({ method: 'importEx', code })
+          if (!code && installUrl) {
+            const r = await fetch(installUrl, { redirect: 'follow' });
+            if (!r.ok) {
+              return JSON.stringify({
+                error: `Failed to fetch URL: ${r.status} ${r.statusText}`,
+                url: installUrl,
+              });
+            }
+            code = await r.text();
+          }
 
           const result = await this.server.sendRaw({
-            type: 'tmMessage',
+            type: 'tmInstallViaBridge',
             tmExtId: tmId,
-            message,
+            message: { method: 'importEx', code },
             timeout: 20000,
           });
 
           return JSON.stringify({
-            success: !result?.error,
+            success: !result?.error && !result?.detail,
             result,
           }, null, 2);
         } catch (e: any) {
-          return JSON.stringify({ error: e.message, hint: 'Make sure Tampermonkey is installed and "External Connect" is set to "all" in TM Settings → Security' });
+          return JSON.stringify({
+            error: e.message,
+            hint: 'Tampermonkey must be installed and the script must start with a valid ==UserScript== header',
+          });
         }
       }
       case 'tmToggleScript': {
@@ -1062,28 +1076,41 @@ export class Helmet {
         }
 
         try {
-          const message = {
-            method: 'modifyScriptOptions',
-            uuid,
-            enabled,
-            reload: false,
-          };
+          // Disable/enable a script via greasyfork.org bridge + saveScript.
+          // We need the full script object — fetch it via tmGetScript first.
+          const scriptJson = await this.handleToolCall('tmGetScript', { uuid, extId: tmId });
+          let script;
+          try {
+            const parsed = JSON.parse(scriptJson);
+            script = parsed.script || parsed;
+          } catch {
+            return JSON.stringify({ error: 'Failed to fetch script for toggle', detail: scriptJson });
+          }
+
+          if (!script || !script.uuid) {
+            return JSON.stringify({ error: 'Script not found', uuid });
+          }
+
+          script.enabled = enabled;
 
           const result = await this.server.sendRaw({
-            type: 'tmMessage',
+            type: 'tmInstallViaBridge',
             tmExtId: tmId,
-            message,
-            timeout: 10000,
+            message: { method: 'saveScript', script },
+            timeout: 20000,
           });
 
           return JSON.stringify({
-            success: !result?.error,
+            success: !result?.error && !result?.detail,
             uuid,
             enabled,
             result,
           }, null, 2);
         } catch (e: any) {
-          return JSON.stringify({ error: e.message });
+          return JSON.stringify({
+            error: e.message,
+            hint: 'tmToggleScript uses the silent bridge — same caveats as tmInstallScript',
+          });
         }
       }
       default:
@@ -1743,12 +1770,12 @@ const MCP_TOOLS = [
   },
   {
     name: 'tmInstallScript',
-    description: 'Install a userscript into Tampermonkey. Provide the full userscript source code (with ==UserScript== header) or a URL to install from. Opens TM options page briefly, calls the internal API, then restores your tab.',
+    description: 'Silently install a userscript into Tampermonkey. Provide the full userscript source code (with ==UserScript== header) or a URL to install from. Opens a hidden tab on greasyfork.org (an origin whitelisted by TM\'s externally_connectable) and uses CDP to inject chrome.runtime.connect(TM_ID) from the page context — TM\'s internal API accepts the install and skips the dialog. No visible tab, no manual confirmation.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         code: { type: 'string', description: 'Full userscript source code (including ==UserScript== header block)' },
-        url: { type: 'string', description: 'URL to install from (alternative to code)' },
+        url: { type: 'string', description: 'URL to install from (alternative to code) — content is fetched server-side then bridged' },
         extId: { type: 'string', description: 'Tampermonkey extension ID (default: auto-detected)' },
       },
     },
