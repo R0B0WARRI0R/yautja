@@ -449,14 +449,13 @@ async function handleCommand(msg) {
       break;
     }
 
-    // ─── Tampermonkey bridge (CDP-injected from whitelisted origin) ─
-    // TM's onConnectExternal only accepts 3 hardcoded editor extensions
-    // (function `xp` in TM's SW). So we can't connect directly from
-    // another extension. Instead: open a hidden tab on greasyfork.org
-    // (TM's externally_connectable whitelist includes this origin),
-    // attach CDP, inject chrome.runtime.connect(TM_ID) from the page
-    // context, and await the response. Generic bridge — passes any TM
-    // method call (importEx, saveScript, getScript, etc.) in `message`.
+    // ─── Tampermonkey bridge (content script → TM via chrome.runtime.sendMessage) ─
+    // Modern Chrome does NOT expose chrome.runtime on web pages (only loadTimes, csi, app).
+    // So we can't call TM from the page's main world. Instead: open a hidden tab on
+    // greasyfork.org (TM's externally_connectable whitelist), and use the existing
+    // content script (content-gql.js) which has chrome.runtime available. The content
+    // script calls chrome.runtime.sendMessage(TM_ID, message, callback). TM's
+    // onMessageExternal accepts because sender URL matches the page origin.
     case 'tmInstallViaBridge': {
       const { tmExtId, message, timeout: timeoutMs } = msg;
       const TM_DEFAULT = 'dhdgffkkebhmkfjojejmpbldmpobfkfo';
@@ -464,36 +463,29 @@ async function handleCommand(msg) {
       const wait = Math.min(timeoutMs || 20000, 30000);
 
       let bridgeTabId = null;
-      let attached = false;
 
       const cleanup = async () => {
-        if (attached && bridgeTabId != null) {
-          try { await chrome.debugger.detach({ tabId: bridgeTabId }); } catch {}
-        }
         if (bridgeTabId != null) {
           try { await chrome.tabs.remove(bridgeTabId); } catch {}
         }
       };
 
-      const fail = async (error, detail) => {
-        await cleanup();
-        sendToYautja({ id, type: 'result', result: { error, detail } });
-      };
-
       try {
-        // 1. Open hidden tab on greasyfork.org (TM whitelisted origin)
+        // 1. Open a hidden tab on greasyfork.org (TM-whitelisted origin).
+        // The content script is auto-injected via manifest content_scripts.
         const tab = await chrome.tabs.create({
           url: 'https://greasyfork.org/en/scripts',
           active: false,
         });
         bridgeTabId = tab.id;
 
-        // 2. Wait for page to fully load
+        // 2. Wait for page to fully load (content script runs at document_idle)
         await new Promise((resolve) => {
           const listener = (tabId, changeInfo) => {
             if (tabId === bridgeTabId && changeInfo.status === 'complete') {
               chrome.tabs.onUpdated.removeListener(listener);
-              resolve();
+              // Small extra delay to ensure content script is fully wired up
+              setTimeout(resolve, 300);
             }
           };
           chrome.tabs.onUpdated.addListener(listener);
@@ -503,99 +495,29 @@ async function handleCommand(msg) {
           }, 15000);
         });
 
-        // 3. Attach CDP debugger
-        await chrome.debugger.attach({ tabId: bridgeTabId }, DEBUGGER_VERSION);
-        attached = true;
-
-        // 4. Inject the bridge function from the page context.
-        // The page is on a TM-whitelisted origin, so chrome.runtime.sendMessage(TM_ID)
-        // should be accepted by TM's onMessageExternal handler.
-        // Wait for chrome.runtime to appear (lazy on hidden tabs) then send.
-        // SENTINEL: v5-sendMessage-wait
-        const expression = `
-          (async function() {
-            window.__tmInstallResult = null;
-            window.__tmInstallError = null;
-            window.__tmBridgeVersion = 'v5-sendMessage-wait';
-            const waitFor = ${wait};
-            const targetId = ${JSON.stringify(targetId)};
-            const message = ${JSON.stringify(message)};
-            // Wait up to 5s for chrome.runtime to be available
-            const startWait = Date.now();
-            const dump = () => ({
-              hasChrome: typeof chrome !== 'undefined',
-              hasRuntime: typeof chrome !== 'undefined' && typeof chrome.runtime !== 'undefined',
-              hasSendMessage: typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage,
-              hasConnect: typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.connect,
-              chromeKeys: typeof chrome !== 'undefined' ? Object.keys(chrome).slice(0, 30) : [],
-              runtimeKeys: typeof chrome !== 'undefined' && chrome.runtime ? Object.keys(chrome.runtime).slice(0, 30) : [],
-              readyState: document.readyState,
-              url: location.href,
-            });
-            while (Date.now() - startWait < 5000) {
-              if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
-                break;
-              }
-              await new Promise((r) => setTimeout(r, 100));
-            }
-            if (typeof chrome === 'undefined' || !chrome.runtime || typeof chrome.runtime.sendMessage !== 'function') {
-              window.__tmInstallError = 'v5-sendMessage unavailable. diag=' + JSON.stringify(dump());
-              return;
-            }
-            try {
-              chrome.runtime.sendMessage(targetId, message, function(response) {
-                if (chrome.runtime.lastError) {
-                  window.__tmInstallError = 'v5-rejected: ' + (chrome.runtime.lastError.message || 'lastError');
-                } else {
-                  window.__tmInstallResult = response;
-                }
-              });
-              setTimeout(() => {
-                if (!window.__tmInstallResult && !window.__tmInstallError) {
-                  window.__tmInstallError = 'v5-timeout';
-                }
-              }, waitFor);
-            } catch (e) {
-              window.__tmInstallError = 'v5-throw: ' + (e.message || String(e));
-            }
-          })();
-        `;
-
-        await chrome.debugger.sendCommand({ tabId: bridgeTabId }, 'Runtime.evaluate', {
-          expression,
-          awaitPromise: true,
-          returnByValue: true,
-        });
-
-        // 5. Poll for the result stored on window
-        const start = Date.now();
-        let result = null;
-        while (Date.now() - start < wait + 2000) {
-          const poll = await chrome.debugger.sendCommand({ tabId: bridgeTabId }, 'Runtime.evaluate', {
-            expression: 'JSON.stringify({ r: window.__tmInstallResult, e: window.__tmInstallError })',
-            returnByValue: true,
-          });
-          const val = poll?.result?.value;
-          if (val) {
-            try {
-              const parsed = JSON.parse(val);
-              if (parsed.r !== null || parsed.e !== null) {
-                result = parsed.r !== null ? parsed.r : { error: parsed.e };
-                break;
-              }
-            } catch {}
-          }
-          await new Promise((r) => setTimeout(r, 200));
-        }
+        // 3. Send message to the content script via chrome.tabs.sendMessage.
+        // The content script will use chrome.runtime.sendMessage(TM_ID, ...) to TM.
+        const response = await Promise.race([
+          chrome.tabs.sendMessage(bridgeTabId, {
+            type: '__yautja_tm_bridge',
+            tmId: targetId,
+            message,
+            timeoutMs: wait,
+          }),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('timeout waiting for content script')), wait + 3000)
+          ),
+        ]);
 
         await cleanup();
         sendToYautja({
           id,
           type: 'result',
-          result: result || { error: 'timeout', detail: 'window.__tmInstallResult never set' },
+          result: response || { error: 'no response from content script' },
         });
       } catch (e) {
-        await fail(`tmInstallViaBridge failed: ${e.message}`);
+        await cleanup();
+        sendToYautja({ id, type: 'result', result: { error: `tmInstallViaBridge failed: ${e.message}` } });
       }
       break;
     }

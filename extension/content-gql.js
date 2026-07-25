@@ -96,4 +96,41 @@
   window.__yautjaGqlCapture = captured;
 
   console.log('[Yautja] GQL content script patched on', window.location.href);
+
+  // ─── Tampermonkey bridge (content script → TM via chrome.runtime.sendMessage) ───
+  // The page's main world has no chrome.runtime (modern Chrome doesn't expose it).
+  // But content scripts HAVE chrome.runtime. TM's onMessageExternal accepts the message
+  // when sender.url matches its externally_connectable whitelist (the page URL).
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg.type === '__yautja_tm_bridge') {
+      const { tmId, message, timeoutMs } = msg;
+      const wait = Math.min(timeoutMs || 20000, 30000);
+      let responded = false;
+      const timer = setTimeout(() => {
+        if (!responded) {
+          responded = true;
+          sendResponse({ error: 'timeout', detail: 'TM did not respond within ' + wait + 'ms' });
+        }
+      }, wait);
+      try {
+        chrome.runtime.sendMessage(tmId, message, (response) => {
+          if (responded) return;
+          responded = true;
+          clearTimeout(timer);
+          if (chrome.runtime.lastError) {
+            sendResponse({ error: 'TM-rejected: ' + (chrome.runtime.lastError.message || 'lastError') });
+          } else {
+            sendResponse(response);
+          }
+        });
+      } catch (e) {
+        if (responded) return;
+        responded = true;
+        clearTimeout(timer);
+        sendResponse({ error: 'throw: ' + (e.message || String(e)) });
+      }
+      return true; // will respond asynchronously
+    }
+    return false; // let other listeners handle other messages
+  });
 })();
