@@ -511,10 +511,12 @@ async function handleCommand(msg) {
         // The page is on a TM-whitelisted origin, so chrome.runtime.sendMessage(TM_ID)
         // should be accepted by TM's onMessageExternal handler.
         // Wait for chrome.runtime to appear (lazy on hidden tabs) then send.
+        // SENTINEL: v5-sendMessage-wait
         const expression = `
           (async function() {
             window.__tmInstallResult = null;
             window.__tmInstallError = null;
+            window.__tmBridgeVersion = 'v5-sendMessage-wait';
             const waitFor = ${wait};
             const targetId = ${JSON.stringify(targetId)};
             const message = ${JSON.stringify(message)};
@@ -537,24 +539,24 @@ async function handleCommand(msg) {
               await new Promise((r) => setTimeout(r, 100));
             }
             if (typeof chrome === 'undefined' || !chrome.runtime || typeof chrome.runtime.sendMessage !== 'function') {
-              window.__tmInstallError = 'sendMessage unavailable. diag=' + JSON.stringify(dump());
+              window.__tmInstallError = 'v5-sendMessage unavailable. diag=' + JSON.stringify(dump());
               return;
             }
             try {
               chrome.runtime.sendMessage(targetId, message, function(response) {
                 if (chrome.runtime.lastError) {
-                  window.__tmInstallError = 'sendMessage-rejected: ' + (chrome.runtime.lastError.message || 'lastError');
+                  window.__tmInstallError = 'v5-rejected: ' + (chrome.runtime.lastError.message || 'lastError');
                 } else {
                   window.__tmInstallResult = response;
                 }
               });
               setTimeout(() => {
                 if (!window.__tmInstallResult && !window.__tmInstallError) {
-                  window.__tmInstallError = 'timeout';
+                  window.__tmInstallError = 'v5-timeout';
                 }
               }, waitFor);
             } catch (e) {
-              window.__tmInstallError = 'throw: ' + (e.message || String(e));
+              window.__tmInstallError = 'v5-throw: ' + (e.message || String(e));
             }
           })();
         `;
