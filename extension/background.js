@@ -521,11 +521,19 @@ async function handleCommand(msg) {
             const waitFor = ${wait};
             const targetId = ${JSON.stringify(targetId)};
             const message = ${JSON.stringify(message)};
+            // Diagnostic: report what's actually available
+            window.__tmDiag = {
+              hasChrome: typeof chrome !== 'undefined',
+              hasChromeRuntime: typeof chrome !== 'undefined' && typeof chrome.runtime !== 'undefined',
+              chromeKeys: typeof chrome !== 'undefined' ? Object.keys(chrome).slice(0, 20) : [],
+              hostname: location.hostname,
+              href: location.href,
+            };
             // Wait for chrome.runtime (up to 3s) — hidden tabs sometimes load lazily
             const startWait = Date.now();
             while (typeof chrome === 'undefined' || typeof chrome.runtime === 'undefined') {
               if (Date.now() - startWait > 3000) {
-                window.__tmInstallError = 'chrome.runtime unavailable after 3s on ' + location.hostname;
+                window.__tmInstallError = 'chrome.runtime unavailable after 3s. diag=' + JSON.stringify(window.__tmDiag);
                 return;
               }
               await new Promise((r) => setTimeout(r, 50));
