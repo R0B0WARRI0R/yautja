@@ -46,8 +46,11 @@ export class PatternDetector {
     // Signal 2: Captured GQL has different hash than known
     if (capturedGql && capturedGql.length > 0) {
       for (const cap of capturedGql) {
-        if (!cap.hash || !cap.ops || cap.ops.length === 0) continue;
-        const opName = cap.ops[0];
+        // Accept both shapes: extension buffer items use {ops: []},
+        // browser interceptor items use {op}.
+        const ops: string[] = Array.isArray(cap?.ops) ? cap.ops : cap?.op ? [cap.op] : [];
+        if (!cap?.hash || ops.length === 0) continue;
+        const opName = ops[0];
         const knownSeed = this.seedDB.get(opName, domain);
         if (knownSeed && knownSeed.hash !== cap.hash) {
           detected.push({

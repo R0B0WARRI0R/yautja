@@ -35,6 +35,16 @@ export const BROWSER_INTERCEPT_SCRIPT = `
     return null;
   }
 
+  const MAX_CAPTURES = 200;
+
+  function pushCapture(entry) {
+    window.__yautjaBrowserCapture.push(entry);
+    // Prune on every push — a page-level trim after the IIFE would only run once.
+    if (window.__yautjaBrowserCapture.length > MAX_CAPTURES) {
+      window.__yautjaBrowserCapture = window.__yautjaBrowserCapture.slice(-MAX_CAPTURES);
+    }
+  }
+
   const origFetch = window.fetch;
   window.fetch = function(input, init) {
     const url = typeof input === 'string' ? input : input?.url;
@@ -43,7 +53,7 @@ export const BROWSER_INTERCEPT_SCRIPT = `
         const body = init?.body ? (typeof init.body === 'string' ? init.body : JSON.stringify(init.body)) : '';
         const oh = getOpAndHash(body);
         if (oh) {
-          window.__yautjaBrowserCapture.push({
+          pushCapture({
             type: 'fetch', url: url.substring(0, 100), method: init?.method || 'GET',
             op: oh[0], hash: oh[1], body: body.substring(0, 500), timestamp: Date.now(),
           });
@@ -67,7 +77,7 @@ export const BROWSER_INTERCEPT_SCRIPT = `
         try {
           const oh = getOpAndHash(body);
           if (oh) {
-            window.__yautjaBrowserCapture.push({
+            pushCapture({
               type: 'xhr', url, method, op: oh[0], hash: oh[1], body: (body || '').substring(0, 500), timestamp: Date.now(),
             });
             send({ type: 'yautja-gql-capture', op: oh[0], hash: oh[1], url });
@@ -78,8 +88,6 @@ export const BROWSER_INTERCEPT_SCRIPT = `
     };
     return xhr;
   };
-
-  if (window.__yautjaBrowserCapture.length > 200) window.__yautjaBrowserCapture = window.__yautjaBrowserCapture.slice(-200);
 })();
 `;
 

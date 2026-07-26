@@ -100,7 +100,17 @@ export class ExtensionIntel {
       try {
         const versions = (await readdir(extBase)).filter((v) => !v.startsWith('.'));
         if (versions.length > 0) {
-          versions.sort();
+          // Numeric (semver-ish) compare: "10.0" > "9.0", unlike lexicographic sort.
+          const byVersion = (a: string, b: string): number => {
+            const pa = a.split(/[._-]/).map((p) => parseInt(p, 10) || 0);
+            const pb = b.split(/[._-]/).map((p) => parseInt(p, 10) || 0);
+            for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+              const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+              if (d !== 0) return d;
+            }
+            return 0;
+          };
+          versions.sort(byVersion);
           const latest = versions[versions.length - 1];
           return { extId, profile, versionDir: join(extBase, latest), version: latest };
         }

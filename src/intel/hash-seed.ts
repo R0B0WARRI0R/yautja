@@ -29,6 +29,7 @@ const SEED_DIR = path.join(process.env.APPDATA || process.env.HOME || '/tmp', '.
 export class HashSeedDB {
   private seeds: Map<string, HashSeed> = new Map();
   private rotations: RotationEvent[] = [];
+  private rotationsByDomain: Map<string, RotationEvent[]> = new Map();
 
   constructor() {
     try { if (!fs.existsSync(SEED_DIR)) fs.mkdirSync(SEED_DIR, { recursive: true }); } catch {}
@@ -43,6 +44,19 @@ export class HashSeedDB {
     return path.join(SEED_DIR, this.key(domain));
   }
 
+  private rebuildRotations(): void {
+    const seen = new Set<string>();
+    this.rotations = [];
+    for (const list of this.rotationsByDomain.values()) {
+      for (const r of list) {
+        const k = `${r.operationName}|${r.detectedAt}|${r.oldHash}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        this.rotations.push(r);
+      }
+    }
+  }
+
   load(domain?: string): void {
     try {
       const file = domain ? this.path(domain) : null;
@@ -51,13 +65,18 @@ export class HashSeedDB {
         const seeds: HashSeed[] = data.seeds || [];
         const rotations: RotationEvent[] = data.rotations || [];
         for (const s of seeds) this.seeds.set(`${domain}:${s.operationName}`, s);
-        this.rotations = rotations;
+        this.rotationsByDomain.set(domain!, rotations);
+        this.rebuildRotations();
       } else if (!domain) {
         for (const f of fs.readdirSync(SEED_DIR)) {
-          if (f.endsWith('.json')) {
-            const dom = f.replace('.json', '').replace(/_/g, '.');
-            this.load(dom);
-          }
+          if (!f.endsWith('.json')) continue;
+          // Filename is sanitized; prefer the real domain stored in the file.
+          let dom = f.replace('.json', '').replace(/_/g, '.');
+          try {
+            const data = JSON.parse(fs.readFileSync(path.join(SEED_DIR, f), 'utf8'));
+            if (typeof data.domain === 'string' && data.domain) dom = data.domain;
+          } catch {}
+          this.load(dom);
         }
       }
     } catch {}
@@ -68,8 +87,9 @@ export class HashSeedDB {
     for (const [k, v] of this.seeds) if (k.startsWith(`${domain}:`)) domainSeeds.push(v);
     try {
       fs.writeFileSync(this.path(domain), JSON.stringify({
+        domain,
         seeds: domainSeeds,
-        rotations: this.rotations,
+        rotations: this.rotationsByDomain.get(domain) ?? [],
         updatedAt: Date.now(),
       }, null, 2));
     } catch {}
@@ -87,30 +107,36 @@ export class HashSeedDB {
 
   list(domain?: string): HashSeed[] {
     if (!domain) return Array.from(this.seeds.values());
-    return Array.from(this.seeds.values()).filter(s => s.queryTemplate && s.operationName);
+    const prefix = `${domain}:`;
+    const out: HashSeed[] = [];
+    for (const [k, v] of this.seeds) if (k.startsWith(prefix)) out.push(v);
+    return out;
   }
 
   invalidate(operationName: string, domain: string): boolean {
     const k = `${domain}:${operationName}`;
-    const existed = this.seeds.delete(k);
-    if (existed) {
-      this.rotations.push({
-        operationName,
-        oldHash: '',
-        detectedAt: Date.now(),
-        recovered: false,
-      });
-      this.save(domain);
-    }
-    return existed;
+    const seed = this.seeds.get(k);
+    if (!seed) return false;
+    this.seeds.delete(k);
+    this.recordRotation({
+      operationName,
+      oldHash: seed.hash,
+      detectedAt: Date.now(),
+      recovered: false,
+    }, domain);
+    return true;
   }
 
-  recordRotation(event: RotationEvent): void {
+  recordRotation(event: RotationEvent, domain?: string): void {
     this.rotations.push(event);
-    if (event.recovered) {
-      this.rotations[this.rotations.length - 1].newHash = event.newHash;
-    }
     if (this.rotations.length > 100) this.rotations = this.rotations.slice(-100);
+    if (domain) {
+      const list = this.rotationsByDomain.get(domain) ?? [];
+      list.push(event);
+      if (list.length > 100) list.splice(0, list.length - 100);
+      this.rotationsByDomain.set(domain, list);
+      this.save(domain);
+    }
   }
 
   getRotations(limit = 20): RotationEvent[] {

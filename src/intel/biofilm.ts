@@ -1,6 +1,7 @@
 export interface BiofilmCell {
   id: string;
-  tabId: number;
+  /** Raw CDP targetId (hex string, e.g. "A1B2C3...") — NOT a numeric tab id. */
+  tabId: string;
   url: string;
   role: 'primary' | 'backup' | 'interceptor' | 'validator' | 'observer';
   status: 'active' | 'failed' | 'recovering' | 'dormant';
@@ -46,7 +47,7 @@ export class BiofilmManager {
         if (!sessionId) continue;
         const cell: BiofilmCell = {
           id: `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          tabId: parseInt(targetId, 10),
+          tabId: targetId,
           url: targetUrl,
           role,
           status: 'active',
@@ -95,7 +96,7 @@ export class BiofilmManager {
   async terminate(): Promise<void> {
     for (const cell of this.cells.values()) {
       try {
-        await this.transport.send('Target.closeTarget', { targetId: String(cell.tabId) });
+        await this.transport.send('Target.closeTarget', { targetId: cell.tabId });
       } catch {}
     }
     this.cells.clear();

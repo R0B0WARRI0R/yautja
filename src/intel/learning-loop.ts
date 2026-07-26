@@ -80,7 +80,7 @@ export class LearningLoop {
             detectedAt: Date.now(),
             recovered: true,
             newHash: result.hash,
-          });
+          }, domain);
         }
       }
     }
@@ -111,10 +111,8 @@ export class LearningLoop {
         if (sig.type === 'persisted-not-found' && sig.data) {
           const op = sig.data.operationName;
           if (op && this.seedDB.get(op, domain)) {
+            // invalidate() already records the rotation with the real oldHash.
             this.seedDB.invalidate(op, domain);
-            this.seedDB.recordRotation({
-              operationName: op, oldHash: 'unknown', detectedAt: Date.now(), recovered: false,
-            });
           }
         }
       }
