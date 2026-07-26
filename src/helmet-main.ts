@@ -5,10 +5,9 @@ async function main() {
   process.stderr.write(`[Yautja] Port: ${port} (source: ${source})\n`);
   const helmet = new Helmet({ port });
 
-  // Graceful shutdown on signals and host death — registered BEFORE start()
-  // so a host dying during the extension wait doesn't leave a zombie.
-  // stop() kills the MITM proxy child and restores the Windows proxy
-  // registry; without it, a taskkill leaves the browser without internet.
+  // Graceful shutdown on signals: stop() kills the MITM proxy child and
+  // restores the Windows proxy registry — without this, a taskkill leaves
+  // the browser pointing at a dead proxy (no internet) and a zombie on 9877.
   let shuttingDown = false;
   const shutdown = (signal: string) => {
     if (shuttingDown) return;
@@ -22,15 +21,17 @@ async function main() {
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
-  // stdin starts paused — resume() so 'end' actually fires on host death.
-  process.stdin.resume();
-  process.stdin.on('end', () => shutdown('stdin EOF'));
+
+  // serveMCP BEFORE start(): readline owns stdin from t=0 (hosts send
+  // initialize immediately and messages must never be swallowed), and its
+  // close handler covers the startup window too — a host dying while we
+  // wait for the extension still shuts us down. Do NOT resume() stdin
+  // manually: flowing mode eats JSON-RPC messages.
+  helmet.serveMCP();
 
   process.stderr.write('[Yautja] Starting helmet...\n');
   await helmet.start();
-  process.stderr.write('[Yautja] Ready. Serving MCP on stdio.\n');
-
-  helmet.serveMCP();
+  process.stderr.write('[Yautja] Ready.\n');
 }
 
 main().catch((err) => {
