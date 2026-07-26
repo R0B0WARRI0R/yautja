@@ -1,4 +1,4 @@
-import { mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, rm, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
 export interface TraceStoreConfig {
@@ -47,8 +47,41 @@ export class TraceStore {
     }
   }
 
-  findExpired(_ttlDays?: number): string[] {
-    return [];
+  /** Trace ids whose directory mtime is older than the TTL. */
+  async findExpired(ttlDays?: number): Promise<string[]> {
+    const ttl = (ttlDays ?? this.config.ttlDays) * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - ttl;
+    const expired: string[] = [];
+    try {
+      const entries = await readdir(this.config.rootDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        try {
+          const st = await stat(join(this.config.rootDir, entry.name));
+          if (st.mtimeMs < cutoff) expired.push(entry.name);
+        } catch { /* skip unreadable */ }
+      }
+    } catch { /* rootDir missing → nothing to expire */ }
+    return expired;
+  }
+
+  /** GC: purge every expired trace. Returns the purged ids. */
+  async purgeExpired(ttlDays?: number): Promise<string[]> {
+    const expired = await this.findExpired(ttlDays);
+    for (const traceId of expired) {
+      await this.purgeTrace(traceId);
+    }
+    return expired;
+  }
+
+  /** List trace ids present in the store (for MCP resources/list). */
+  async listTraces(): Promise<string[]> {
+    try {
+      const entries = await readdir(this.config.rootDir, { withFileTypes: true });
+      return entries.filter((e) => e.isDirectory()).map((e) => e.name);
+    } catch {
+      return [];
+    }
   }
 
   async purgeTrace(traceId: string): Promise<void> {

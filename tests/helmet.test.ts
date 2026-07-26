@@ -142,9 +142,10 @@ describe('Helmet — MCP protocol', () => {
     });
     expect(response.id).toBe(1);
     expect(response.jsonrpc).toBe('2.0');
-    expect(response.result.serverInfo).toEqual({ name: 'yautja', version: '0.1.0' });
+    expect(response.result.serverInfo).toEqual({ name: 'yautja', version: '0.2.0' });
     expect(response.result.protocolVersion).toBe('2024-11-05');
-    expect(response.result.capabilities).toEqual({ tools: {} });
+    expect(response.result.capabilities).toEqual({ tools: {}, resources: {} });
+    expect(response.result.schema_version).toBe('1.0');
   });
 
   it('tools/list returns core tools with correct names and schemas', async () => {
@@ -186,7 +187,7 @@ describe('Helmet — MCP protocol', () => {
     expect(response.result.content[0].text.length).toBeGreaterThan(0);
   });
 
-  it('tools/call act returns action result as JSON text', async () => {
+  it('tools/call act returns action result inside a doctrine envelope', async () => {
     helmet.serveMCP();
     const response = await sendMCP({
       jsonrpc: '2.0',
@@ -195,10 +196,10 @@ describe('Helmet — MCP protocol', () => {
       params: { name: 'act', arguments: { action: { type: 'evaluate', expression: '1+1' } } },
     }, 3000);
     expect(response.id).toBe(4);
-    const text = response.result.content[0].text;
-    const jsonPart = text.split('\n\nChanges:')[0]!;
-    const parsed = JSON.parse(jsonPart);
-    expect(parsed.success).toBe(true);
+    const parsed = JSON.parse(response.result.content[0].text);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.schema_version).toBe('1.0');
+    expect(parsed.result.success).toBe(true);
   });
 
   it('tools/call inspect returns domain summary as JSON', async () => {
@@ -209,11 +210,11 @@ describe('Helmet — MCP protocol', () => {
       method: 'tools/call',
       params: { name: 'inspect', arguments: { domain: 'network' } },
     });
-    const text = response.result.content[0].text;
-    const parsed = JSON.parse(text);
-    expect(parsed).toHaveProperty('total');
-    expect(parsed).toHaveProperty('completed');
-    expect(parsed).toHaveProperty('failed');
+    const parsed = JSON.parse(response.result.content[0].text);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.result).toHaveProperty('total');
+    expect(parsed.result).toHaveProperty('completed');
+    expect(parsed.result).toHaveProperty('failed');
   });
 
   it('tools/call diff returns no-previous-state message when memory is empty', async () => {

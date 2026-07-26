@@ -1,0 +1,42 @@
+{
+  "id": "perplexity",
+  "version": 1,
+  "match": {
+    "hosts": ["www.perplexity.ai", "perplexity.ai"]
+  },
+  "rules": {
+    "intercept": "forbid",
+    "stealth": "required",
+    "stealthEnforcement": "auto",
+    "maxAgentQueriesPerSession": 1,
+    "preType": "ensureEmpty",
+    "onCaptcha": "stop_hard",
+    "allowEvaluateFetch": "limited",
+    "urlDenyRegex": "cdn-cgi/access/login|/restricted/"
+  },
+  "preFlight": [
+    {
+      "id": "read_quota_cookie",
+      "type": "cookieJson",
+      "name": "pplx.metadata",
+      "decode": "uriComponent"
+    },
+    {
+      "id": "abort_if_qcd_high",
+      "type": "abortIf",
+      "path": "preFlight.results.read_quota_cookie.qcd",
+      "op": ">",
+      "value": 15,
+      "code": "QUOTA_EXHAUSTED"
+    }
+  ],
+  "waitDefaults": {
+    "ready": {
+      "allOf": [
+        { "type": "ariaBusy", "value": false },
+        { "type": "noPulse", "root": "main" }
+      ]
+    }
+  },
+  "notes": "No intercept. One agent query per ~5 manual. See investigacion/perplexity-opsec-y-baneos.md"
+}

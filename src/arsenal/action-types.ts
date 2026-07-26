@@ -5,7 +5,12 @@ export type WaitCondition =
   | { kind: 'navigation' }
   | { kind: 'networkIdle'; idleTimeMs?: number }
   | { kind: 'function'; fn: string }
-  | { kind: 'timeout'; ms: number };
+  | { kind: 'timeout'; ms: number }
+  // P12 predicates (routed through the waitForUi engine)
+  | { kind: 'ariaBusy'; root?: string; value?: boolean }
+  | { kind: 'noPulse'; root?: string }
+  | { kind: 'textSettled'; selector: string; stableMs: number; minLength?: number }
+  | { kind: 'urlMatch'; pattern: string };
 
 export type BrowserAction =
   | { type: 'navigate'; url: string; waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' }

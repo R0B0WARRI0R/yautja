@@ -1,0 +1,44 @@
+# Changelog
+
+## 0.2.0 — 2026-07-26 (Roadmap P10–P18)
+
+### P10 — Error contract + response envelope
+- Toda tool MCP devuelve `YautjaResponse` (`schema_version: "1.0"`) con metas operation/state/evidence/context; handshake `initialize` anuncia `schema_version`.
+- 10a: shim legacy (payloads preservados en `result`/`result.legacy_text`); 10b: core nativos (observe, act, inspect, diff, listTabs, reattach) con `StateMeta` real.
+- `recovery_stats` registrada (estaba muerta); `TelemetryCollector` wired.
+- Kill-switch: `YAUTJA_LEGACY_SHIM=0` hace fallar tipado las tools no migradas (P18).
+
+### P11 — Input atomicity
+- `ensureEmpty` (tool + módulo), type transaction con RecoveryMachine, anti blind-retry 30s (`input-session`), híbrido stealth≤80/insertText.
+- Códigos: `TYPE_PARTIAL`, `TYPE_REJECTED`, `TYPE_RETRY_BLOCKED`, `INPUT_NOT_CLEARABLE`, `SUBMIT_NO_EFFECT`.
+
+### P12 — waitForUi + stream extract
+- Motor `wait-for-ui` (selector, urlMatch, ariaBusy, noPulse, networkIdle real vía Thermal, textSettled, fn, timeout); `extractAnswer` settled + chunked; `waitReady` en smartType; `act` sleep condicional.
+- Código: `YJ.ACT.WAIT_TIMEOUT`.
+
+### P13 — Site profiles + preflight/quota
+- Perfiles JSON (`profiles/{perplexity,gemini,default}.json` + override usuario), preflight cookie/quota, economic sensor, enforcement en interceptEnable/act/smartType.
+- Códigos: `YJ.POLICY.QUOTA_EXHAUSTED`, `YJ.OPSEC.CAPTCHA_DETECTED`, `YJ.POLICY.GATE_DENIED`.
+
+### P13.5 — Tab identity + silent listen
+- `TabRegistry`: openTab/switchTab verificados con `location.href`; `previousActiveTabId`.
+- Código: `YJ.ACT.TAB_SWITCH_MISMATCH`.
+
+### P14 — browserFetch + session gates
+- Gates P0–P4 (`gates.json` + `audit.jsonl`), `browserFetch` en page context con redacción, rate limit por host, gate de `evaluate(fetch)` por perfil.
+- Tools: `gateStatus`, `gateGrant` (phrase obligatoria), `gateRevoke`, `browserFetch`.
+
+### P15 — apiSurface + HAR + evidence
+- `apiSurface` (network + bundles), `exportHar` (HAR 1.2, redacción, stubs sha256), evidence store content-addressed, `responseDiff`.
+- Tools: `apiSurface`, `exportHar`, `evidencePut`, `evidenceGet`, `evidenceList`, `responseDiff`.
+
+### P16 — Trusted gestures
+- `trustedClick` (isTrusted real vía Input domain), `trustedFileChooser` (path A direct / path B chooser intercept), `capabilities` matrix.
+- Código: `YJ.PROTOCOL.CAPABILITY_MISSING` (nunca éxito falso).
+
+### P17 — Snapshots + resources
+- `snapshotSave/List/Restore` (OPSEC warning en hosts no-lab), MCP `resources/list|read` (traces + evidence, GC TTL 7d), HAR no-body edges, `docs/capture-modes.md`.
+
+### P18 — Backend router + hardening
+- `delegate` + `~/.yautja/backends.json`; siteMemory v2 (estrategias, hits, TTL por entrada, buildVersion); macros con precondition captcha/profile; shim kill-switch.
+- Registry: 23 códigos `YJ.*`. Tests: 517 → 1073.

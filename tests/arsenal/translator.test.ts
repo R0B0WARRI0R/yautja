@@ -496,11 +496,11 @@ describe('ActionTranslator', () => {
     it('wait selector returns true when element appears', async () => {
       vi.useFakeTimers();
       let call = 0;
-      transport.send = vi.fn(async (method: string) => {
-        if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
-        if (method === 'DOM.querySelector') {
+      // P12: selector waits poll via Runtime.evaluate (waitForUi engine)
+      transport.send = vi.fn(async (method: string, params?: any) => {
+        if (method === 'Runtime.evaluate' && (params?.expression ?? '').includes('#x')) {
           call++;
-          return call >= 3 ? { nodeId: 99 } : { nodeId: 0 };
+          return { result: { value: call >= 3 } };
         }
         return {};
       });
@@ -512,9 +512,10 @@ describe('ActionTranslator', () => {
 
     it('wait selector state=hidden returns true when element gone', async () => {
       vi.useFakeTimers();
-      transport.send = vi.fn(async (method: string) => {
-        if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
-        if (method === 'DOM.querySelector') return { nodeId: 0 };
+      transport.send = vi.fn(async (method: string, params?: any) => {
+        if (method === 'Runtime.evaluate' && (params?.expression ?? '').includes('#gone')) {
+          return { result: { value: true } };
+        }
         return {};
       });
       const p = translator.execute({

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { TraceStore } from '../../src/doctrine/trace-store.js';
-import { rmSync, existsSync } from 'node:fs';
+import { rmSync, existsSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 
 const TEST_DIR = join(process.cwd(), 'tests', 'tmp-traces');
@@ -35,8 +35,21 @@ describe('TraceStore', () => {
     expect(content).toBeNull();
   });
 
-  it('lists traces for cleanup', () => {
-    const expired = store.findExpired(0);
+  it('lists traces for cleanup', async () => {
+    const expired = await store.findExpired(0);
     expect(Array.isArray(expired)).toBe(true);
+  });
+
+  it('purgeExpired removes traces older than the TTL', async () => {
+    await store.saveNetworkWindow('tr_old', '{"net":true}');
+    await store.saveNetworkWindow('tr_new', '{"net":true}');
+    // Age tr_old artificially (31 days)
+    const past = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
+    utimesSync(join(TEST_DIR, 'tr_old'), past, past);
+
+    const purged = await store.purgeExpired(7);
+    expect(purged).toContain('tr_old');
+    expect(purged).not.toContain('tr_new');
+    expect(await store.listTraces()).toEqual(['tr_new']);
   });
 });

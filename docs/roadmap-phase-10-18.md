@@ -3,7 +3,7 @@
 **Spec ID:** YJ-RM-10.18  
 **Fecha:** 2026-07-16  
 **Revisión:** r2 (auditoría código + skills + pendientes)  
-**Estado:** Diseño viable con correcciones r2 — **no empezar P10 como greenfield**  
+**Estado:** **COMPLETE (2026-07-26)** — P10–P18 implementadas y verdes (1073 tests, v0.2.0). Ver `docs/envelope-migration-tracker.md` y `docs/CHANGELOG.md`  
 **Autor:** Diseño asistido + contexto operador (api-recon, Perplexity OPSEC, Gemini UI)  
 **Dependencias:** Phases 1–9 DONE · doctrine library parcial · [yautja-error-contract-1.0.md](../proyectos-pendientes/yautja-error-contract-1.0.md) · [2026-07-15-yautja-error-contract-plan.md](../proyectos-pendientes/2026-07-15-yautja-error-contract-plan.md)  
 **Principio rector:** *percepción barata · acción atómica · evidencia redactada · política de dominio embebida*

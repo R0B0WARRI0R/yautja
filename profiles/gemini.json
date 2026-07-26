@@ -1,0 +1,25 @@
+{
+  "id": "gemini",
+  "version": 1,
+  "match": {
+    "hosts": ["gemini.google.com"]
+  },
+  "rules": {
+    "intercept": "silent_only",
+    "stealth": "preferred",
+    "stealthEnforcement": "auto",
+    "preType": "ensureEmpty",
+    "onCaptcha": "stop_hard",
+    "allowEvaluateFetch": "limited"
+  },
+  "preFlight": [],
+  "waitDefaults": {
+    "ready": {
+      "allOf": [
+        { "type": "ariaBusy", "value": false },
+        { "type": "noPulse", "root": "main" }
+      ]
+    }
+  },
+  "notes": "Multi-cuenta /u/{N}/: mismo host, distinto estado/plan — el tracking es tab-scoped. No auto-navegar a /usage (non-goal P13)."
+}

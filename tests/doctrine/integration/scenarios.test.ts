@@ -17,7 +17,7 @@ function setupMachine() {
   return { machine, tracker, idem, telemetry };
 }
 
-describe('Integration: all 12 MVP error codes', () => {
+describe('Integration: all MVP error codes', () => {
   for (const def of MVP_CODES) {
     it(`${def.code} (${def.severity}) is producible and classified`, async () => {
       const { machine } = setupMachine();
@@ -37,7 +37,7 @@ describe('Integration: all 12 MVP error codes', () => {
         expect(result.error.severity).toBe(def.severity);
         expect(result.error.retryable).toBe(def.retryable);
         expect(result.error.category).toBe(def.category);
-        expect(result.error.introduced_in).toBe('1.0');
+        expect(result.error.introduced_in).toBe(def.introduced_in);
         expect(result.error.message).toBeTruthy();
         expect(result.error.agent_summary).toBeTruthy();
         expect(result.error.recovery.allowed.length).toBeGreaterThan(0);

@@ -1,0 +1,17 @@
+{
+  "id": "default",
+  "version": 1,
+  "match": {
+    "hosts": ["*"]
+  },
+  "rules": {
+    "intercept": "allow",
+    "stealth": "preferred",
+    "stealthEnforcement": "auto",
+    "preType": "none",
+    "onCaptcha": "warn",
+    "allowEvaluateFetch": "limited"
+  },
+  "preFlight": [],
+  "notes": "Fallback permisivo para hosts sin perfil específico."
+}

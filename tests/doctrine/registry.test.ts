@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { REGISTRY, lookupCode, codesInFamily, MVP_CODES } from '../../src/doctrine/registry.js';
 
 describe('Error code registry', () => {
-  it('has exactly 12 MVP codes', () => {
-    expect(MVP_CODES).toHaveLength(12);
+  it('has exactly 23 MVP codes (12 core + 5 P11 + 1 P12 + 3 P13 + 1 P13.5 + 1 P16)', () => {
+    expect(MVP_CODES).toHaveLength(23);
   });
 
   it('every code matches YJ.FAMILY.NAME pattern', () => {
@@ -27,8 +27,11 @@ describe('Error code registry', () => {
 
   it('codesInFamily returns all codes in a category', () => {
     const actionCodes = codesInFamily('action');
-    expect(actionCodes).toHaveLength(4);
+    expect(actionCodes).toHaveLength(11);
     expect(actionCodes.map(c => c.code)).toContain('YJ.ACT.DOM_TARGET_STALE');
+    expect(actionCodes.map(c => c.code)).toContain('YJ.ACT.TYPE_PARTIAL');
+    expect(actionCodes.map(c => c.code)).toContain('YJ.ACT.WAIT_TIMEOUT');
+    expect(actionCodes.map(c => c.code)).toContain('YJ.ACT.TAB_SWITCH_MISMATCH');
   });
 
   it('terminal severity codes are never retryable', () => {

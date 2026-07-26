@@ -1,6 +1,6 @@
 {
   "name": "yautja",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Bio-helmet for browser-hunting LLMs — sensory cortex between CDP and LLM",
   "type": "module",
   "main": "dist/helmet.js",

@@ -240,3 +240,25 @@ yautja/
 | 9 | helmet.ts (orchestrator) + config.ts | All | Medium |
 
 Each phase: spec → MiniMax M3 implements → test against real browser → iterate.
+
+---
+
+## Addendum 2026-07-26 (v0.2.0 — roadmap P10–P18)
+
+New layers on top of the original 5:
+
+```
+6. DOCTRINE   error contract (YautjaResponse envelope, 23 YJ.* codes),
+              recovery machine, gates P0–P4, site profiles, backends
+7. ECONOMIC   quota/budget view per domain (passive, OPSEC-safe)
+```
+
+- **Envelope:** every MCP tool response is a `YautjaResponse` (schema 1.0). Native for ~40 tools; legacy shim for the rest (kill-switch `YAUTJA_LEGACY_SHIM=0`).
+- **Input atomicity:** type = transaction (RecoveryMachine) with ensureEmpty, verify, rollback, anti blind-retry.
+- **Declarative waits:** wait-for-ui engine (networkIdle real via Thermal, textSettled, ariaBusy…); extractAnswer settled+chunked.
+- **Policy in the helmet:** site profiles (JSON) enforce intercept/stealth/quota/captcha per domain; session gates P0–P4 for browserFetch; tab identity verified (TabRegistry).
+- **Trusted gestures:** trustedClick / trustedFileChooser (isTrusted real), typed CAPABILITY_MISSING, never fake success.
+- **Resources:** MCP resources/list|read over traces + evidence (TTL 7d GC); canonical layout `%APPDATA%/.yautja/{sessions,evidence,har,traces,snapshots,profiles}`.
+- **Backends:** delegate router (yautja native / chrome-devtools / superapi) via `~/.yautja/backends.json`.
+
+See `docs/envelope-migration-tracker.md`, `docs/capture-modes.md`, `docs/CHANGELOG.md`.

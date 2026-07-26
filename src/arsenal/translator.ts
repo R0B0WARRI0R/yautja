@@ -1,8 +1,32 @@
 import type { Transport } from '../vision/base-sensor.js';
 import type { BrowserAction, ActionResult, WaitCondition } from './action-types.js';
 import { makeError } from './errors.js';
+import { waitForUi } from './wait-for-ui.js';
+import type { WaitPredicate } from './wait-for-ui.js';
 
 const DEFAULT_TIMEOUT = 30000;
+
+function mapConditionToPredicate(condition: WaitCondition): WaitPredicate {
+  switch (condition.kind) {
+    case 'selector':
+      return { type: 'selector', selector: condition.selector, state: condition.state ?? 'visible' };
+    case 'networkIdle':
+      return { type: 'networkIdle', quietMs: condition.idleTimeMs ?? 500 };
+    case 'function':
+      return { type: 'fn', expression: condition.fn };
+    case 'ariaBusy':
+      return { type: 'ariaBusy', root: condition.root, value: condition.value ?? false };
+    case 'noPulse':
+      return { type: 'noPulse', root: condition.root };
+    case 'textSettled':
+      return { type: 'textSettled', selector: condition.selector, stableMs: condition.stableMs, minLength: condition.minLength };
+    case 'urlMatch':
+      return { type: 'urlMatch', pattern: condition.pattern };
+    default:
+      // navigation/timeout are handled before reaching the engine
+      return { type: 'timeout', ms: 0 };
+  }
+}
 
 export class ActionTranslator {
   constructor(private transport: Transport) {}
@@ -259,45 +283,25 @@ export class ActionTranslator {
   }
 
   private async waitFor(condition: WaitCondition, timeoutMs: number): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs;
-    const interval = 200;
-
-    while (Date.now() < deadline) {
-      switch (condition.kind) {
-        case 'selector': {
-          const node = await this.querySelector(condition.selector);
-          if (condition.state === 'hidden' || condition.state === 'detached') {
-            if (!node) return true;
-          } else {
-            if (node) return true;
-          }
-          break;
-        }
-        case 'navigation': {
-          // Check if URL is stable
-          await sleep(500);
-          return true;
-        }
-        case 'networkIdle': {
-          await sleep(condition.idleTimeMs ?? 500);
-          return true;
-        }
-        case 'function': {
-          const result = await this.transport.send('Runtime.evaluate', {
-            expression: condition.fn,
-            returnByValue: true,
-          });
-          if (result?.result?.value === true) return true;
-          break;
-        }
-        case 'timeout': {
-          await sleep(condition.ms);
-          return true;
-        }
-      }
-      await sleep(interval);
+    // Legacy stubs kept for compatibility: 'navigation' has no previous-URL
+    // tracking at this layer, and 'timeout' is a plain delay by definition.
+    if (condition.kind === 'navigation') {
+      await sleep(500);
+      return true;
     }
-    return false;
+    if (condition.kind === 'timeout') {
+      await sleep(condition.ms);
+      return true;
+    }
+    // Everything else goes through the P12 waitForUi engine. networkIdle
+    // without a pending-request provider degrades to a quiet sleep (same as
+    // the old stub); the MCP `waitFor` tool wires the real Thermal counter.
+    const predicate = mapConditionToPredicate(condition);
+    const result = await waitForUi(
+      { transport: this.transport },
+      { anyOf: [predicate], timeoutMs, pollMs: 200 },
+    );
+    return result.matched !== 'timeout';
   }
 }
 

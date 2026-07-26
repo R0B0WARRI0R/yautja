@@ -1,15 +1,47 @@
 import fs from 'fs';
 import path from 'path';
 
+/**
+ * Site memory v2 (P18 hardening) — per-domain selector cache with
+ * multi-strategy signatures, hit tracking and per-entry TTL.
+ *
+ * v1 entries ({selector, method}) keep working unchanged: the v2 fields
+ * are optional and old files load as-is. Per-entry expiry uses ttlDays
+ * (default 7); whole-file MAX_AGE is kept as a second safety net.
+ */
+
+export interface InputStrategy {
+  kind: 'aria' | 'css' | 'text' | 'role';
+  value: string;
+  score: number;
+}
+
+export interface InputEntry {
+  selector: string;
+  method: 'input' | 'contenteditable';
+  strategies?: InputStrategy[];
+  buildVersion?: string;
+  hits?: number;
+  lastHit?: string;
+  ttlDays?: number;
+}
+
 export interface SiteProfile {
   domain: string;
-  inputs: Record<string, { selector: string; method: 'input' | 'contenteditable'; }>;
-  buttons: Record<string, { selector: string; }>;
+  inputs: Record<string, InputEntry>;
+  buttons: Record<string, { selector: string }>;
   updatedAt: number;
 }
 
 const MEMORY_DIR = path.join(process.env.APPDATA || process.env.HOME || '/tmp', '.yautja-memory');
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_ENTRY_TTL_DAYS = 7;
+
+function isEntryFresh(entry: InputEntry, now = Date.now()): boolean {
+  if (!entry.lastHit) return true; // never used → rely on file-level MAX_AGE
+  const ttl = (entry.ttlDays ?? DEFAULT_ENTRY_TTL_DAYS) * 24 * 60 * 60 * 1000;
+  return now - Date.parse(entry.lastHit) < ttl;
+}
 
 export class SiteMemory {
   private cache: Map<string, SiteProfile> = new Map();
@@ -34,6 +66,24 @@ export class SiteMemory {
       }
     } catch {}
     return null;
+  }
+
+  /** Get a fresh (non-expired) input entry for a query key. */
+  getInput(domain: string, query: string): InputEntry | null {
+    const profile = this.get(domain);
+    const entry = profile?.inputs?.[query];
+    if (!entry || !isEntryFresh(entry)) return null;
+    return entry;
+  }
+
+  /** Record a cache hit: bumps hits + lastHit and persists. */
+  recordHit(domain: string, query: string): void {
+    const profile = this.get(domain);
+    const entry = profile?.inputs?.[query];
+    if (!profile || !entry) return;
+    entry.hits = (entry.hits ?? 0) + 1;
+    entry.lastHit = new Date().toISOString();
+    this.save(domain, { inputs: { [query]: entry } });
   }
 
   save(domain: string, updates: Partial<SiteProfile>): SiteProfile {

@@ -108,6 +108,33 @@ async function main() {
     const delBuiltin = await send(helmet, { jsonrpc: '2.0', id: nextId(), method: 'tools/call', params: { name: 'macro_delete', arguments: { name: 'page-summary' } } });
     log('11. macro_delete built-in (should refuse)', JSON.parse(delBuiltin.result.content[0].text));
 
+    // ─── P10–P18 smoke (envelope-aware) ──────────────────────
+    // 12. Envelope shape on a native tool
+    const obs = JSON.parse((await send(helmet, { jsonrpc: '2.0', id: nextId(), method: 'tools/call', params: { name: 'listTabs', arguments: {} } })).result.content[0].text);
+    log('12. envelope shape (listTabs)', { ok: obs.ok, schema_version: obs.schema_version, hasState: !!obs.state });
+
+    // 13. ensureEmpty fails fast without query/selector (P11)
+    const ee = JSON.parse((await send(helmet, { jsonrpc: '2.0', id: nextId(), method: 'tools/call', params: { name: 'ensureEmpty', arguments: {} } })).result.content[0].text);
+    log('13. ensureEmpty INVALID_ARGUMENT', { ok: ee.ok, code: ee.error?.code });
+
+    // 14. waitFor times out typed (P12)
+    const wf = JSON.parse((await send(helmet, { jsonrpc: '2.0', id: nextId(), method: 'tools/call', params: { name: 'waitFor', arguments: { anyOf: [{ type: 'selector', selector: '#definitely-not-here-x1' }], timeoutMs: 1200, pollMs: 200 } } })).result.content[0].text);
+    log('14. waitFor WAIT_TIMEOUT', { ok: wf.ok, code: wf.error?.code });
+
+    // 15. profileList ships perplexity/gemini/default (P13)
+    const pl = JSON.parse((await send(helmet, { jsonrpc: '2.0', id: nextId(), method: 'tools/call', params: { name: 'profileList', arguments: {} } })).result.content[0].text);
+    const profileIds = (pl.result?.profiles ?? []).map((p) => p.id);
+    log('15. profileList', { ok: pl.ok, ids: profileIds });
+
+    // 16. preflight passes on a default domain (P13)
+    const pf = JSON.parse((await send(helmet, { jsonrpc: '2.0', id: nextId(), method: 'tools/call', params: { name: 'preflight', arguments: {} } })).result.content[0].text);
+    log('16. preflight', { ok: pf.ok, pass: pf.result?.pass, profile: pf.result?.profile });
+
+    // 17. gateStatus default P0; browserFetch denied without grant (P14)
+    const gs = JSON.parse((await send(helmet, { jsonrpc: '2.0', id: nextId(), method: 'tools/call', params: { name: 'gateStatus', arguments: {} } })).result.content[0].text);
+    const bf = JSON.parse((await send(helmet, { jsonrpc: '2.0', id: nextId(), method: 'tools/call', params: { name: 'browserFetch', arguments: { url: 'https://example.com/api', method: 'POST' } } })).result.content[0].text);
+    log('17. gates', { defaultGate: gs.result?.defaultGate, fetchDenied: bf.ok === false && bf.error?.code === 'YJ.POLICY.GATE_DENIED' });
+
     // Summary
     console.log('\n========== SUMMARY ==========');
     console.log('Tools exposed:', names.filter((n) => n.startsWith('macro_')).length, '/ 4 expected');
@@ -116,6 +143,11 @@ async function main() {
     console.log('Lookup error: OK if step 8 stage=lookup');
     console.log('Validation error: OK if step 9 stage=validation');
     console.log('Built-in delete refused: OK if step 11 stage=permission');
+    console.log('Envelope: OK if step 12 ok===true && schema_version==="1.0"');
+    console.log('P11: OK if step 13 code===YJ.PROTOCOL.INVALID_ARGUMENT');
+    console.log('P12: OK if step 14 code===YJ.ACT.WAIT_TIMEOUT');
+    console.log('P13: OK if step 15 includes perplexity+gemini+default && step 16 pass===true');
+    console.log('P14: OK if step 17 defaultGate===P0 && fetchDenied===true');
   } catch (err) {
     console.error('\n!!! E2E FAILED !!!');
     console.error('Error:', err.message);

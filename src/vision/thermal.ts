@@ -248,6 +248,15 @@ export class ThermalSensor extends BaseSensor<NetworkSummary> {
     if (txn) txn.isSSE = true;
   }
 
+  /** Pending (in-flight) request count — used by waitForUi networkIdle (P12). */
+  getPendingCount(): number {
+    let n = 0;
+    for (const t of this.transactions.values()) {
+      if (t.state === 'pending' || t.state === 'receiving') n++;
+    }
+    return n;
+  }
+
   async summarize(query?: NetworkQuery): Promise<NetworkSummary> {
     const slowThreshold = query?.slowThresholdMs ?? this.config.slowThresholdMs;
     let txns = Array.from(this.transactions.values());

@@ -61,6 +61,12 @@ async function send(stdin: Readable, out: string[], o: unknown): Promise<any> {
   return JSON.parse(out[out.length - 1]!.trim());
 }
 
+// P10: tools/call payloads are doctrine envelopes — unwrap the legacy result.
+function unwrapToolResult(resp: any): any {
+  const env = JSON.parse(resp.result.content[0].text);
+  return env.result !== undefined ? env.result : env;
+}
+
 describe('Helmet macro tools (tools/list + tool routing)', () => {
   let h: Helmet;
   let stdin: Readable;
@@ -85,20 +91,20 @@ describe('Helmet macro tools (tools/list + tool routing)', () => {
 
   it('macro_list returns array (possibly empty since start() not called)', async () => {
     const resp = await send(stdin, out, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'macro_list', arguments: {} } });
-    const r = JSON.parse(resp.result.content[0].text);
+    const r = unwrapToolResult(resp);
     expect(Array.isArray(r.macros)).toBe(true);
   });
 
   it('macro_run on unknown returns lookup error', async () => {
     const resp = await send(stdin, out, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'macro_run', arguments: { name: 'ghost' } } });
-    const r = JSON.parse(resp.result.content[0].text);
+    const r = unwrapToolResult(resp);
     expect(r.success).toBe(false);
     expect(r.stage).toBe('lookup');
   });
 
   it('macro_register with invalid name returns validation error', async () => {
     const resp = await send(stdin, out, { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'macro_register', arguments: { name: 'Bad!', source: 'x' } } });
-    const r = JSON.parse(resp.result.content[0].text);
+    const r = unwrapToolResult(resp);
     expect(r.success).toBe(false);
     expect(r.stage).toBe('validation');
   });
@@ -114,11 +120,11 @@ describe('buildCtx integration — real ctx methods called by macro', () => {
     try {
       const src = `export default { name: 'smoke', description: 'smoke', async run(_a, ctx) { const o = await ctx.observe('overview'); return { ok: true, o }; } };`;
       const regResp = await send(stdin, out, { jsonrpc: '2.0', id: 100, method: 'tools/call', params: { name: 'macro_register', arguments: { name: 'smoke', source: src } } });
-      const regResult = JSON.parse(regResp.result.content[0].text);
+      const regResult = unwrapToolResult(regResp);
       expect(regResult.success).toBe(true);
 
       const runResp = await send(stdin, out, { jsonrpc: '2.0', id: 101, method: 'tools/call', params: { name: 'macro_run', arguments: { name: 'smoke' } } });
-      const runResult = JSON.parse(runResp.result.content[0].text);
+      const runResult = unwrapToolResult(runResp);
       expect(runResult.success).toBe(true);
       expect(runResult.result.ok).toBe(true);
     } finally {
