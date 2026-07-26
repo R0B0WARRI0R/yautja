@@ -159,3 +159,12 @@ setInterval(() => {}, 10000);
 
 process.on('SIGTERM', () => { server.close(); process.exit(0); });
 process.on('SIGINT', () => { server.close(); process.exit(0); });
+
+// Parent-death watchdog: this proxy is spawned by the helmet and its stdin
+// is piped from the parent. When the helmet dies (even with -9), stdin
+// closes — exit instead of becoming a zombie holding port 9877 and the
+// Windows system proxy settings.
+process.stdin.on('end', () => {
+  server.close();
+  process.exit(0);
+});

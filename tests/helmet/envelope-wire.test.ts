@@ -575,4 +575,14 @@ describe('P10 — doctrine envelope wire (shim 10a)', () => {
       delete process.env.YAUTJA_LEGACY_SHIM;
     }
   });
+
+  it('hardening: stdin close (host death) triggers clean stop and exit — no zombie', async () => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as any);
+    const stopSpy = vi.spyOn(helmet as any, 'stop');
+    stdin.push(null); // EOF — the MCP host died
+    await new Promise((r) => setTimeout(r, 150));
+    expect(stopSpy).toHaveBeenCalled();
+    expect(exitSpy).toHaveBeenCalledWith(0);
+    exitSpy.mockRestore();
+  });
 });

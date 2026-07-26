@@ -430,6 +430,17 @@ export class Helmet {
   serveMCP(): void {
     const rl = createInterface({ input: process.stdin, output: process.stderr });
 
+    // Host death detection (zombie hardening): when the MCP host dies,
+    // stdin closes. Shut down cleanly (kill proxy child, restore Windows
+    // proxy settings) and exit instead of becoming a zombie on the port.
+    rl.on('close', () => {
+      const force = setTimeout(() => process.exit(0), 3000);
+      force.unref();
+      this.stop()
+        .catch(() => {})
+        .finally(() => process.exit(0));
+    });
+
     rl.on('line', async (line: string) => {
       let msg: any;
       try {

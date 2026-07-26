@@ -42,3 +42,9 @@
 ### P18 — Backend router + hardening
 - `delegate` + `~/.yautja/backends.json`; siteMemory v2 (estrategias, hits, TTL por entrada, buildVersion); macros con precondition captcha/profile; shim kill-switch.
 - Registry: 23 códigos `YJ.*`. Tests: 517 → 1073.
+
+### Zombie/port hardening (2026-07-26)
+- `helmet-main`: handlers SIGINT/SIGTERM + `stdin.on('end')` (con `resume()`) registrados **antes** de `start()` — host muerto o taskkill → `stop()` limpio + exit. Verificado en vivo: EOF durante startup y post-handshake → exit 0.
+- `serveMCP`: `rl.on('close')` → `stop()` + exit (con force-exit a 3s).
+- `proxy-standalone.cjs`: watchdog `stdin.on('end')` — padre muerto → el proxy sale (no zombie en :9877 ni proxy de sistema colgado en el registro).
+- Puerto ocupado: falla rápido con fatal claro (ya existía; verificado EADDRINUSE).
