@@ -117,19 +117,20 @@
 | Backends | delegate | ✅ nativo P18 (dry-run) |
 | MCP resources | resources/list, resources/read | ✅ P17 |
 | Doctrine | recovery_stats | ✅ nativa |
-| Tabs resto | closeTab | shim 10a |
-| Smart input resto | findElement, findClick, findType, siteMemory, siteMemoryClear | shim 10a |
-| Interception / Capture / GQL / Intel / WS / Macros / Ext / TM | resto | shim 10a |
+| **Todo lo demás** | closeTab, find*/siteMemory, intercept*, capture*, gql*, techScan, stealth*, osint/netIntel, ws*, macro_*, ext*, tm*, learningStatus | ✅ nativo **10c** |
 
 ## Pendiente (post-roadmap)
 
-- [ ] 10c: migrar a nativos las tools restantes (intel, intercept, capture, gql, macros, ext/tm, closeTab) — el shim sigue activo por defecto para ellas.
+- [x] **10c COMPLETA (2026-07-27):** 100% de tools nativas vía codemod (100 returns) + helper `native()` (clasifica shapes legacy de error, preserva payload). **Shim eliminado** (`detectLegacyError` y el path de strings borrados; `handleToolCall` solo devuelve `YautjaResponse`).
+- [x] Telemetría `recovered`: `RecoveryMachine.onOutcome` registra outcomes `recovered` cuando un retry tiene éxito tras un fallo (helmet lo cablea a `TelemetryCollector`).
+- [x] Biofilm: estado visible en `learningStatus` (`biofilm.getState()`), opt-in sin auto-init (no spawnea tabs).
+- [x] Multi-sesión: puertos configurables (`YAUTJA_PORT`, `YAUTJA_PROXY_PORT`, `YAUTJA_CDP_REMOTE_PORT`) + `docs/multi-session.md` con la receta y las limitaciones honestas.
 - [ ] Rename propuesto `interceptor*` → `gqlCapture*` (ver `docs/capture-modes.md`).
-- [ ] Telemetry: registrar outcomes `recovered` cuando un retry tiene éxito (hoy solo `failed`).
 - [ ] `ContextMeta.available_window_tokens` configurable por perfil de modelo.
 - [ ] Economic sensor: campo `budget` en `observe` (hoy solo vía `profileStatus`).
 - [ ] **Riesgo residual r2 (documentado):** `gateGrant` es MCP tool — el agente PUEDE llamarla con una phrase inventada. Mitigación actual: phrase obligatoria + audit + hard rule P0. Mitigación fuerte pendiente: grants solo vía fichero/CLI `yautja-gate`, o `confirmationToken` del host MCP.
 - [ ] Delegate: invocación real cross-proceso (hoy dry-run).
+- [ ] MITM proxy: HTTPS solo dominio (CONNECT), sin desencriptar contenido — limitación documentada; activar MITM real requiere CA instalada (`extNetwork installCert`).
 
 ## Notas de diseño
 

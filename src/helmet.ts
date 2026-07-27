@@ -24,6 +24,7 @@ import { PatternDetector } from './intel/pattern-detector.js';
 import { HashLearner } from './intel/hash-learner.js';
 import { BrowserInterceptorManager } from './intel/browser-interceptor.js';
 import { LearningLoop } from './intel/learning-loop.js';
+import { BiofilmManager } from './intel/biofilm.js';
 import { NetworkCapture } from './intel/network-capture.js';
 import { MacroRunner } from './macros/runner.js';
 import { loadBuiltins, loadUserMacros } from './macros/loader.js';
@@ -84,6 +85,25 @@ export interface HelmetConfig {
 
 export type PortSource = 'cli' | 'env' | 'default';
 
+function envPort(name: string, fallback: number): number {
+  const v = process.env[name]?.trim();
+  if (v) {
+    const n = Number(v);
+    if (Number.isInteger(n) && n >= 1024 && n <= 65535) return n;
+  }
+  return fallback;
+}
+
+/** MITM proxy port (extNetwork). Override per-instance for multi-session. */
+export function resolveProxyPort(): number {
+  return envPort('YAUTJA_PROXY_PORT', 9877);
+}
+
+/** CDP remote debugging port. Override per-instance for multi-session. */
+export function resolveCdpRemotePort(): number {
+  return envPort('YAUTJA_CDP_REMOTE_PORT', 9222);
+}
+
 export function resolvePort(): { port: number; source: PortSource } {
   const cli = process.argv[2]?.trim();
   if (cli) {
@@ -134,6 +154,7 @@ export class Helmet {
   private hashLearner: HashLearner;
   private browserInterceptor: BrowserInterceptorManager;
   private learningLoop: LearningLoop;
+  private biofilm: BiofilmManager;
   private networkCapture: NetworkCapture;
   private macroRunner: MacroRunner;
   private extIntel: ExtensionIntel;
@@ -189,6 +210,7 @@ export class Helmet {
         escalation: ['ROLLBACK_TO_CHECKPOINT', 'ABORT'],
       },
     },
+    onOutcome: (outcome) => this.telemetry.record(outcome),
   });
   private attached = false;
 
@@ -222,11 +244,12 @@ export class Helmet {
     this.learningLoop = new LearningLoop(
       this.server, this.hashSeedDB, this.patternDetector, this.hashLearner, this.browserInterceptor
     );
+    this.biofilm = new BiofilmManager(this.server);
     this.networkCapture = new NetworkCapture(this.server);
     this.macroRunner = new MacroRunner(this);
     this.extIntel = new ExtensionIntel();
-    this.cdpRemote = new CdpRemoteClient(9222);
-    this.mitmProxy = new MitmProxyServer(9877);
+    this.cdpRemote = new CdpRemoteClient(resolveCdpRemotePort());
+    this.mitmProxy = new MitmProxyServer(resolveProxyPort());
     this.tabRegistry = new TabRegistry(this.server);
     this.server.setNetworkCaptureCallback((msg: any) => {
       if (msg.action === 'add' && msg.entry) {
@@ -533,7 +556,7 @@ export class Helmet {
     });
   }
 
-  private async handleToolCall(name: string, args: any): Promise<string | YautjaResponse<unknown>> {
+  private async handleToolCall(name: string, args: any): Promise<YautjaResponse<unknown>> {
     switch (name) {
       case 'observe': {
         const { text, state } = await this.observeCore(args.question || 'overview');
@@ -674,7 +697,7 @@ export class Helmet {
       }
       case 'closeTab': {
         const tabId = args.tabId;
-        if (!tabId) return JSON.stringify({ error: 'tabId required' });
+        if (!tabId) return this.native(name, args, { error: 'tabId required' });
         if (this.server.getCurrentTabId() === tabId) {
           const tabs = await this.server.listTabs();
           const yt = tabs.find((t) => t.url.includes('youtube.com'));
@@ -687,9 +710,9 @@ export class Helmet {
           }
         }
         try { await this.server.closeTab(tabId); } catch (e: any) {
-          return JSON.stringify({ success: false, error: e.message });
+          return this.native(name, args, { success: false, error: e.message });
         }
-        return JSON.stringify({ success: true, closed: tabId });
+        return this.native(name, args, { success: true, closed: tabId });
       }
       case 'interceptEnable': {
         // P13: site profile enforcement — a profile with intercept:forbid
@@ -701,47 +724,47 @@ export class Helmet {
           }));
         }
         await this.interceptor.enable();
-        return JSON.stringify({ success: true, active: true });
+        return this.native(name, args, { success: true, active: true });
       }
       case 'interceptDisable':
         await this.interceptor.disable();
-        return JSON.stringify({ success: true, active: false });
+        return this.native(name, args, { success: true, active: false });
       case 'interceptStatus':
-        return JSON.stringify({ active: this.interceptor.isActive(), rules: this.interceptor.listRules() });
+        return this.native(name, args, { active: this.interceptor.isActive(), rules: this.interceptor.listRules() });
       case 'interceptAddRule': {
         const rule = this.interceptor.addRule(args.rule);
-        return JSON.stringify({ success: true, rule });
+        return this.native(name, args, { success: true, rule });
       }
       case 'interceptRemoveRule':
-        return JSON.stringify({ success: this.interceptor.removeRule(args.id) });
+        return this.native(name, args, { success: this.interceptor.removeRule(args.id) });
       case 'interceptClearRules':
         this.interceptor.clearRules();
-        return JSON.stringify({ success: true });
+        return this.native(name, args, { success: true });
       case 'interceptLog':
-        return JSON.stringify(this.interceptor.getLogs(args.limit));
+        return this.native(name, args, this.interceptor.getLogs(args.limit));
       case 'findElement': {
         const results = await this.finder.find(args.query, args.limit || 10);
-        return JSON.stringify(results);
+        return this.native(name, args, results);
       }
       case 'findClick': {
         const el = await this.finder.findOne(args.query);
-        if (!el) return JSON.stringify({ success: false, error: `No element found for: ${args.query}` });
+        if (!el) return this.native(name, args, { success: false, error: `No element found for: ${args.query}` });
         const result = await this.translator.execute({
           type: 'click', selector: el.selector,
         });
-        return JSON.stringify({ success: result.ok, found: el, error: result.ok ? undefined : result.error });
+        return this.native(name, args, { success: result.ok, found: el, error: result.ok ? undefined : result.error });
       }
       case 'findType': {
         const el = await this.finder.findOne(args.query);
-        if (!el) return JSON.stringify({ success: false, error: `No element found for: ${args.query}` });
+        if (!el) return this.native(name, args, { success: false, error: `No element found for: ${args.query}` });
         const result = await this.translator.execute({
           type: 'type', selector: el.selector, text: args.text, clearFirst: args.clearFirst ?? true,
         });
-        return JSON.stringify({ success: result.ok, found: el, error: result.ok ? undefined : result.error });
+        return this.native(name, args, { success: result.ok, found: el, error: result.ok ? undefined : result.error });
       }
       case 'captureBody': {
-        if (!this.interceptor.isActive()) return JSON.stringify({ error: 'Interceptor not active. Call interceptEnable first.' });
-        return JSON.stringify({ hint: 'Use interceptAddRule with action type "log" and captureBody: true' });
+        if (!this.interceptor.isActive()) return this.native(name, args, { error: 'Interceptor not active. Call interceptEnable first.' });
+        return this.native(name, args, { hint: 'Use interceptAddRule with action type "log" and captureBody: true' });
       }
       case 'waitFor': {
         const anyOf = args.anyOf as WaitPredicate[] | undefined;
@@ -985,19 +1008,19 @@ export class Helmet {
         const url = (await this.gatherState()).state.url;
         const domain = new URL(url).hostname;
         const profile = this.siteMemory.get(domain);
-        return JSON.stringify({ domain, profile });
+        return this.native(name, args, { domain, profile });
       }
       case 'siteMemoryClear': {
         this.siteMemory.clear(args.domain);
-        return JSON.stringify({ success: true });
+        return this.native(name, args, { success: true });
       }
       case 'techScan': {
         const summary = await this.techSensor.summarize();
-        return JSON.stringify(summary, null, 2);
+        return this.native(name, args, summary);
       }
       case 'stealthCheck': {
         const summary = await this.techSensor.summarize();
-        return JSON.stringify({ antiBot: summary.antiBot, recommendation: summary.antiBot.riskLevel === 'high' ? 'Use stealth mode' : 'Safe to type normally' });
+        return this.native(name, args, { antiBot: summary.antiBot, recommendation: summary.antiBot.riskLevel === 'high' ? 'Use stealth mode' : 'Safe to type normally' });
       }
       case 'stealthEnable': {
         this.stealth.activate();
@@ -1006,7 +1029,7 @@ export class Helmet {
         await this.translator.execute({ type: 'evaluate', expression: STEALTH_PART_2 });
         await sleep(100);
         const r3 = await this.translator.execute({ type: 'evaluate', expression: STEALTH_PART_3 });
-        return JSON.stringify({ success: r3.ok, parts: ['core', 'fingerprint', 'misc'] });
+        return this.native(name, args, { success: r3.ok, parts: ['core', 'fingerprint', 'misc'] });
       }
       case 'stealthDisable': {
         this.stealth.deactivate();
@@ -1014,51 +1037,51 @@ export class Helmet {
           type: 'evaluate',
           expression: `(() => { delete window.__yautja_stealth; location.reload(); return true; })()`,
         });
-        return JSON.stringify({ success: r.ok });
+        return this.native(name, args, { success: r.ok });
       }
       case 'wsWatch': {
         this.wsInspector.watch();
-        return JSON.stringify({ success: true, active: true });
+        return this.native(name, args, { success: true, active: true });
       }
       case 'wsUnwatch': {
         this.wsInspector.unwatch();
-        return JSON.stringify({ success: true, active: false });
+        return this.native(name, args, { success: true, active: false });
       }
       case 'wsList': {
-        return JSON.stringify(this.wsInspector.listConnections(), null, 2);
+        return this.native(name, args, this.wsInspector.listConnections());
       }
       case 'wsFrames': {
-        return JSON.stringify(this.wsInspector.getFrames({
+        return this.native(name, args, this.wsInspector.getFrames({
           connectionId: args.connectionId,
           direction: args.direction,
           search: args.search,
           limit: args.limit,
-        }), null, 2);
+        }));
       }
       case 'wsStats': {
-        return JSON.stringify(this.wsInspector.getStats(), null, 2);
+        return this.native(name, args, this.wsInspector.getStats());
       }
       case 'wsClear': {
         this.wsInspector.clear();
-        return JSON.stringify({ success: true });
+        return this.native(name, args, { success: true });
       }
       case 'osintHarvest': {
         const result = await this.osint.harvest();
-        return JSON.stringify(result, null, 2);
+        return this.native(name, args, result);
       }
       case 'netIntel': {
         const result = await this.netIntel.analyze();
-        return JSON.stringify(result, null, 2);
+        return this.native(name, args, result);
       }
       case 'capturedGql': {
         const tabId = args.tabId;
         const limit = args.limit || 100;
         const result = await this.server.getCapturedGql(tabId, limit);
-        return JSON.stringify(result, null, 2);
+        return this.native(name, args, result);
       }
       case 'clearGql': {
         await this.server.clearCapturedGql(args.tabId);
-        return JSON.stringify({ success: true });
+        return this.native(name, args, { success: true });
       }
       case 'hashAcquire': {
         const url = (await this.gatherState()).state.url;
@@ -1067,7 +1090,7 @@ export class Helmet {
         const result = await this.learningLoop.acquireHash(
           args.operationName, domain, args.queryTemplate, args.endpoint, args.headers
         );
-        return JSON.stringify(result, null, 2);
+        return this.native(name, args, result);
       }
       case 'hashSeed': {
         const url = (await this.gatherState()).state.url;
@@ -1076,13 +1099,13 @@ export class Helmet {
         const op = args.operationName;
         if (!op) {
           const all = this.learningLoop.getSeeds(domain);
-          return JSON.stringify({ domain, seeds: all }, null, 2);
+          return this.native(name, args, { domain, seeds: all });
         }
         const seed = this.hashSeedDB.get(op, domain);
-        return JSON.stringify({ domain, seed }, null, 2);
+        return this.native(name, args, { domain, seed });
       }
       case 'hashRotations': {
-        return JSON.stringify({ rotations: this.learningLoop.getRotations(args.limit || 20) }, null, 2);
+        return this.native(name, args, { rotations: this.learningLoop.getRotations(args.limit || 20) });
       }
       case 'hashSave': {
         const url = (await this.gatherState()).state.url;
@@ -1101,11 +1124,11 @@ export class Helmet {
           rotationCount: 0,
           source: 'external',
         }, domain);
-        return JSON.stringify({ success: true, domain, operationName: args.operationName });
+        return this.native(name, args, { success: true, domain, operationName: args.operationName });
       }
       case 'interceptorStart': {
         const installed = await this.learningLoop.startInterceptor();
-        return JSON.stringify({
+        return this.native(name, args, {
           success: installed,
           active: this.browserInterceptor.isActive(),
           lastError: this.browserInterceptor.getStatus().lastCapturedHash || null,
@@ -1113,35 +1136,40 @@ export class Helmet {
       }
       case 'interceptorStop': {
         await this.learningLoop.stopInterceptor();
-        return JSON.stringify({ success: true });
+        return this.native(name, args, { success: true });
       }
       case 'interceptorStatus': {
-        return JSON.stringify(this.learningLoop.getStatus(), null, 2);
+        return this.native(name, args, this.learningLoop.getStatus());
       }
       case 'interceptorPull': {
         const captures = await this.browserInterceptor.pullCaptures();
-        return JSON.stringify({ captures, count: captures.length });
+        return this.native(name, args, { captures, count: captures.length });
       }
       case 'learningStatus': {
-        return JSON.stringify(this.learningLoop.getStatus(), null, 2);
+        return this.native(name, args, {
+          ...this.learningLoop.getStatus(),
+          // Biofilm is opt-in (no auto-init — creating cells spawns tabs).
+          // Report its state so callers can decide to use it explicitly.
+          biofilm: this.biofilm.getState(),
+        });
       }
       case 'captureRequest': {
         if (!args.requestId) {
           const ids = this.networkCapture.list().map(r => r.id);
-          return JSON.stringify({ hint: 'requestId required. Available IDs:', ids: ids.slice(-10) });
+          return this.native(name, args, { hint: 'requestId required. Available IDs:', ids: ids.slice(-10) });
         }
         const body = await this.networkCapture.captureRequestBody(args.requestId);
         if (body) this.networkCapture.attachBodyToRequest(args.requestId, 'request', body);
-        return JSON.stringify({ requestId: args.requestId, body, length: body?.length || 0 });
+        return this.native(name, args, { requestId: args.requestId, body, length: body?.length || 0 });
       }
       case 'captureResponse': {
         if (!args.requestId) {
           const ids = this.networkCapture.list().map(r => r.id);
-          return JSON.stringify({ hint: 'requestId required. Available IDs:', ids: ids.slice(-10) });
+          return this.native(name, args, { hint: 'requestId required. Available IDs:', ids: ids.slice(-10) });
         }
         const r = await this.networkCapture.captureResponseBody(args.requestId);
         if (r) this.networkCapture.attachBodyToRequest(args.requestId, 'response', r.body);
-        return JSON.stringify({ requestId: args.requestId, length: r?.body.length || 0 });
+        return this.native(name, args, { requestId: args.requestId, length: r?.body.length || 0 });
       }
       case 'captureList': {
         const filters: any = {};
@@ -1150,11 +1178,11 @@ export class Helmet {
         if (args.hasMatches) filters.hasMatches = true;
         if (args.limit) filters.limit = args.limit;
         const list = this.networkCapture.list(filters);
-        return JSON.stringify({ count: list.length, items: list });
+        return this.native(name, args, { count: list.length, items: list });
       }
       case 'captureStats': {
         const s = this.networkCapture.stats();
-        return JSON.stringify({
+        return this.native(name, args, {
           total: s.total,
           withBody: s.withBody,
           withMatches: s.withMatches,
@@ -1166,11 +1194,11 @@ export class Helmet {
       case 'captureSetActive': {
         const active = args.active !== false;
         this.networkCapture.setActive(active);
-        return JSON.stringify({ success: true, active });
+        return this.native(name, args, { success: true, active });
       }
       case 'captureClear': {
         this.networkCapture.clear();
-        return JSON.stringify({ success: true });
+        return this.native(name, args, { success: true });
       }
       case 'gqlQuery': {
         const url = (await this.gatherState()).state.url;
@@ -1184,27 +1212,27 @@ export class Helmet {
           operationName: args.operationName,
           headers: args.headers,
         });
-        return JSON.stringify(result, null, 2);
+        return this.native(name, args, result);
       }
       case 'gqlCache': {
         const url = (await this.gatherState()).state.url;
         let domain = '';
         try { domain = new URL(url).hostname; } catch {}
         const info = this.gqlCache.get(domain);
-        return JSON.stringify({ domain, info }, null, 2);
+        return this.native(name, args, { domain, info });
       }
       case 'gqlCacheAdd': {
         const url = (await this.gatherState()).state.url;
         let domain = '';
         try { domain = new URL(url).hostname; } catch {}
         this.gqlCache.addHash(domain, args.operationName, args.hash, args.query);
-        return JSON.stringify({ success: true, domain, operationName: args.operationName });
+        return this.native(name, args, { success: true, domain, operationName: args.operationName });
       }
       case 'gqlCacheList': {
-        return JSON.stringify({ domains: this.gqlCache.listDomains() }, null, 2);
+        return this.native(name, args, { domains: this.gqlCache.listDomains() });
       }
       case 'macro_list':
-        return JSON.stringify({ macros: this.macroRunner.list() });
+        return this.native(name, args, { macros: this.macroRunner.list() });
       case 'macro_run': {
         // P18: precondition — profile OPSEC rules apply to macros too
         const macroProfile = this.profileStore.match(await this.currentPageUrl());
@@ -1220,15 +1248,15 @@ export class Helmet {
           } catch {}
         }
         const result = await this.macroRunner.run(args.name, args.args, args.timeoutMs);
-        return JSON.stringify(result);
+        return this.native(name, args, result);
       }
       case 'macro_register': {
         const result = await this.macroRunner.registerUserMacro(args.name, args.source, args.overwrite === true);
-        return JSON.stringify(result);
+        return this.native(name, args, result);
       }
       case 'macro_delete': {
         const result = await this.macroRunner.deleteUserMacro(args.name);
-        return JSON.stringify(result);
+        return this.native(name, args, result);
       }
       // ─── Extension inspection tools (hybrid: disk + management + CDP) ──
       case 'extList': {
@@ -1238,84 +1266,84 @@ export class Helmet {
           const filtered = args.type
             ? extensions.filter((e: any) => e.type === args.type)
             : extensions;
-          return JSON.stringify({ extensions: filtered, count: filtered.length, source: 'management' }, null, 2);
+          return this.native(name, args, { extensions: filtered, count: filtered.length, source: 'management' });
         } catch {
           const targets = await this.server.listAllTargets();
           const filtered = args.type
             ? targets.filter((t) => t.type === args.type)
             : targets;
-          return JSON.stringify({ extensions: filtered, count: filtered.length, source: 'debugger-targets' }, null, 2);
+          return this.native(name, args, { extensions: filtered, count: filtered.length, source: 'debugger-targets' });
         }
       }
       case 'extAttach': {
         // Deprecated — no longer needed. Disk/management/CDP backends operate by extId directly.
-        return JSON.stringify({
+        return this.native(name, args, {
           success: true,
           note: 'extAttach is no longer required. extManifest/extSource/extStorage read from disk; extNetwork uses webRequest; extEval uses CDP remote on :9222.',
         });
       }
       case 'extManifest': {
         const extId = args.extId;
-        if (!extId) return JSON.stringify({ error: 'extId required' });
+        if (!extId) return this.native(name, args, { error: 'extId required' });
         try {
           const manifest = await this.extIntel.readManifest(extId);
-          return JSON.stringify({ extId, manifest }, null, 2);
+          return this.native(name, args, { extId, manifest });
         } catch (e: any) {
-          return JSON.stringify({ error: e.message });
+          return this.native(name, args, { error: e.message });
         }
       }
       case 'extSource': {
         const extId = args.extId;
         const filePath = args.path || 'manifest.json';
-        if (!extId) return JSON.stringify({ error: 'extId required' });
+        if (!extId) return this.native(name, args, { error: 'extId required' });
         try {
           const content = await this.extIntel.readSource(extId, filePath);
-          return JSON.stringify({ extId, path: filePath, content });
+          return this.native(name, args, { extId, path: filePath, content });
         } catch (e: any) {
-          return JSON.stringify({ error: e.message });
+          return this.native(name, args, { error: e.message });
         }
       }
       case 'extStorage': {
         const extId = args.extId;
-        if (!extId) return JSON.stringify({ error: 'extId required' });
+        if (!extId) return this.native(name, args, { error: 'extId required' });
         const key = args.key;
         try {
           const data = await this.extIntel.readStorage(extId, key);
-          return JSON.stringify({ extId, area: 'local', keys: Object.keys(data).length, data });
+          return this.native(name, args, { extId, area: 'local', keys: Object.keys(data).length, data });
         } catch (e: any) {
-          return JSON.stringify({ error: e.message });
+          return this.native(name, args, { error: e.message });
         }
       }
       case 'extNetwork': {
         const extId = args.extId;
         const action = args.action || 'list';
-        if (!extId) return JSON.stringify({ error: 'extId required' });
+        if (!extId) return this.native(name, args, { error: 'extId required' });
         try {
           if (action === 'start') {
             // Start the tunnel proxy if not running
             if (!this.mitmProxy.isRunning()) {
               await this.mitmProxy.start();
               // Tell the extension to route through our proxy
-              await this.server.proxyStart(9877);
-              return JSON.stringify({
+              await this.server.proxyStart(resolveProxyPort());
+              return this.native(name, args, {
                 success: true,
                 action: 'started',
                 extId,
                 method: 'tunnel-proxy',
-                proxyPort: 9877,
+                proxyPort: resolveProxyPort(),
                 caCertInstalled: true,
                 note: 'HTTPS traffic captured via CONNECT tunneling (domain only, no content decryption)',
               });
             }
             // Proxy already running — just clear buffer for fresh capture
             await this.mitmProxy.clear();
-            await this.server.proxyStart(9877);
-            return JSON.stringify({ success: true, action: 'started', extId, method: 'tunnel-proxy', note: 'Proxy already running, buffer cleared' });
+            await this.server.proxyStart(resolveProxyPort());
+            return this.native(name, args, { success: true, action: 'started', extId, method: 'tunnel-proxy', note: 'Proxy already running, buffer cleared' });
           }
           if (action === 'stop') {
             // Stop routing through proxy
             await this.server.proxyStop();
-            return JSON.stringify({ success: true, action: 'stopped', extId });
+            return this.native(name, args, { success: true, action: 'stopped', extId });
           }
           if (action === 'installCert') {
             if (!this.mitmProxy.hasCaCert()) {
@@ -1331,18 +1359,18 @@ export class Helmet {
             return new Promise((resolve) => {
               exec(`certutil -user -addstore Root "${realPath}"`, (err, stdout) => {
                 if (err) {
-                  resolve(JSON.stringify({ success: false, error: err.message, hint: `Run manually: certutil -user -addstore Root "${realPath}"` }));
+                  resolve(this.native(name, args, { success: false, error: err.message, hint: `Run manually: certutil -user -addstore Root "${realPath}"` }));
                 } else {
-                  resolve(JSON.stringify({ success: true, installed: true, certPath: realPath, output: stdout }));
+                  resolve(this.native(name, args, { success: true, installed: true, certPath: realPath, output: stdout }));
                 }
               });
-            }).then(s => s as string);
+            });
           }
           // action === 'list': return requests captured by the MITM proxy
           const hostPattern = args.hostPattern;
           const { requests, count, total } = await this.mitmProxy.getRequests({ hostPattern, limit: args.limit || 100 });
           const stats = await this.mitmProxy.stats();
-          return JSON.stringify({
+          return this.native(name, args, {
             requests,
             count,
             method: 'tunnel-proxy',
@@ -1351,16 +1379,16 @@ export class Helmet {
             topHosts: Object.entries(stats.hosts).sort((a, b) => b[1] - a[1]).slice(0, 20),
           });
         } catch (e: any) {
-          return JSON.stringify({ error: e.message });
+          return this.native(name, args, { error: e.message });
         }
       }
       case 'extEval': {
         const extId = args.extId;
         const expression = args.expression;
-        if (!extId || !expression) return JSON.stringify({ error: 'extId and expression required' });
+        if (!extId || !expression) return this.native(name, args, { error: 'extId and expression required' });
         const available = await this.cdpRemote.isAvailable();
         if (!available) {
-          return JSON.stringify({
+          return this.native(name, args, {
             error: 'Remote debugging port not available. Launch Chrome with --remote-debugging-port=9222 to use extEval.',
           });
         }
@@ -1368,9 +1396,9 @@ export class Helmet {
           const { result, exceptionDetails } = await this.cdpRemote.evaluate(
             extId, expression, args.awaitPromise ?? false,
           );
-          return JSON.stringify({ result, exceptionDetails });
+          return this.native(name, args, { result, exceptionDetails });
         } catch (e: any) {
-          return JSON.stringify({ error: e.message });
+          return this.native(name, args, { error: e.message });
         }
       }
       // ─── Tampermonkey integration tools ──────────────────────────────
@@ -1405,23 +1433,23 @@ export class Helmet {
             }
           }
           scripts.sort((a, b) => a.name.localeCompare(b.name));
-          return JSON.stringify({ scripts, count: scripts.length, extId: tmId }, null, 2);
+          return this.native(name, args, { scripts, count: scripts.length, extId: tmId });
         } catch (e: any) {
-          return JSON.stringify({ error: e.message, hint: 'Tampermonkey may not be installed or no profile found' });
+          return this.native(name, args, { error: e.message, hint: 'Tampermonkey may not be installed or no profile found' });
         }
       }
       case 'tmGetScript': {
         const tmId = args.extId || 'dhdgffkkebhmkfjojejmpbldmpobfkfo';
         const uuid = args.uuid;
-        if (!uuid) return JSON.stringify({ error: 'uuid required' });
+        if (!uuid) return this.native(name, args, { error: 'uuid required' });
         try {
           const data = await this.extIntel.readStorage(tmId);
           const metaKey = `@meta#${uuid}`;
           const sourceKey = `@source#${uuid}`;
           const meta = data[metaKey];
           const source = data[sourceKey];
-          if (!meta) return JSON.stringify({ error: `Script with UUID ${uuid} not found` });
-          return JSON.stringify({
+          if (!meta) return this.native(name, args, { error: `Script with UUID ${uuid} not found` });
+          return this.native(name, args, {
             uuid,
             name: meta.name,
             version: meta.version,
@@ -1434,9 +1462,9 @@ export class Helmet {
             grants: meta.grant || [],
             code: source || '(source not found in storage)',
             codeSize: source ? source.length : 0,
-          }, null, 2);
+          });
         } catch (e: any) {
-          return JSON.stringify({ error: e.message });
+          return this.native(name, args, { error: e.message });
         }
       }
       case 'tmSearchScripts': {
@@ -1451,7 +1479,7 @@ export class Helmet {
           } else if (query) {
             url = `https://greasyfork.org/en/scripts.json?q=${encodeURIComponent(query)}&per_page=${limit}`;
           } else {
-            return JSON.stringify({ error: 'Either query or domain required' });
+            return this.native(name, args, { error: 'Either query or domain required' });
           }
 
           const resp = await fetch(url, {
@@ -1459,7 +1487,7 @@ export class Helmet {
             signal: AbortSignal.timeout(15000),
           });
           if (!resp.ok) {
-            return JSON.stringify({ error: `GreasyFork API returned ${resp.status}` });
+            return this.native(name, args, { error: `GreasyFork API returned ${resp.status}` });
           }
           const data = await resp.json() as any;
           const results = (data.query || []).map((s: any) => ({
@@ -1482,15 +1510,15 @@ export class Helmet {
             locale: s.locale || '',
           }));
 
-          return JSON.stringify({
+          return this.native(name, args, {
             results,
             count: results.length,
             source: 'greasyfork.org',
             searchType: domain ? 'by-site' : 'query',
             query: query || domain,
-          }, null, 2);
+          });
         } catch (e: any) {
-          return JSON.stringify({ error: e.message });
+          return this.native(name, args, { error: e.message });
         }
       }
       case 'tmInstallScript': {
@@ -1499,7 +1527,7 @@ export class Helmet {
         const installUrl = args.url as string | undefined;
 
         if (!code && !installUrl) {
-          return JSON.stringify({ error: 'Either code (userscript source) or url (install URL) required' });
+          return this.native(name, args, { error: 'Either code (userscript source) or url (install URL) required' });
         }
 
         try {
@@ -1510,7 +1538,7 @@ export class Helmet {
           if (!code && installUrl) {
             const r = await fetch(installUrl, { redirect: 'follow' });
             if (!r.ok) {
-              return JSON.stringify({
+              return this.native(name, args, {
                 error: `Failed to fetch URL: ${r.status} ${r.statusText}`,
                 url: installUrl,
               });
@@ -1525,12 +1553,12 @@ export class Helmet {
             timeout: 20000,
           });
 
-          return JSON.stringify({
+          return this.native(name, args, {
             success: !result?.error && !result?.detail,
             result,
-          }, null, 2);
+          });
         } catch (e: any) {
-          return JSON.stringify({
+          return this.native(name, args, {
             error: e.message,
             hint: 'Tampermonkey must be installed and the script must start with a valid ==UserScript== header',
           });
@@ -1542,7 +1570,7 @@ export class Helmet {
         const enabled = args.enabled as boolean | undefined;
 
         if (!uuid || enabled === undefined) {
-          return JSON.stringify({ error: 'uuid and enabled (boolean) required' });
+          return this.native(name, args, { error: 'uuid and enabled (boolean) required' });
         }
 
         try {
@@ -1553,7 +1581,7 @@ export class Helmet {
           const metaKey = `@meta#${uuid}`;
           const meta = data[metaKey];
           if (!meta) {
-            return JSON.stringify({ error: `Script ${uuid} not found` });
+            return this.native(name, args, { error: `Script ${uuid} not found` });
           }
 
           // Toggle the enabled flag in-place
@@ -1568,14 +1596,14 @@ export class Helmet {
             timeout: 20000,
           });
 
-          return JSON.stringify({
+          return this.native(name, args, {
             success: !result?.error && !result?.detail,
             uuid,
             enabled,
             result,
-          }, null, 2);
+          });
         } catch (e: any) {
-          return JSON.stringify({
+          return this.native(name, args, {
             error: e.message,
             hint: 'tmToggleScript uses the silent bridge — same caveats as tmInstallScript',
           });
@@ -2064,13 +2092,15 @@ export class Helmet {
         });
       }
       case 'recovery_stats':
-        return JSON.stringify(this.recoveryStats({
+        return this.native(name, args, this.recoveryStats({
           code: args.code,
           strategy: args.strategy,
           since: args.since,
         }));
       default:
-        return `Unknown tool: ${name}`;
+        return this.nativeFailure(name, args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+          message: `Unknown tool: ${name}`,
+        }));
     }
   }
 
@@ -2134,25 +2164,38 @@ export class Helmet {
     });
   }
 
-  private detectLegacyError(raw: string, parsed: any): YautjaError | null {
-    // act() legacy shape: { success: false, error, type, recoveryHint }
-    if (parsed && parsed.success === false) {
-      return classifyLegacyError({
-        type: (parsed.type as ArsenalErrorType) || 'UNKNOWN_ERROR',
-        message: typeof parsed.error === 'string' ? parsed.error : String(parsed.detail ?? 'Action failed'),
-        recoverable: false,
-        recoveryHint: parsed.recoveryHint,
-      });
+  /**
+   * 10c: single conversion point for tool payloads. Legacy error shapes
+   * ({success:false}, {error:string}, ArsenalError objects) become typed
+   * native failures; everything else is a native success.
+   */
+  private native(name: string, args: any, payload: unknown): YautjaResponse<unknown> {
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      const p = payload as Record<string, any>;
+      if (p.success === false || typeof p.error === 'string') {
+        const arsenalShaped = p.error && typeof p.error === 'object' && typeof p.error.message === 'string' && typeof p.error.type === 'string'
+          ? p.error
+          : null;
+        const env = ((): YautjaResponse<unknown> => {
+          if (arsenalShaped || typeof p.type === 'string') {
+            return this.nativeFailure(name, args, classifyLegacyError({
+              type: (arsenalShaped?.type ?? p.type) as ArsenalErrorType,
+              message: arsenalShaped?.message ?? (typeof p.error === 'string' ? p.error : String(p.detail ?? 'Action failed')),
+              recoverable: false,
+              recoveryHint: arsenalShaped?.recoveryHint ?? p.recoveryHint,
+            }));
+          }
+          return this.nativeFailure(name, args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: typeof p.error === 'string' ? p.error : String(p.detail ?? 'Tool error'),
+          }));
+        })();
+        // Preserve the original payload for backward compatibility (macros,
+        // tm tools, etc. carry structured fields like `stage` consumers read).
+        env.result = payload;
+        return env;
+      }
     }
-    // Generic error payloads from other tools: { error: string, ... }
-    if (parsed && typeof parsed.error === 'string') {
-      return toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: parsed.error });
-    }
-    // Plain-text legacy errors: "Unknown tool: x", "Error: unknown domain ..."
-    if (raw.startsWith('Unknown tool:') || raw.startsWith('Error:')) {
-      return toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: raw.split('\n')[0]! });
-    }
-    return null;
+    return this.nativeSuccess(name, args, payload);
   }
 
   private recordFailure(operation: OperationMeta, error: YautjaError, started: number, context: ContextMeta): void {
@@ -2174,49 +2217,20 @@ export class Helmet {
     const started = Date.now();
     try {
       const raw = await this.handleToolCall(name, args);
-      // Native envelope (10b core tools): pass through; telemetry on failure.
-      if (typeof raw !== 'string') {
-        if (!raw.ok && raw.error) {
-          this.telemetry.record({
-            trace_id: raw.operation.trace_id,
-            operation_id: raw.operation.operation_id,
-            original_error_code: raw.error.code,
-            recovery_strategy: raw.error.retry_strategy,
-            attempts: 1,
-            outcome: 'failed',
-            time_to_recover_ms: Date.now() - started,
-            context_cost_delta_tokens: raw.context.consumed_tokens_estimate,
-            deviated_from_recommendation: false,
-          });
-        }
-        return JSON.stringify(raw);
-      }
-      // P18: shim kill-switch — with YAUTJA_LEGACY_SHIM=0, non-migrated
-      // tools fail typed instead of silently using the legacy shim.
-      if (process.env.YAUTJA_LEGACY_SHIM === '0') {
-        const context = this.buildContextMeta(0);
-        const err = toYautjaError('YJ.PROTOCOL.CAPABILITY_MISSING', {
-          message: `Tool "${name}" is not migrated to a native envelope and the legacy shim is disabled (YAUTJA_LEGACY_SHIM=0)`,
+      if (!raw.ok && raw.error) {
+        this.telemetry.record({
+          trace_id: raw.operation.trace_id,
+          operation_id: raw.operation.operation_id,
+          original_error_code: raw.error.code,
+          recovery_strategy: raw.error.retry_strategy,
+          attempts: 1,
+          outcome: 'failed',
+          time_to_recover_ms: Date.now() - started,
+          context_cost_delta_tokens: raw.context.consumed_tokens_estimate,
+          deviated_from_recommendation: false,
         });
-        this.recordFailure(operation, err, started, context);
-        return JSON.stringify(failure(err, { operation, state: this.buildStateMeta(), context }));
       }
-      let parsed: any = null;
-      try {
-        const v = JSON.parse(raw);
-        if (v && typeof v === 'object') parsed = v;
-      } catch { /* legacy plain-text output */ }
-      const context = this.buildContextMeta(raw.length);
-      const legacyError = this.detectLegacyError(raw, parsed);
-      if (legacyError) {
-        this.recordFailure(operation, legacyError, started, context);
-        const env = failure(legacyError, { operation, state: this.buildStateMeta(), context });
-        // Preserve the legacy payload so older agents can still read it.
-        if (parsed) (env as { result?: unknown }).result = parsed;
-        return JSON.stringify(env);
-      }
-      const result = parsed ?? { legacy_text: raw };
-      return JSON.stringify(success(result, { operation, state: this.buildStateMeta(), context }));
+      return JSON.stringify(raw);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const context = this.buildContextMeta(message.length);

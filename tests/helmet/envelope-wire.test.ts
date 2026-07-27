@@ -561,16 +561,14 @@ describe('P10 — doctrine envelope wire (shim 10a)', () => {
     expect(missing.error.code).toBe('YJ.PROTOCOL.CAPABILITY_MISSING');
   });
 
-  it('P18: YAUTJA_LEGACY_SHIM=0 makes non-migrated tools fail typed', async () => {
+  it('10c: previously-shimmed tools now return native envelopes (shim flag has no shim left to kill)', async () => {
     process.env.YAUTJA_LEGACY_SHIM = '0';
     try {
-      // techScan is still shim-routed (10a) → typed failure with the flag on
+      // techScan was shim-routed before 10c — now it's native even with the kill-switch on
       const env = await callTool(52, 'techScan', {});
-      expect(env.ok).toBe(false);
-      expect(env.error.code).toBe('YJ.PROTOCOL.CAPABILITY_MISSING');
-      // native tools keep working with the flag on
-      const native = await callTool(53, 'observe', { question: 'q' });
-      expect(native.ok).toBe(true);
+      expect(env.ok).toBe(true);
+      expect(env.schema_version).toBe('1.0');
+      expect(env.operation.tool).toBe('techScan');
     } finally {
       delete process.env.YAUTJA_LEGACY_SHIM;
     }
@@ -584,5 +582,13 @@ describe('P10 — doctrine envelope wire (shim 10a)', () => {
     expect(stopSpy).toHaveBeenCalled();
     expect(exitSpy).toHaveBeenCalledWith(0);
     exitSpy.mockRestore();
+  });
+
+  it('learningStatus includes biofilm state (opt-in, no auto-init)', async () => {
+    const env = await callTool(54, 'learningStatus', {});
+    expect(env.ok).toBe(true);
+    expect(env.result.biofilm).toBeDefined();
+    expect(Array.isArray(env.result.biofilm.cells)).toBe(true);
+    expect(env.result.biofilm.cells).toHaveLength(0); // no cells until explicit initialize
   });
 });

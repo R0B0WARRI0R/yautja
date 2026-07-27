@@ -123,3 +123,80 @@ describe('RecoveryMachine', () => {
     expect(fn).toHaveBeenCalledTimes(1); // not called second time
   });
 });
+
+describe('RecoveryMachine — onOutcome telemetry', () => {
+  it('records a recovered outcome when a retry succeeds after a failure', async () => {
+    const outcomes: any[] = [];
+    const tracker = new StateIntegrityTracker('ses_telem');
+    const idem = new IdempotencyRegistry({ defaultTtlMs: 60000 });
+    const machine = new RecoveryMachine({
+      tracker,
+      idempotency: idem,
+      policies: DEFAULT_RETRY_POLICIES,
+      onOutcome: (o) => outcomes.push(o),
+    });
+
+    let calls = 0;
+    const result = await machine.execute({
+      tool: 'yautja_act',
+      action_type: 'click',
+      policy_key: 'act.click',
+      trace_id: 'tr_recover',
+      fn: async () => {
+        calls++;
+        if (calls === 1) return { error: { code: 'YJ.ACT.DOM_TARGET_NOT_FOUND' } };
+        return { value: 'ok on second try' };
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]).toMatchObject({
+      trace_id: 'tr_recover',
+      original_error_code: 'YJ.ACT.DOM_TARGET_NOT_FOUND',
+      attempts: 2,
+      outcome: 'recovered',
+    });
+    expect(typeof outcomes[0].time_to_recover_ms).toBe('number');
+  });
+
+  it('records nothing when the first attempt succeeds', async () => {
+    const outcomes: any[] = [];
+    const machine = new RecoveryMachine({
+      tracker: new StateIntegrityTracker('ses_telem2'),
+      idempotency: new IdempotencyRegistry({ defaultTtlMs: 60000 }),
+      policies: DEFAULT_RETRY_POLICIES,
+      onOutcome: (o) => outcomes.push(o),
+    });
+    const result = await machine.execute({
+      tool: 'yautja_act',
+      action_type: 'click',
+      policy_key: 'act.click',
+      trace_id: 'tr_first',
+      fn: async () => ({ value: 'first try' }),
+    });
+    expect(result.ok).toBe(true);
+    expect(outcomes).toHaveLength(0);
+  });
+
+  it('works without an onOutcome sink (optional)', async () => {
+    const machine = new RecoveryMachine({
+      tracker: new StateIntegrityTracker('ses_telem3'),
+      idempotency: new IdempotencyRegistry({ defaultTtlMs: 60000 }),
+      policies: DEFAULT_RETRY_POLICIES,
+    });
+    let calls = 0;
+    const result = await machine.execute({
+      tool: 'yautja_act',
+      action_type: 'click',
+      policy_key: 'act.click',
+      trace_id: 'tr_nosink',
+      fn: async () => {
+        calls++;
+        if (calls === 1) return { error: { code: 'YJ.ACT.DOM_TARGET_NOT_FOUND' } };
+        return { value: 'ok' };
+      },
+    });
+    expect(result.ok).toBe(true);
+  });
+});

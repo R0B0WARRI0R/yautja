@@ -28,6 +28,18 @@ export interface RecoveryMachineConfig {
   idempotency: IdempotencyRegistry;
   policies: Record<string, RetryPolicy>;
   agent_context_window?: number;
+  /** Optional sink for recovery outcomes (helmet wires telemetry here). */
+  onOutcome?: (outcome: {
+    trace_id: string;
+    operation_id: string;
+    original_error_code: string;
+    recovery_strategy: string;
+    attempts: number;
+    outcome: 'recovered' | 'recovered_with_degradation' | 'failed' | 'deviated';
+    time_to_recover_ms: number;
+    context_cost_delta_tokens: number;
+    deviated_from_recommendation: boolean;
+  }) => void;
 }
 
 export class RecoveryMachine {
@@ -55,6 +67,7 @@ export class RecoveryMachine {
     // EXECUTE with retries
     const operation_id = generateOperationId();
     let lastErrorCode: string | null = null;
+    const started = Date.now();
 
     for (let attempt = 1; attempt <= policy.max_attempts; attempt++) {
       this.config.tracker.beginOperation();
@@ -81,6 +94,21 @@ export class RecoveryMachine {
 
         if (opts.idempotency_key) {
           this.config.idempotency.set(opts.idempotency_key, response);
+        }
+
+        // Telemetry: a success after a prior failed attempt IS a recovery
+        if (attempt > 1 && lastErrorCode) {
+          this.config.onOutcome?.({
+            trace_id: opts.trace_id,
+            operation_id,
+            original_error_code: lastErrorCode,
+            recovery_strategy: engine.nextEscalation(attempt - 1),
+            attempts: attempt,
+            outcome: 'recovered',
+            time_to_recover_ms: Date.now() - started,
+            context_cost_delta_tokens: 0,
+            deviated_from_recommendation: false,
+          });
         }
 
         return response;

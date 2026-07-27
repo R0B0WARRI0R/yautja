@@ -48,3 +48,10 @@
 - `serveMCP`: `rl.on('close')` → `stop()` + exit (con force-exit a 3s).
 - `proxy-standalone.cjs`: watchdog `stdin.on('end')` — padre muerto → el proxy sale (no zombie en :9877 ni proxy de sistema colgado en el registro).
 - Puerto ocupado: falla rápido con fatal claro (ya existía; verificado EADDRINUSE).
+
+### 10c + piezas experimentales + multi-sesión (2026-07-27)
+- **10c completa:** las ~30 tools que quedaban en shim migran a nativas vía codemod (100 returns convertidos) + helper `native()` con clasificación de errores y payload preservado. **Shim eliminado del código** (`detectLegacyError`, path de strings, flag `YAUTJA_LEGACY_SHIM` sin función ya).
+- **Telemetría `recovered`:** `RecoveryMachine.onOutcome` — un éxito tras retry queda registrado (antes solo `failed`).
+- **Biofilm:** estado visible en `learningStatus` (opt-in, sin auto-init).
+- **Multi-sesión:** `YAUTJA_PROXY_PORT` / `YAUTJA_CDP_REMOTE_PORT` configurables + `docs/multi-session.md` (receta y límites honestos).
+- Tests: 1074 → 1081.
