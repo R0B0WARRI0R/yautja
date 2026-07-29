@@ -42,6 +42,23 @@ describe('Legacy error classifier', () => {
     expect(yj.agent_summary).toContain('LEGACY_ERROR_UNCLASSIFIED');
   });
 
+  it('maps FEATURE_DISABLED to YJ.POLICY.FEATURE_DISABLED', () => {
+    const legacy = makeError('FEATURE_DISABLED', 'browser_batch disabled via yjBrowserBatch');
+    const yj = classifyLegacyError(legacy);
+    expect(yj.code).toBe('YJ.POLICY.FEATURE_DISABLED');
+    expect(yj.retryable).toBe(false);
+    expect(yj.message).toContain('yjBrowserBatch');
+  });
+
+  it('maps EXTENSION_LINK_DEGRADED to YJ.NET.EXTENSION_LINK_DEGRADED', () => {
+    const legacy = makeError('EXTENSION_LINK_DEGRADED', 'Enlace extensión degradado');
+    const yj = classifyLegacyError(legacy);
+    expect(yj.code).toBe('YJ.NET.EXTENSION_LINK_DEGRADED');
+    expect(yj.retryable).toBe(true);
+    expect(legacy.recoverable).toBe(true);
+    expect(legacy.recoveryHint).toContain('recuperación automática en curso');
+  });
+
   it('preserves original message in override', () => {
     const legacy = makeError('SELECTOR_NOT_FOUND', 'Custom selector .foo failed');
     const yj = classifyLegacyError(legacy);

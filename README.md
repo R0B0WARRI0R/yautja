@@ -44,3 +44,8 @@ npm run helmet       # build + start MCP server
 ## Status
 
 Personal R&D project (v0.2.0). Developed solo as an exploration of agent–browser interfaces.
+
+## Security notes
+
+- The local broker (multi-instance coordination) listens on **localhost only** and accepts any local client without authentication. It is designed for single-user machines where local processes are trusted. Do not expose the port beyond loopback.
+- Sensitive fields (passwords, OTPs, card numbers) are redacted before leaving the tool boundary; session recordings and evidence stores apply the same redaction policy.

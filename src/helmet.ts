@@ -1,6 +1,8 @@
 import { createInterface } from 'readline';
 import fs from 'fs';
 import { ExtensionServer } from './connection/extension-server.js';
+import { BrokerClient } from './connection/broker-client.js';
+import { BrokerReelection } from './connection/broker-reelection.js';
 import { ThermalSensor } from './vision/thermal.js';
 import { EMSensor } from './vision/em.js';
 import { AudioSensor } from './vision/audio.js';
@@ -55,13 +57,21 @@ import { runPreflight, mapPreflightCode } from './doctrine/preflight.js';
 import { EconomicSensor } from './vision/economic-sensor.js';
 import { TabRegistry } from './connection/tab-registry.js';
 import { SessionGates, RateLimiter } from './doctrine/gates.js';
+import { validatePlanInput, formatPlanForChat } from './doctrine/plan.js';
+import type { PendingPlan } from './doctrine/plan.js';
+import { isFeatureEnabled, BROWSER_BATCH_KILL_SWITCH_KEY, SESSION_RECORDER_KILL_SWITCH_KEY, MACRO_RECORD_KILL_SWITCH_KEY, SESSION_SCHEDULER_KILL_SWITCH_KEY } from './arsenal/kill-switch.js';
 import { browserFetch } from './intel/browser-fetch.js';
 import { EvidenceStore } from './intel/evidence-store.js';
+import { SessionRecorder, summarizeToolEvent, summarizeRecording, RECORDER_EXCLUDED_TOOLS } from './intel/session-recorder.js';
+import { MacroRecorder } from './macros/recorder.js';
+import { SessionScheduler } from './intel/session-scheduler.js';
+import { buildSessionSummary } from './intel/session-summary.js';
 import { exportHarToFile } from './intel/har-export.js';
 import { surfaceFromNetwork, buildBundleScanScript, mergeEndpoints } from './intel/api-surface.js';
 import type { ApiEndpoint } from './intel/api-surface.js';
 import { responseDiff } from './intel/response-diff.js';
 import { trustedClick } from './arsenal/trusted-input.js';
+import { isStripInterferenceEnabled, stripInterference } from './arsenal/strip-interference.js';
 import { trustedFileChooser } from './arsenal/file-chooser.js';
 import { detectCapabilities } from './doctrine/capabilities.js';
 import { SessionSnapshotStore } from './memory/session-snapshot.js';
@@ -73,7 +83,7 @@ import path from 'path';
 import type { BrowserState } from './memory/browser-state.js';
 import type { Anomaly } from './vision/base-sensor.js';
 import type { BrowserAction, ActionResult } from './arsenal/action-types.js';
-import { arsenalToDoctrine } from './arsenal/errors.js';
+import { arsenalToDoctrine, makeError } from './arsenal/errors.js';
 import type { ArsenalErrorType } from './arsenal/errors.js';
 
 export interface HelmetConfig {
@@ -182,6 +192,11 @@ export class Helmet {
     this.sessionId,
   );
   private rateLimiter = new RateLimiter();
+  /**
+   * P14.1: plan pendiente de aprobación (plan_propose/plan_approve). Vive
+   * solo en memoria del helmet (uno por sesión; proponer otro lo sustituye).
+   */
+  private pendingPlan: PendingPlan | null = null;
   private evidenceStore = new EvidenceStore(
     path.join(process.env.APPDATA || process.env.HOME || '/tmp', '.yautja', 'evidence'),
   );
@@ -196,6 +211,14 @@ export class Helmet {
   });
   private idempotency = new IdempotencyRegistry({ defaultTtlMs: 300_000 });
   private stateTracker = new StateIntegrityTracker(this.sessionId);
+  /** T12: grabación de sesión anotada (log JSON de eventos, sin imágenes). */
+  private sessionRecorder = new SessionRecorder();
+  /** T13: grabación de workflows → macros. Se instancia en el constructor (necesita macroRunner). */
+  private macroRecorder: MacroRecorder;
+  /** T14A: scheduler local de tool calls/macros (persiste schedule.json en el dir de sesión). */
+  private sessionScheduler: SessionScheduler;
+  /** T14B: contador de tool calls por nombre (para session_summary). */
+  private toolCallCounts = new Map<string, number>();
   private recoveryMachine = new RecoveryMachine({
     tracker: this.stateTracker,
     idempotency: this.idempotency,
@@ -213,6 +236,16 @@ export class Helmet {
     onOutcome: (outcome) => this.telemetry.record(outcome),
   });
   private attached = false;
+  /**
+   * P8: id del grupo de pestañas de sesión (sandbox estilo "MCP tab group"
+   * de Claude in Chrome). null hasta que se cree con sessionGroupCreate.
+   * Persiste en memoria del helmet durante la sesión MCP.
+   */
+  private sessionGroupId: number | null = null;
+  /** Multi-instancia (Tanda A): enlace al broker cuando este helmet es CLIENT. */
+  private brokerClient: BrokerClient | null = null;
+  /** Multi-instancia (Tanda C): bucle de reelección/re-registro de broker. */
+  private brokerReelection: BrokerReelection | null = null;
 
   constructor(config?: Partial<HelmetConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -247,6 +280,20 @@ export class Helmet {
     this.biofilm = new BiofilmManager(this.server);
     this.networkCapture = new NetworkCapture(this.server);
     this.macroRunner = new MacroRunner(this);
+    this.macroRecorder = new MacroRecorder(this.macroRunner);
+    this.sessionScheduler = new SessionScheduler({
+      dir: path.join(process.env.APPDATA || process.env.HOME || '/tmp', '.yautja', 'sessions', this.sessionId),
+      macroExists: (n) => this.macroRunner.get(n) !== undefined,
+      executeTool: async (tool, toolArgs) => {
+        // El kill switch también frena la ejecución programada (no solo la tool).
+        if (!(await isFeatureEnabled(this.server, SESSION_SCHEDULER_KILL_SWITCH_KEY))) {
+          return { skipped: true, reason: `disabled via the ${SESSION_SCHEDULER_KILL_SWITCH_KEY} kill switch (chrome.storage.local)` };
+        }
+        const raw = await this.callTool(tool, toolArgs);
+        try { return JSON.parse(raw); } catch { return raw; }
+      },
+      executeMacro: async (macroName, macroArgs) => this.macroRunner.run(macroName, macroArgs),
+    });
     this.extIntel = new ExtensionIntel();
     this.cdpRemote = new CdpRemoteClient(resolveCdpRemotePort());
     this.mitmProxy = new MitmProxyServer(resolveProxyPort());
@@ -284,16 +331,68 @@ export class Helmet {
 
   async start(): Promise<void> {
     await this.server.start();
-    if (!this.server.isExtensionConnected()) {
-      await new Promise<void>((resolve) => {
-        const unsub = this.server.onStatusChange((s) => {
-          if (s.connected) { unsub(); setTimeout(resolve, 300); }
-        });
+
+    // Multi-instancia (Tanda A): "winner takes <puerto base>". El helmet que
+    // bindeó el puerto base es BROKER (acepta clientes en el mismo listener);
+    // los demás se registran como CLIENT y enrutan sus comandos vía broker.
+    // Sin broker vivo, este helmet arranca en standalone y el bucle de
+    // reelección (Tanda C) lo re-registra o lo promueve a broker.
+    // El sessionId propio se expone siempre: en `registered` (como broker) y
+    // en las respuestas brokerInfo del discovery (Tanda C).
+    this.server.setBrokerSessionId(this.sessionId);
+    if (this.server.getPort() === this.config.port) {
+      process.stderr.write(`[Yautja] multi-instance role=broker (port ${this.server.getPort()}, session ${this.sessionId})\n`);
+    } else {
+      const client = new BrokerClient(this.config.port, this.sessionId);
+      this.server.setBrokerClient(client);
+      // Tanda C: ante pérdida del broker o fallo del registro inicial, el
+      // bucle re-escanea la ventana y re-registra o promueve este helmet.
+      this.brokerReelection = new BrokerReelection({
+        server: this.server,
+        sessionId: this.sessionId,
+        windowBasePort: this.config.port,
+        getGroupId: () => this.sessionGroupId,
       });
+      if (await client.start()) {
+        this.brokerClient = client;
+        client.onEvent((payload) => this.server.dispatchBrokerEvent(payload));
+        this.brokerReelection.adopt(client);
+        process.stderr.write(`[Yautja] multi-instance role=client → registered with broker :${this.config.port} (session ${this.sessionId})\n`);
+      } else {
+        this.server.setBrokerClient(null);
+        this.brokerReelection.start();
+        process.stderr.write(`[Yautja] multi-instance: no broker at :${this.config.port} — standalone (port ${this.server.getPort()})\n`);
+      }
+    }
+
+    if (!this.server.isExtensionConnected()) {
+      // Espera ACOTADA: el host MCP mata el proceso si no arrancamos en ~30s,
+      // y la extensión (o el broker, en modo client) puede no estar aún.
+      // Arrancamos degradados: las browser tools se recuperan solas en cuanto
+      // haya enlace; las tools locales funcionan desde el primer momento.
+      const EXTENSION_BOOT_WAIT_MS = 10_000;
+      await Promise.race([
+        new Promise<void>((resolve) => {
+          const unsub = this.server.onStatusChange((s) => {
+            if (s.connected) { unsub(); setTimeout(resolve, 300); }
+          });
+        }),
+        sleep(EXTENSION_BOOT_WAIT_MS),
+      ]);
+      if (!this.server.isExtensionConnected()) {
+        process.stderr.write('[Yautja] extension/broker not connected yet — starting degraded (browser tools will recover)\n');
+      }
     }
 
     if (this.config.autoAttach) {
-      await this.attachToActiveTab();
+      // Un fallo aquí (p.ej. "broker: extension not connected" durante una
+      // reconexión MV3) no puede ser fatal: el attach se reintenta solo en la
+      // primera operación de navegador vía ensureAttached().
+      try {
+        await this.attachToActiveTab();
+      } catch (err) {
+        process.stderr.write(`[Yautja] autoAttach deferred (${(err as Error)?.message ?? err}) — will retry on first browser command\n`);
+      }
     }
 
     this.thermal.subscribe();
@@ -313,12 +412,16 @@ export class Helmet {
       process.stderr.write(`[Yautja] macro loading failed (continuing): ${err}\n`);
     }
 
+    // T14A: arrancar el scheduler (jobs persistidos ya reconciliados en el ctor)
+    this.sessionScheduler.start();
+
     for (const domain of ['Network', 'Page', 'Runtime', 'Performance', 'Security']) {
       try { await this.server.enableDomains([domain]); } catch {}
     }
   }
 
   async stop(): Promise<void> {
+    this.sessionScheduler.stop();
     this.thermal.unsubscribe();
     this.em.unsubscribe();
     this.audio.unsubscribe();
@@ -328,6 +431,14 @@ export class Helmet {
     if (this.mitmProxy.isRunning()) {
       await this.server.proxyStop().catch(() => {});
       await this.mitmProxy.stop();
+    }
+    if (this.brokerReelection) {
+      await this.brokerReelection.stop();
+      this.brokerReelection = null;
+    }
+    if (this.brokerClient) {
+      await this.brokerClient.stop();
+      this.brokerClient = null;
     }
     await this.server.stop();
   }
@@ -431,6 +542,69 @@ export class Helmet {
     return { result, before: beforeState, after: afterState, changes: diff?.fields ?? [] };
   }
 
+  /**
+   * Núcleo del tool `act` (guardas P13/P14 + actCore + envelope), extraído
+   * para que `browser_batch` ejecute sub-acciones por la misma vía sin
+   * duplicar lógica. `name` es el tool que aparece en el envelope.
+   */
+  private async runActTool(name: string, args: any, action: BrowserAction): Promise<YautjaResponse<unknown>> {
+    // P13: profile urlDenyRegex applies to the navigation destination
+    if (action?.type === 'navigate' && typeof action.url === 'string') {
+      const destProfile = this.profileStore.match(action.url);
+      if (!isUrlAllowed(destProfile, action.url)) {
+        return this.nativeFailure(name, args, toYautjaError('YJ.POLICY.GATE_DENIED', {
+          message: `Site profile "${destProfile.id}" denies navigation to ${action.url} (urlDenyRegex)`,
+        }));
+      }
+    }
+    // P14 r2: evaluate(fetch) must not bypass browserFetch gates
+    if ((action?.type === 'evaluate' || action?.type === 'evaluateAsync') &&
+        typeof (action as any).expression === 'string' &&
+        /\bfetch\s*\(|XMLHttpRequest/.test((action as any).expression)) {
+      const pageProfile = this.profileStore.match(await this.currentPageUrl());
+      const policy = pageProfile.rules.allowEvaluateFetch;
+      if (policy === 'none') {
+        this.gates.audit({ type: 'evaluateFetch', denied: true, profile: pageProfile.id, expression: (action as any).expression.slice(0, 200) });
+        return this.nativeFailure(name, args, toYautjaError('YJ.POLICY.GATE_DENIED', {
+          message: `Site profile "${pageProfile.id}" forbids evaluate(fetch) (allowEvaluateFetch: none). Use browserFetch with a session grant instead.`,
+        }));
+      }
+      this.gates.audit({ type: 'evaluateFetch', denied: false, policy, profile: pageProfile.id, expression: (action as any).expression.slice(0, 200) });
+    }
+    // P10 (strip): un iframe de otra extensión puede tapar el viewport y
+    // salir en la captura — se elimina antes de screenshots. No fatal.
+    if (action?.type === 'screenshot' || action?.type === 'screenshotZoom') {
+      await this.maybeStripInterference();
+    }
+    const { result, before, after, changes } = await this.actCore(action);
+    const stateMeta: Partial<StateMeta> = {
+      url_before: before.url || undefined,
+      url_after: after.url || undefined,
+      state_integrity: 'known',
+    };
+    if (!result.ok) {
+      return this.nativeFailure(name, args, arsenalToDoctrine(result.error), stateMeta);
+    }
+    return this.nativeSuccess(name, args, { success: true, value: result.value, changes }, stateMeta);
+  }
+
+  /**
+   * P10: strip de iframes de extensiones ajenas (kill switch
+   * `yjStripInterference` en chrome.storage.local, default true). Nunca
+   * lanza: un fallo del strip no debe tumbar la acción principal.
+   */
+  private async maybeStripInterference(): Promise<void> {
+    try {
+      if (!(await isStripInterferenceEnabled(this.server))) return;
+      const r = await stripInterference(this.server, this.server.getExtensionId() ?? '');
+      if (r.removed > 0) {
+        process.stderr.write(`[Yautja] strip-interference: removed ${r.removed} iframe(s): ${r.hosts.join(', ')}\n`);
+      }
+    } catch {
+      // no fatal por diseño
+    }
+  }
+
   async inspect(domain: string): Promise<string> {
     await this.ensureAttached().catch(() => {});
     const { state } = await this.gatherState();
@@ -448,6 +622,15 @@ export class Helmet {
     const diff = this.memory.diff();
     if (!diff) return 'No previous state to compare. Perform an action first.';
     return JSON.stringify(diff, null, 2);
+  }
+
+  /**
+   * Dispatch genérico para macros (T13): re-ejecuta una tool MCP por la
+   * misma vía interna (handleToolCall) y devuelve el envelope serializado,
+   * en línea con el resto de métodos expuestos en MacroContext.
+   */
+  async callTool(name: string, args?: Record<string, unknown>): Promise<string> {
+    return JSON.stringify(await this.handleToolCall(name, args ?? {}));
   }
 
   serveMCP(): void {
@@ -566,40 +749,58 @@ export class Helmet {
         });
       }
       case 'act': {
-        const action = args.action as BrowserAction;
-        // P13: profile urlDenyRegex applies to the navigation destination
-        if (action?.type === 'navigate' && typeof action.url === 'string') {
-          const destProfile = this.profileStore.match(action.url);
-          if (!isUrlAllowed(destProfile, action.url)) {
-            return this.nativeFailure('act', args, toYautjaError('YJ.POLICY.GATE_DENIED', {
-              message: `Site profile "${destProfile.id}" denies navigation to ${action.url} (urlDenyRegex)`,
-            }));
+        return this.runActTool(name, args, args.action as BrowserAction);
+      }
+      case 'browser_batch': {
+        // P9: N acciones act en una llamada, secuenciales, reutilizando la
+        // vía interna de act (guardas incluidas). No anidable.
+        // Kill switch `yjBrowserBatch` (chrome.storage.local, default true).
+        if (!(await isFeatureEnabled(this.server, BROWSER_BATCH_KILL_SWITCH_KEY))) {
+          return this.nativeFailure('browser_batch', args, arsenalToDoctrine(makeError(
+            'FEATURE_DISABLED',
+            `browser_batch is disabled via the ${BROWSER_BATCH_KILL_SWITCH_KEY} kill switch (chrome.storage.local)`,
+          )));
+        }
+        const actions = args.actions as BrowserAction[] | undefined;
+        if (!Array.isArray(actions) || actions.length === 0) {
+          return this.nativeFailure('browser_batch', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: 'actions must be a non-empty array of BrowserAction',
+          }));
+        }
+        if (actions.some((a) => !a || typeof a !== 'object' || typeof (a as any).type !== 'string')) {
+          return this.nativeFailure('browser_batch', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: 'Every action must be an object with a string "type" field',
+          }));
+        }
+        if (actions.some((a) => (a as any).type === 'batch' || (a as any).type === 'browser_batch')) {
+          return this.nativeFailure('browser_batch', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: 'browser_batch is not nestable: a sub-action cannot be of type batch',
+          }));
+        }
+        const stopOnError = args.stopOnError !== false;
+        const results: Array<{ index: number; ok: boolean; value?: any; changes?: string[]; error?: YautjaError }> = [];
+        let stoppedAt: number | undefined;
+        for (let i = 0; i < actions.length; i++) {
+          const env = await this.runActTool('browser_batch', args, actions[i]);
+          if (env.ok) {
+            const r = env.result as any;
+            results.push({ index: i, ok: true, value: r?.value, changes: r?.changes });
+          } else {
+            results.push({ index: i, ok: false, error: env.error });
+            if (stopOnError) {
+              stoppedAt = i;
+              break;
+            }
           }
         }
-        // P14 r2: evaluate(fetch) must not bypass browserFetch gates
-        if ((action?.type === 'evaluate' || action?.type === 'evaluateAsync') &&
-            typeof (action as any).expression === 'string' &&
-            /\bfetch\s*\(|XMLHttpRequest/.test((action as any).expression)) {
-          const pageProfile = this.profileStore.match(await this.currentPageUrl());
-          const policy = pageProfile.rules.allowEvaluateFetch;
-          if (policy === 'none') {
-            this.gates.audit({ type: 'evaluateFetch', denied: true, profile: pageProfile.id, expression: (action as any).expression.slice(0, 200) });
-            return this.nativeFailure('act', args, toYautjaError('YJ.POLICY.GATE_DENIED', {
-              message: `Site profile "${pageProfile.id}" forbids evaluate(fetch) (allowEvaluateFetch: none). Use browserFetch with a session grant instead.`,
-            }));
-          }
-          this.gates.audit({ type: 'evaluateFetch', denied: false, policy, profile: pageProfile.id, expression: (action as any).expression.slice(0, 200) });
-        }
-        const { result, before, after, changes } = await this.actCore(action);
-        const stateMeta: Partial<StateMeta> = {
-          url_before: before.url || undefined,
-          url_after: after.url || undefined,
-          state_integrity: 'known',
-        };
-        if (!result.ok) {
-          return this.nativeFailure('act', args, arsenalToDoctrine(result.error), stateMeta);
-        }
-        return this.nativeSuccess('act', args, { success: true, value: result.value, changes }, stateMeta);
+        return this.nativeSuccess('browser_batch', args, {
+          results,
+          total: actions.length,
+          executed: results.length,
+          succeeded: results.filter((r) => r.ok).length,
+          failed: results.filter((r) => !r.ok).length,
+          stoppedAt,
+        });
       }
       case 'inspect': {
         const domain = args.domain as string;
@@ -620,6 +821,59 @@ export class Helmet {
         return this.nativeSuccess('inspect', args, summaries[domain], {
           url_after: state.url || undefined,
           state_integrity: 'known',
+        });
+      }
+      case 'read_console_messages': {
+        // Sensor buffers track the attached tab only; tabId just guards
+        // against reading a stale buffer thinking it's another tab.
+        const currentTab = this.server.getCurrentTabId();
+        if (args.tabId !== undefined && currentTab != null && args.tabId !== currentTab) {
+          return this.nativeFailure('read_console_messages', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: `Console buffer tracks the attached tab (${currentTab}). Use switchTab(${args.tabId}) first.`,
+          }));
+        }
+        const messages = this.audio.readEntries({
+          errorsOnly: args.errorsOnly === true,
+          max: args.max ?? 100,
+        });
+        if (args.clear === true) this.audio.clear();
+        return this.nativeSuccess('read_console_messages', args, {
+          count: messages.length,
+          cleared: args.clear === true,
+          messages: messages.map((m) => ({
+            level: m.level,
+            text: m.text,
+            timestamp: m.timestamp,
+            count: m.count,
+            url: m.url,
+            lineNumber: m.lineNumber,
+          })),
+        });
+      }
+      case 'read_network_requests': {
+        const currentTab = this.server.getCurrentTabId();
+        if (args.tabId !== undefined && currentTab != null && args.tabId !== currentTab) {
+          return this.nativeFailure('read_network_requests', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: `Network buffer tracks the attached tab (${currentTab}). Use switchTab(${args.tabId}) first.`,
+          }));
+        }
+        const txns = this.thermal.readTransactions({
+          urlContains: args.filter,
+          max: args.max ?? 100,
+        });
+        if (args.clear === true) this.thermal.clear();
+        return this.nativeSuccess('read_network_requests', args, {
+          count: txns.length,
+          cleared: args.clear === true,
+          requests: txns.map((t) => ({
+            id: t.id,
+            method: t.request.method,
+            url: t.request.url,
+            status: t.response?.status ?? null,
+            type: t.request.resourceType,
+            state: t.state,
+            timestamp: Math.round(t.startedAt * 1000),
+          })),
         });
       }
       case 'diff': {
@@ -644,9 +898,41 @@ export class Helmet {
           return this.nativeFailure('reattach', args, toYautjaError('YJ.NET.SESSION_STATE_UNKNOWN', { message }));
         }
       }
+      case 'sessionGroupCreate': {
+        // P8: idempotente — si el grupo existe y sigue vivo, se devuelve tal cual.
+        if (this.sessionGroupId != null) {
+          try {
+            const tabs = await this.server.listTabs();
+            const alive = tabs.find((t) => t.groupId === this.sessionGroupId);
+            if (alive) {
+              return this.nativeSuccess('sessionGroupCreate', args, {
+                groupId: this.sessionGroupId,
+                tabId: alive.tabId,
+                existed: true,
+              });
+            }
+          } catch {}
+          this.sessionGroupId = null; // stale — recrear
+        }
+        const created = await this.server.sessionGroupCreate('Yautja', 'purple');
+        this.sessionGroupId = created.groupId;
+        return this.nativeSuccess('sessionGroupCreate', args, {
+          groupId: created.groupId,
+          tabId: created.tabId,
+          existed: false,
+        });
+      }
       case 'listTabs': {
         const tabs = await this.server.listTabs();
-        return this.nativeSuccess('listTabs', args, { tabs, currentTabId: this.server.getCurrentTabId() });
+        const enriched = tabs.map((t) => ({
+          ...t,
+          inSessionGroup: this.sessionGroupId != null && t.groupId === this.sessionGroupId,
+        }));
+        return this.nativeSuccess('listTabs', args, {
+          tabs: enriched,
+          currentTabId: this.server.getCurrentTabId(),
+          sessionGroupId: this.sessionGroupId,
+        });
       }
       case 'switchTab': {
         const tabId = args.tabId;
@@ -680,9 +966,14 @@ export class Helmet {
       }
       case 'openTab': {
         const targetUrl = args.url || 'about:blank';
+        // P8: con grupo de sesión activo, las tabs nuevas nacen dentro del
+        // grupo salvo inGroup: false explícito.
+        const inGroup = this.sessionGroupId != null && args.inGroup !== false;
         // P13.5: canonical open — verified URL post-attach, previous active
         // tab captured BEFORE opening (fixes wrong-URL reports).
-        const opened = await this.tabRegistry.openVerified(targetUrl);
+        const opened = await this.tabRegistry.openVerified(targetUrl, {
+          groupId: inGroup ? this.sessionGroupId! : undefined,
+        });
         for (const domain of ['Network', 'Page', 'Runtime', 'Performance', 'Security']) {
           try { await this.server.enableDomains([domain]); } catch {}
         }
@@ -693,11 +984,23 @@ export class Helmet {
           url: opened.url,
           attached: opened.attached,
           previousActiveTabId: opened.previousActiveTabId,
+          groupId: inGroup ? this.sessionGroupId : undefined,
         }, { state_integrity: opened.attached ? 'known' : 'unknown' });
       }
       case 'closeTab': {
         const tabId = args.tabId;
         if (!tabId) return this.native(name, args, { error: 'tabId required' });
+        // P8: sandbox — con grupo de sesión activo, solo se cierran tabs del
+        // grupo (salvo force: true). Las del usuario se miran con switchTab.
+        if (this.sessionGroupId != null && args.force !== true) {
+          const tabs = await this.server.listTabs();
+          const target = tabs.find((t) => t.tabId === tabId);
+          if (target && target.groupId !== this.sessionGroupId) {
+            return this.nativeFailure('closeTab', args, arsenalToDoctrine(
+              makeError('TAB_OUTSIDE_GROUP', `Tab ${tabId} is outside the session group (${this.sessionGroupId})`),
+            ));
+          }
+        }
         if (this.server.getCurrentTabId() === tabId) {
           const tabs = await this.server.listTabs();
           const yt = tabs.find((t) => t.url.includes('youtube.com'));
@@ -1258,6 +1561,179 @@ export class Helmet {
         const result = await this.macroRunner.deleteUserMacro(args.name);
         return this.native(name, args, result);
       }
+      case 'session_record': {
+        // T12: kill switch `yjSessionRecorder` (chrome.storage.local, default true).
+        if (!(await isFeatureEnabled(this.server, SESSION_RECORDER_KILL_SWITCH_KEY))) {
+          return this.nativeFailure('session_record', args, arsenalToDoctrine(makeError(
+            'FEATURE_DISABLED',
+            `session_record is disabled via the ${SESSION_RECORDER_KILL_SWITCH_KEY} kill switch (chrome.storage.local)`,
+          )));
+        }
+        switch (args.action) {
+          case 'start':
+            this.sessionRecorder.start();
+            return this.native(name, args, { success: true, ...this.sessionRecorder.status() });
+          case 'stop': {
+            const rec = this.sessionRecorder.stop();
+            if (!rec) {
+              return this.nativeFailure(name, args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+                message: 'no active session recording',
+              }));
+            }
+            return this.native(name, args, {
+              success: true,
+              ...this.sessionRecorder.status(),
+              summary: summarizeRecording(rec),
+            });
+          }
+          case 'status':
+            return this.native(name, args, this.sessionRecorder.status());
+          case 'clear':
+            this.sessionRecorder.clear();
+            return this.native(name, args, { success: true, ...this.sessionRecorder.status() });
+          case 'export': {
+            const out = this.sessionRecorder.exportToEvidence(this.evidenceStore, { runId: this.sessionId });
+            if (!out) {
+              return this.nativeFailure(name, args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+                message: 'no recorded events to export (start a recording and perform some actions first)',
+              }));
+            }
+            return this.native(name, args, {
+              success: true,
+              evidenceId: out.record.id,
+              resPath: out.record.resPath,
+              summary: out.summary,
+            });
+          }
+          default:
+            return this.nativeFailure(name, args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+              message: `unknown session_record action: ${args.action} (use start|stop|status|export|clear)`,
+            }));
+        }
+      }
+      case 'macro_record': {
+        // T13: kill switch `yjMacroRecord` (chrome.storage.local, default true).
+        if (!(await isFeatureEnabled(this.server, MACRO_RECORD_KILL_SWITCH_KEY))) {
+          return this.nativeFailure('macro_record', args, arsenalToDoctrine(makeError(
+            'FEATURE_DISABLED',
+            `macro_record is disabled via the ${MACRO_RECORD_KILL_SWITCH_KEY} kill switch (chrome.storage.local)`,
+          )));
+        }
+        switch (args.action) {
+          case 'start':
+            if (this.macroRecorder.active) {
+              return this.nativeFailure(name, args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+                message: 'macro_record is already recording (stop or cancel first)',
+              }));
+            }
+            this.macroRecorder.start();
+            return this.native(name, args, { success: true, recording: true, steps: 0 });
+          case 'cancel':
+            this.macroRecorder.cancel();
+            return this.native(name, args, { success: true, recording: false });
+          case 'stop': {
+            if (typeof args.name !== 'string' || !args.name) {
+              return this.nativeFailure(name, args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+                message: 'macro_record stop requires a name (filename-safe [a-z0-9_-]+)',
+              }));
+            }
+            const result = await this.macroRecorder.stop({
+              name: args.name,
+              description: args.description,
+              overwrite: args.overwrite === true,
+            });
+            return this.native(name, args, result);
+          }
+          default:
+            return this.nativeFailure(name, args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+              message: `unknown macro_record action: ${args.action} (use start|stop|cancel)`,
+            }));
+        }
+      }
+      case 'session_schedule': {
+        // T14A: kill switch `yjSessionScheduler` (chrome.storage.local, default true).
+        if (!(await isFeatureEnabled(this.server, SESSION_SCHEDULER_KILL_SWITCH_KEY))) {
+          return this.nativeFailure('session_schedule', args, arsenalToDoctrine(makeError(
+            'FEATURE_DISABLED',
+            `session_schedule is disabled via the ${SESSION_SCHEDULER_KILL_SWITCH_KEY} kill switch (chrome.storage.local)`,
+          )));
+        }
+        try {
+          switch (args.action) {
+            case 'add': {
+              const job = this.sessionScheduler.addJob({
+                name: typeof args.name === 'string' ? args.name : undefined,
+                schedule: args.schedule,
+                payload: args.payload,
+              });
+              return this.native(name, args, { success: true, job });
+            }
+            case 'list':
+              return this.native(name, args, { jobs: this.sessionScheduler.list() });
+            case 'remove': {
+              if (!this.sessionScheduler.remove(String(args.id ?? ''))) {
+                throw new Error(`unknown job id: ${args.id}`);
+              }
+              return this.native(name, args, { success: true, id: args.id });
+            }
+            case 'enable':
+            case 'disable': {
+              const job = this.sessionScheduler.setEnabled(String(args.id ?? ''), args.action === 'enable');
+              return this.native(name, args, { success: true, job });
+            }
+            case 'run-now': {
+              const result = await this.sessionScheduler.runNow(String(args.id ?? ''));
+              return this.native(name, args, { success: true, result });
+            }
+            default:
+              return this.nativeFailure(name, args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+                message: `unknown session_schedule action: ${args.action} (use add|list|remove|enable|disable|run-now)`,
+              }));
+          }
+        } catch (err) {
+          return this.nativeFailure(name, args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: err instanceof Error ? err.message : String(err),
+          }));
+        }
+      }
+      case 'session_summary': {
+        // T14B: resumen compacto de la sesión para el LLM cliente.
+        const maxChars = typeof args.maxChars === 'number' && Number.isFinite(args.maxChars) && args.maxChars > 0
+          ? Math.floor(args.maxChars)
+          : undefined;
+        // Tabs del grupo de sesión (best-effort: el browser puede no estar).
+        let groupTabs: Array<{ tabId: number; url: string; title: string; active: boolean }> | null = null;
+        if (this.sessionGroupId != null) {
+          try {
+            const all = await this.server.listTabs();
+            groupTabs = all
+              .filter((t: any) => t.groupId === this.sessionGroupId)
+              .map((t: any) => ({ tabId: t.tabId, url: t.url, title: t.title, active: t.active }));
+          } catch {}
+        }
+        const errorsByCode: Record<string, number> = {};
+        for (const o of this.telemetry.query({})) {
+          errorsByCode[o.original_error_code] = (errorsByCode[o.original_error_code] ?? 0) + 1;
+        }
+        const summary = buildSessionSummary({
+          sessionId: this.sessionId,
+          gates: this.gates.status(),
+          pendingPlan: this.pendingPlan,
+          sessionGroupId: this.sessionGroupId,
+          tabs: groupTabs,
+          recorder: { ...this.sessionRecorder.status(), lastEvents: this.sessionRecorder.tail(10) },
+          macros: this.macroRunner.list(),
+          jobs: this.sessionScheduler.list(),
+          activity: {
+            toolCalls: Object.fromEntries(this.toolCallCounts),
+            errorsByCode,
+          },
+          // Estado del enlace extensión↔helmet (watchdog); opcional porque los
+          // mocks de tests pueden no implementarlo.
+          link: (this.server as any).getLinkState?.(),
+        }, maxChars);
+        return this.native(name, args, summary);
+      }
       // ─── Extension inspection tools (hybrid: disk + management + CDP) ──
       case 'extList': {
         // Try chrome.management first (richer data), fall back to debugger.getTargets
@@ -1696,7 +2172,52 @@ export class Helmet {
         });
       }
       case 'gateStatus': {
-        return this.nativeSuccess('gateStatus', args, this.gates.status());
+        return this.nativeSuccess('gateStatus', args, { ...this.gates.status(), pendingPlan: this.pendingPlan });
+      }
+      case 'plan_propose': {
+        // P14.1: Claude-style plan UX sobre los gates duros. Solo guarda el
+        // plan pendiente y devuelve la presentación para chat — NO concede.
+        const v = validatePlanInput(args);
+        if (!v.ok) {
+          return this.nativeFailure('plan_propose', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: v.message,
+          }));
+        }
+        this.pendingPlan = v.plan;
+        return this.nativeSuccess('plan_propose', args, {
+          proposed: true,
+          plan: v.plan,
+          presentation: formatPlanForChat(v.plan),
+        });
+      }
+      case 'plan_approve': {
+        // Mismo contrato que gateGrant: SOLO cuando el usuario lo ha
+        // aprobado explícitamente en chat; la phrase registra sus palabras.
+        if (!args.phrase || typeof args.phrase !== 'string') {
+          return this.nativeFailure('plan_approve', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: 'phrase is required — the exact words with which the user approved this plan',
+          }));
+        }
+        if (!this.pendingPlan) {
+          return this.nativeFailure('plan_approve', args, toYautjaError('YJ.POLICY.PLAN_NOT_FOUND', {
+            message: 'No pending plan to approve. Propose one first with plan_propose.',
+          }));
+        }
+        const plan = this.pendingPlan;
+        try {
+          // Session-scoped: los grants viven bajo el sessionId (gates.json
+          // por sesión), así que mueren con la sesión sin expiresAt.
+          const grant = this.gates.grant({
+            level: plan.requestedLevel,
+            scope: { hosts: plan.domains },
+            phrase: args.phrase,
+          });
+          this.gates.audit({ type: 'planApprove', level: plan.requestedLevel, domains: plan.domains, items: plan.items });
+          this.pendingPlan = null; // consumido
+          return this.nativeSuccess('plan_approve', args, { granted: true, grant, approvedPlan: plan });
+        } catch (e: any) {
+          return this.nativeFailure('plan_approve', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: e.message }));
+        }
       }
       case 'gateGrant': {
         // r2: grants must come from the USER's words in chat. The phrase is
@@ -1938,6 +2459,9 @@ export class Helmet {
             message: 'selector or query is required',
           }));
         }
+        // P10 (strip): un iframe de otra extensión puede interceptar el
+        // punto de click — se elimina antes del gesto trusted. No fatal.
+        await this.maybeStripInterference();
         const result = await trustedClick(this.server, {
           selector,
           button: args.button,
@@ -2217,6 +2741,7 @@ export class Helmet {
     const started = Date.now();
     try {
       const raw = await this.handleToolCall(name, args);
+      this.recordToolCall(name, args, raw.ok, raw);
       if (!raw.ok && raw.error) {
         this.telemetry.record({
           trace_id: raw.operation.trace_id,
@@ -2232,11 +2757,44 @@ export class Helmet {
       }
       return JSON.stringify(raw);
     } catch (err) {
+      this.recordToolCall(name, args, false, null);
       const message = err instanceof Error ? err.message : String(err);
       const context = this.buildContextMeta(message.length);
       const yerr = classifyLegacyError({ type: 'UNKNOWN_ERROR', message, recoverable: false });
       this.recordFailure(operation, yerr, started, context);
       return JSON.stringify(failure(yerr, { operation, state: this.buildStateMeta(), context }));
+    }
+  }
+
+  /**
+   * T12/T13: hook de grabación sobre el chokepoint de tools — alimenta el
+   * session recorder (log de eventos anotado) y el macro recorder (pasos
+   * replayables). Nunca lanza: un fallo de grabación no debe tumbar la tool.
+   */
+  private recordToolCall(name: string, args: any, ok: boolean, raw: YautjaResponse<unknown> | null): void {
+    try {
+      this.toolCallCounts.set(name, (this.toolCallCounts.get(name) ?? 0) + 1);
+      if (this.sessionRecorder.active && !RECORDER_EXCLUDED_TOOLS.has(name)) {
+        const ev = summarizeToolEvent(name, args, ok);
+        // Screenshots: enlaza la evidencia (id) en vez del base64 en el log.
+        if (ok && ev.event.startsWith('screenshot')) {
+          const value = (raw?.result as any)?.value;
+          if (typeof value === 'string' && value.length > 0) {
+            let host = 'page';
+            try { host = new URL(this.memory.snapshot()?.url ?? '').hostname || 'page'; } catch {}
+            ev.evidenceId = this.evidenceStore.put({
+              host,
+              kind: 'screenshot',
+              runId: this.sessionId,
+              body: value,
+            }).id;
+          }
+        }
+        this.sessionRecorder.capture(ev.event, ev);
+      }
+      this.macroRecorder.recordStep(name, args, ok);
+    } catch {
+      // no fatal por diseño
     }
   }
 
@@ -2297,12 +2855,50 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: 'browser_batch',
+    description: 'Execute N act actions in one call, sequentially and with the same guards as act (not nestable). Returns per-action {index, ok, value|error}; with stopOnError (default true) it stops at the first failure and reports stoppedAt. Kill switch: yjBrowserBatch in chrome.storage.local (default true; if false → YJ.POLICY.FEATURE_DISABLED).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        actions: { type: 'array', description: 'BrowserAction[] to execute in order', items: { type: 'object' } },
+        stopOnError: { type: 'boolean', description: 'Stop at the first failing action (default true)' },
+      },
+      required: ['actions'],
+    },
+  },
+  {
     name: 'inspect',
     description: 'Deep-dive into a sensor domain (network, dom, console, performance, security).',
     inputSchema: {
       type: 'object' as const,
       properties: { domain: { type: 'string', enum: ['network', 'dom', 'console', 'performance', 'security'] } },
       required: ['domain'],
+    },
+  },
+  {
+    name: 'read_console_messages',
+    description: 'Read buffered console messages (ring buffer, last 500). Level/text/timestamp per message. clear:true empties the buffer after reading (incremental reads without duplicates).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        errorsOnly: { type: 'boolean', description: 'Only error-level messages (default false)' },
+        max: { type: 'number', description: 'Max messages to return, most recent first (default 100)' },
+        clear: { type: 'boolean', description: 'Empty the buffer after reading (default false)' },
+        tabId: { type: 'number', description: 'Guard: must match the attached tab (buffers are per attached tab)' },
+      },
+    },
+  },
+  {
+    name: 'read_network_requests',
+    description: 'Read buffered network requests (ring buffer, last 500): method/url/status/type/timestamp (no headers or bodies). filter matches URL substring. clear:true empties the buffer after reading.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        filter: { type: 'string', description: 'Only requests whose URL contains this substring' },
+        max: { type: 'number', description: 'Max requests to return, most recent first (default 100)' },
+        clear: { type: 'boolean', description: 'Empty the buffer after reading (default false)' },
+        tabId: { type: 'number', description: 'Guard: must match the attached tab (buffers are per attached tab)' },
+      },
     },
   },
   {
@@ -2331,21 +2927,32 @@ const MCP_TOOLS = [
   },
   {
     name: 'openTab',
-    description: 'Open a new tab with a URL and attach to it. Does NOT overwrite current tab.',
+    description: 'Open a new tab with a URL and attach to it. Does NOT overwrite current tab. With an active session group (sessionGroupCreate), the tab is created inside the group unless inGroup:false.',
     inputSchema: {
       type: 'object' as const,
-      properties: { url: { type: 'string', description: 'URL to open' } },
+      properties: {
+        url: { type: 'string', description: 'URL to open' },
+        inGroup: { type: 'boolean', description: 'Create inside the session group when one is active (default true)' },
+      },
       required: ['url'],
     },
   },
   {
     name: 'closeTab',
-    description: 'Close a tab by its tabId.',
+    description: 'Close a tab by its tabId. With an active session group, only tabs inside the group can be closed unless force:true.',
     inputSchema: {
       type: 'object' as const,
-      properties: { tabId: { type: 'number', description: 'Tab ID to close' } },
+      properties: {
+        tabId: { type: 'number', description: 'Tab ID to close' },
+        force: { type: 'boolean', description: 'Allow closing tabs outside the session group (default false)' },
+      },
       required: ['tabId'],
     },
+  },
+  {
+    name: 'sessionGroupCreate',
+    description: 'Create (or return) the Yautja session tab group — a sandbox tab group ("Yautja", purple) that owns every tab Yautja opens. Idempotent: returns the existing group if alive.',
+    inputSchema: { type: 'object' as const, properties: {} },
   },
   {
     name: 'interceptEnable',
@@ -2821,6 +3428,56 @@ const MCP_TOOLS = [
       required: ['name'],
     },
   },
+  {
+    name: 'session_record',
+    description: 'Annotated session recording (JSON event log of browser actions: click/type/navigate/screenshot..., redacted values, no images). export dumps the log to the evidence store (kind session-recording) and returns an evidenceId. Kill switch: yjSessionRecorder.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: { type: 'string', enum: ['start', 'stop', 'status', 'export', 'clear'], description: 'Recorder operation' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'macro_record',
+    description: 'Record MCP tool calls as replayable steps and compile them into a user macro on stop (registered like macro_register). gate/plan tools are never recorded — grants are not replay-automatable. Kill switch: yjMacroRecord.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: { type: 'string', enum: ['start', 'stop', 'cancel'], description: 'Recorder operation' },
+        name: { type: 'string', description: 'Macro name on stop, filename-safe [a-z0-9_-]+' },
+        description: { type: 'string', description: 'Macro description on stop' },
+        overwrite: { type: 'boolean', description: 'Overwrite existing macro with same name (default false)' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'session_schedule',
+    description: 'Local scheduler for tool calls/macros (persisted to schedule.json in the session dir, survives restarts). Schedules: {kind:"once",at} (auto-deleted after firing; jobs missed while the helmet was off are marked missed and NOT run), {kind:"interval",everyMs} (>= 60000), {kind:"cron",expr} (5-field UTC: min hour dom mon dow). Jobs CANNOT run gateGrant/gateRevoke/plan_approve — grants require the user\'s phrase in chat. run-now executes immediately and returns the result. Kill switch: yjSessionScheduler (also skips scheduled executions).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: { type: 'string', enum: ['add', 'list', 'remove', 'enable', 'disable', 'run-now'], description: 'Scheduler operation' },
+        id: { type: 'string', description: 'Job id (for remove/enable/disable/run-now)' },
+        name: { type: 'string', description: 'Optional human label for the job (add)' },
+        schedule: { type: 'object', description: '{kind:"once",at} | {kind:"interval",everyMs} | {kind:"cron",expr}' },
+        payload: { type: 'object', description: '{type:"tool",tool,args?} | {type:"macro",name,args?}' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'session_summary',
+    description: 'Compact structured summary of the current session for the MCP client LLM: gates (default level + active grants with scope), pending plan, session-group tabs, recorder status, registered macros, scheduler jobs, activity counters (tool calls by name, errors by code) and last recorded actions. Sections are dropped lowest-priority-first when over maxChars (truncated: true + omittedSections).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        maxChars: { type: 'number', description: 'Max size of the summary JSON in chars (default 4000)' },
+      },
+    },
+  },
   // ─── Extension inspection tools ───────────────────────────────────
   {
     name: 'extList',
@@ -2998,8 +3655,32 @@ const MCP_TOOLS = [
   },
   {
     name: 'gateStatus',
-    description: 'Show session gate state (P14): default gate (P0) and active grants with level, scope, usage and expiry.',
+    description: 'Show session gate state (P14): default gate (P0), active grants with level, scope, usage and expiry, and the pending plan (P14.1) if one was proposed with plan_propose.',
     inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'plan_propose',
+    description: 'Propose a session plan (P14.1): 3-7 high-level items + domains + requested gate level. Stores the pending plan (one per session; a new proposal replaces it) and returns a chat-ready presentation. Grants NOTHING by itself — if the user approves in chat, call plan_approve with their exact words.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        items: { type: 'array', description: '3-7 high-level step descriptions' },
+        domains: { type: 'array', description: 'Hostnames to pre-approve (no scheme/port/path, no wildcards — gate host matching is exact)' },
+        requestedLevel: { type: 'string', enum: ['P1', 'P2', 'P3', 'P4'], description: 'Gate level to request (default P2)' },
+      },
+      required: ['items', 'domains'],
+    },
+  },
+  {
+    name: 'plan_approve',
+    description: 'Approve the pending plan (P14.1). ONLY call when the user explicitly approved in chat — phrase must record their exact words (audit trail, grantedBy: user_phrase). Creates ONE session GateGrant at the plan\'s requestedLevel covering all plan domains; the grant is session-scoped (stored under the session id, dies with the session). To revoke it later use gateRevoke with the same level — no separate plan_revoke exists. Fails with YJ.POLICY.PLAN_NOT_FOUND if no plan is pending.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        phrase: { type: 'string', description: 'REQUIRED: the user\'s exact approval words' },
+      },
+      required: ['phrase'],
+    },
   },
   {
     name: 'gateGrant',

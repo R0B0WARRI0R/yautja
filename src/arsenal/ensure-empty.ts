@@ -22,13 +22,19 @@ export interface Transport {
 
 export type EnsureEmptyStrategy = 'auto' | 'execCommand' | 'selectAll' | 'force';
 
+import { REDACTED_VALUE } from '../vision/redaction.js';
+
 export interface EnsureEmptyResult {
   found: boolean;
   wasClean: boolean;
   afterClean: boolean;
   strategyUsed: string;
   selectorResolved: string;
-  /** Residual content found before cleaning (truncated to 500 chars). */
+  /**
+   * Residual content found before cleaning (truncated to 500 chars).
+   * Sensitive fields (password/hidden/OTP/CC autocomplete) are replaced
+   * by REDACTED_VALUE — never the real value.
+   */
   residual: string;
 }
 
@@ -38,6 +44,16 @@ export function buildEnsureEmptyScript(selector: string, strategy: EnsureEmptySt
   const strategy = ${JSON.stringify(strategy)};
   const el = document.querySelector(sel);
   if (!el) return JSON.stringify({ found: false });
+  // Sensitive-field detector — keep in sync with src/vision/redaction.ts.
+  // The residual (previous content) must never leak a password/OTP/CC value.
+  const sensitive = (() => {
+    const t = String(el.type || (el.getAttribute ? el.getAttribute('type') : '') || '').toLowerCase();
+    if (t === 'password' || t === 'hidden') return true;
+    const ac = String((el.getAttribute ? el.getAttribute('autocomplete') : '') || '').toLowerCase();
+    if (!ac) return false;
+    const tokens = ['current-password','new-password','one-time-code','cc-number','cc-csc','cc-exp','cc-exp-month','cc-exp-year'];
+    return tokens.some((tok) => ac.indexOf(tok) !== -1);
+  })();
   const isCE = () => el.isContentEditable || el.getAttribute('contenteditable') === 'true';
   const read = () => {
     if (isCE()) return (el.innerText || el.textContent || '');
@@ -53,7 +69,7 @@ export function buildEnsureEmptyScript(selector: string, strategy: EnsureEmptySt
   };
   const before = read();
   const wasClean = before.trim() === '';
-  if (wasClean) return JSON.stringify({ found: true, wasClean: true, afterClean: true, strategyUsed: 'none', residual: '' });
+  if (wasClean) return JSON.stringify({ found: true, wasClean: true, afterClean: true, strategyUsed: 'none', residual: '', sensitive });
   let strategyUsed = 'none';
   const tryExecCommand = () => {
     try { el.focus(); } catch (e) {}
@@ -105,7 +121,11 @@ export function buildEnsureEmptyScript(selector: string, strategy: EnsureEmptySt
     wasClean: false,
     afterClean: after.trim() === '',
     strategyUsed,
-    residual: before.slice(0, 500),
+    // Redact in-page too: a sensitive residual must not even cross the
+    // Runtime.evaluate boundary. Keep in sync with REDACTED_VALUE in
+    // src/vision/redaction.ts.
+    residual: sensitive ? '[value redacted]' : before.slice(0, 500),
+    sensitive,
   });
 })()`;
 }
@@ -125,13 +145,20 @@ export async function ensureEmpty(
   }
   try {
     const parsed = JSON.parse(raw);
+    // Fuga evitada: si el campo es sensible (password/hidden/autocomplete
+    // de password/OTP/tarjeta), el residual nunca sale en claro.
+    const residual = parsed.sensitive === true
+      ? REDACTED_VALUE
+      : typeof parsed.residual === 'string'
+        ? parsed.residual
+        : '';
     return {
       found: !!parsed.found,
       wasClean: !!parsed.wasClean,
       afterClean: !!parsed.afterClean,
       strategyUsed: parsed.strategyUsed ?? 'none',
       selectorResolved: selector,
-      residual: typeof parsed.residual === 'string' ? parsed.residual : '',
+      residual,
     };
   } catch {
     return { found: false, wasClean: false, afterClean: false, strategyUsed: 'none', selectorResolved: selector, residual: '' };

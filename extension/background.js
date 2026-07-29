@@ -1,10 +1,67 @@
 // Yautja Bridge — Service Worker
 // Relays CDP commands from Yautja (WebSocket) to chrome.debugger and back.
-
-const YAUTJA_URL = 'ws://localhost:9876';
+//
+// Multi-puerto: varias instancias de Kimi/MCP pueden correr helmets en
+// puertos distintos (resolvePort: arg CLI > YAUTJA_PORT > 9876). La extensión
+// solo puede hablar con UN helmet a la vez. Orden de preferencia:
+//   1. chrome.storage.local.yjPort (override explícito del usuario)
+//   2. FALLBACK_PORTS en orden (el primero que acepte conexión gana)
+// Para apuntar la extensión a otro helmet:
+//   chrome.storage.local.set({ yjPort: 9877 })  → reconecta sola.
+// Ventana de puertos candidatos: debe cubrir la ventana de auto-incremento
+// del helmet (base 9876 + hasta 9) — ver extension-server.ts.
+const DEFAULT_PORTS = [9876, 9877, 9878, 9879, 9880, 9881, 9882, 9883, 9884, 9885];
 const RECONNECT_DELAY = 2000;
 const KEEPALIVE_ALARM = 'yautja-keepalive';
 const DEBUGGER_VERSION = '1.3';
+
+let candidatePorts = DEFAULT_PORTS;
+let portIndex = 0;
+let everConnected = false;
+
+async function resolveCandidatePorts() {
+  try {
+    const { yjPort } = await chrome.storage.local.get('yjPort');
+    const n = Number(yjPort);
+    if (Number.isInteger(n) && n >= 1024 && n <= 65535) {
+      return [n, ...DEFAULT_PORTS.filter((p) => p !== n)];
+    }
+  } catch {}
+  return DEFAULT_PORTS;
+}
+
+function rotatePort() {
+  portIndex = (portIndex + 1) % candidatePorts.length;
+}
+
+// Si el usuario cambia yjPort en storage, reconectar al nuevo destino.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.yjPort) {
+    portIndex = 0;
+    everConnected = false;
+    if (ws) { try { ws.close(); } catch {} }
+    else connectWS();
+  }
+});
+
+// Ningún handler puede colgarse para siempre esperando a Chrome/CDP (renderer
+// saturado): los awaits de APIs de Chrome van envueltos en withTimeout.
+const HANDLER_TIMEOUT_MS = 20000;
+// Page.navigate con espera de carga puede tardar más en SPAs pesadas; se le
+// da más margen, pero por debajo del timeout heavy del helmet (60s) para que
+// el error tipado llegue antes que el timeout propio del helmet.
+const NAVIGATE_TIMEOUT_MS = 45000;
+
+function withTimeout(promise, ms = HANDLER_TIMEOUT_MS, label = 'handler') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
+// Diagnóstico del service worker (comando health).
+const swStartTime = Date.now();
+let pendingHandlers = 0;
 
 /** @type {WebSocket | null} */
 let ws = null;
@@ -78,21 +135,27 @@ let nextId = 1;
 
 // ─── WebSocket connection ─────────────────────────────────────────
 
-function connectWS() {
+async function connectWS() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
 
+  candidatePorts = await resolveCandidatePorts();
+  if (portIndex >= candidatePorts.length) portIndex = 0;
+  const url = `ws://localhost:${candidatePorts[portIndex]}`;
+
   try {
-    ws = new WebSocket(YAUTJA_URL);
+    ws = new WebSocket(url);
   } catch (e) {
+    rotatePort();
     scheduleReconnect();
     return;
   }
 
   ws.onopen = () => {
     connected = true;
-    sendToYautja({ type: 'hello', extension: 'yautja-bridge', version: '0.1.0' });
+    everConnected = true;
+    sendToYautja({ type: 'hello', extension: 'yautja-bridge', version: '0.1.0', id: chrome.runtime.id, port: candidatePorts[portIndex] });
     // Re-attach to any tabs we were tracking before reconnect
     for (const tabId of attachedTabs.keys()) {
       sendToYautja({ type: 'info', message: `Tab ${tabId} was attached before reconnect` });
@@ -106,12 +169,22 @@ function connectWS() {
     } catch {
       return;
     }
-    handleCommand(msg);
+    // Contador de handlers en vuelo (lo expone health). Los handlers corren
+    // concurrentes; si todos cuelgan contra el renderer, health sigue
+    // respondiendo y delata el wedge.
+    pendingHandlers++;
+    Promise.resolve(handleCommand(msg))
+      .catch(() => {})
+      .finally(() => { pendingHandlers--; });
   };
 
   ws.onclose = () => {
+    const wasConnected = connected;
     connected = false;
     ws = null;
+    // Si nunca llegamos a conectar en este intento, probar el siguiente
+    // puerto candidato en la próxima reconexión (helmet en otro puerto).
+    if (!wasConnected && candidatePorts.length > 1) rotatePort();
     scheduleReconnect();
   };
 
@@ -145,6 +218,18 @@ async function handleCommand(msg) {
       break;
     }
 
+    // Sonda de liveness: responde SIN awaits para distinguir "SW muerto"
+    // (ni health responde) de "renderer ocupado" (health responde, comandos no).
+    case 'health': {
+      sendToYautja({ id, type: 'result', result: {
+        runtimeId: chrome.runtime.id,
+        uptimeMs: Date.now() - swStartTime,
+        pendingHandlers,
+        attachedTabs: [...attachedTabs.keys()],
+      }});
+      break;
+    }
+
     case 'attach': {
       const tabId = msg.tabId;
       if (!tabId && tabId !== 0) {
@@ -156,7 +241,7 @@ async function handleCommand(msg) {
         break;
       }
       try {
-        await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+        await withTimeout(chrome.debugger.attach({ tabId }, DEBUGGER_VERSION), HANDLER_TIMEOUT_MS, 'debugger.attach');
         attachedTabs.set(tabId, new Set());
         sendToYautja({ type: 'attached', tabId });
         sendToYautja({ id, type: 'result', result: { attached: true } });
@@ -169,7 +254,7 @@ async function handleCommand(msg) {
     case 'detach': {
       const tabId = msg.tabId;
       try {
-        await chrome.debugger.detach({ tabId });
+        await withTimeout(chrome.debugger.detach({ tabId }), HANDLER_TIMEOUT_MS, 'debugger.detach');
         attachedTabs.delete(tabId);
         sendToYautja({ type: 'detached', tabId });
         sendToYautja({ id, type: 'result', result: { detached: true } });
@@ -184,7 +269,7 @@ async function handleCommand(msg) {
       const detached = [];
       for (const tabId of [...attachedTabs.keys()]) {
         try {
-          await chrome.debugger.detach({ tabId });
+          await withTimeout(chrome.debugger.detach({ tabId }), HANDLER_TIMEOUT_MS, 'debugger.detach');
           detached.push(tabId);
         } catch {
           // Already detached or error — remove from tracking anyway
@@ -204,7 +289,11 @@ async function handleCommand(msg) {
         break;
       }
       try {
-        const result = await chrome.debugger.sendCommand({ tabId }, method, params);
+        const result = await withTimeout(
+          chrome.debugger.sendCommand({ tabId }, method, params),
+          method === 'Page.navigate' ? NAVIGATE_TIMEOUT_MS : HANDLER_TIMEOUT_MS,
+          `CDP ${method}`,
+        );
         if (method && method.endsWith('.enable')) {
           const domain = method.slice(0, -7);
           attachedTabs.get(tabId).add(domain);
@@ -222,7 +311,7 @@ async function handleCommand(msg) {
 
     case 'listTabs': {
       try {
-        const tabs = await chrome.tabs.query({});
+        const tabs = await withTimeout(chrome.tabs.query({}), HANDLER_TIMEOUT_MS, 'tabs.query');
         const result = tabs.map((t) => ({
           tabId: t.id,
           url: t.url || '',
@@ -230,6 +319,7 @@ async function handleCommand(msg) {
           active: t.active,
           index: t.index,
           windowId: t.windowId,
+          groupId: t.groupId,
         }));
         sendToYautja({ id, type: 'result', result: { tabs: result } });
       } catch (e) {
@@ -240,7 +330,12 @@ async function handleCommand(msg) {
 
     case 'openTab': {
       try {
-        const tab = await chrome.tabs.create({ url: msg.url, active: true });
+        const tab = await withTimeout(chrome.tabs.create({ url: msg.url, active: true }), HANDLER_TIMEOUT_MS, 'tabs.create');
+        // Session group (P8): when a groupId is provided, the new tab joins
+        // that group so Yautja-controlled tabs stay sandboxed together.
+        if (typeof msg.groupId === 'number' && msg.groupId >= 0) {
+          try { await withTimeout(chrome.tabs.group({ tabIds: [tab.id], groupId: msg.groupId }), HANDLER_TIMEOUT_MS, 'tabs.group'); } catch {}
+        }
         sendToYautja({ id, type: 'result', result: { tabId: tab.id, url: tab.url || msg.url } });
       } catch (e) {
         sendToYautja({ id, type: 'error', error: `openTab failed: ${e.message}` });
@@ -248,9 +343,39 @@ async function handleCommand(msg) {
       break;
     }
 
+    // Session tab group (P8, estilo "MCP tab group" de Claude in Chrome):
+    // crea una pestaña en blanco y la agrupa con título/color distintivos.
+    case 'sessionGroupCreate': {
+      try {
+        const tab = await withTimeout(chrome.tabs.create({ url: 'about:blank', active: false }), HANDLER_TIMEOUT_MS, 'tabs.create');
+        const groupId = await withTimeout(chrome.tabs.group({ tabIds: [tab.id] }), HANDLER_TIMEOUT_MS, 'tabs.group');
+        await withTimeout(chrome.tabGroups.update(groupId, {
+          title: msg.title || 'Yautja',
+          color: msg.color || 'purple',
+          collapsed: false,
+        }), HANDLER_TIMEOUT_MS, 'tabGroups.update');
+        sendToYautja({ id, type: 'result', result: { groupId, tabId: tab.id } });
+      } catch (e) {
+        sendToYautja({ id, type: 'error', error: `sessionGroupCreate failed: ${e.message}` });
+      }
+      break;
+    }
+
+    // Lectura de claves de chrome.storage.local de la extensión (kill switches,
+    // p.ej. yjStripInterference). Devuelve { value } — undefined si no existe.
+    case 'storageGet': {
+      try {
+        const data = await chrome.storage.local.get(msg.key);
+        sendToYautja({ id, type: 'result', result: { value: data ? data[msg.key] : undefined } });
+      } catch (e) {
+        sendToYautja({ id, type: 'error', error: `storageGet failed: ${e.message}` });
+      }
+      break;
+    }
+
     case 'closeTab': {
       try {
-        await chrome.tabs.remove(msg.tabId);
+        await withTimeout(chrome.tabs.remove(msg.tabId), HANDLER_TIMEOUT_MS, 'tabs.remove');
         sendToYautja({ id, type: 'result', result: { closed: true, tabId: msg.tabId } });
       } catch (e) {
         sendToYautja({ id, type: 'error', error: `closeTab failed: ${e.message}` });
@@ -260,10 +385,10 @@ async function handleCommand(msg) {
 
     case 'switchToTab': {
       try {
-        await chrome.tabs.update(msg.tabId, { active: true });
-        const tab = await chrome.tabs.get(msg.tabId);
+        await withTimeout(chrome.tabs.update(msg.tabId, { active: true }), HANDLER_TIMEOUT_MS, 'tabs.update');
+        const tab = await withTimeout(chrome.tabs.get(msg.tabId), HANDLER_TIMEOUT_MS, 'tabs.get');
         if (tab.windowId) {
-          await chrome.windows.update(tab.windowId, { focused: true });
+          await withTimeout(chrome.windows.update(tab.windowId, { focused: true }), HANDLER_TIMEOUT_MS, 'windows.update');
         }
         sendToYautja({ id, type: 'result', result: { tabId: msg.tabId } });
       } catch (e) {
@@ -276,7 +401,7 @@ async function handleCommand(msg) {
 
     case 'listAllTargets': {
       try {
-        const targets = await chrome.debugger.getTargets();
+        const targets = await withTimeout(chrome.debugger.getTargets(), HANDLER_TIMEOUT_MS, 'debugger.getTargets');
         const result = targets
           .filter((t) => t.url && t.url.startsWith('chrome-extension://'))
           .map((t) => ({
@@ -301,7 +426,7 @@ async function handleCommand(msg) {
         break;
       }
       try {
-        await chrome.debugger.attach({ targetId }, DEBUGGER_VERSION);
+        await withTimeout(chrome.debugger.attach({ targetId }, DEBUGGER_VERSION), HANDLER_TIMEOUT_MS, 'debugger.attach');
         attachedTargets.set(targetId, new Set());
         sendToYautja({ type: 'targetAttached', targetId });
         sendToYautja({ id, type: 'result', result: { attached: true } });
@@ -314,7 +439,7 @@ async function handleCommand(msg) {
     case 'detachTarget': {
       const { targetId } = msg;
       try {
-        await chrome.debugger.detach({ targetId });
+        await withTimeout(chrome.debugger.detach({ targetId }), HANDLER_TIMEOUT_MS, 'debugger.detach');
         attachedTargets.delete(targetId);
         sendToYautja({ type: 'targetDetached', targetId });
         sendToYautja({ id, type: 'result', result: { detached: true } });
@@ -332,10 +457,10 @@ async function handleCommand(msg) {
         break;
       }
       try {
-        const result = await chrome.debugger.sendCommand(
-          { targetId },
-          method,
-          params || {},
+        const result = await withTimeout(
+          chrome.debugger.sendCommand({ targetId }, method, params || {}),
+          HANDLER_TIMEOUT_MS,
+          `CDP target ${method}`,
         );
 
         if (method && method.endsWith('.enable')) {

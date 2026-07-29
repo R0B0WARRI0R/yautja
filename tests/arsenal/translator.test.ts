@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { ActionTranslator } from '../../src/arsenal/translator.js';
 import type { Transport } from '../../src/vision/base-sensor.js';
 import type { BrowserAction } from '../../src/arsenal/action-types.js';
-import { makeError } from '../../src/arsenal/errors.js';
+import { makeError, arsenalToDoctrine } from '../../src/arsenal/errors.js';
 
 class MockTransport implements Transport {
   handlers: Map<string, ((params: any) => void)[]> = new Map();
@@ -113,7 +113,8 @@ describe('ActionTranslator', () => {
       if (!r.ok) {
         expect(r.error.type).toBe('SELECTOR_NOT_FOUND');
         expect(r.error.message).toContain('#missing');
-        expect(r.error.recoveryHint).toContain('inspect');
+        expect(r.error.recoveryHint).toContain('findElement');
+        expect(r.error.hint).toBe(r.error.recoveryHint);
       }
     });
 
@@ -213,33 +214,68 @@ describe('ActionTranslator', () => {
   });
 
   describe('press', () => {
-    it('sends keyDown + keyUp with no modifiers', async () => {
+    it('sends rawKeyDown + keyUp for Enter with no modifiers', async () => {
       const r = await translator.execute({ type: 'press', key: 'Enter' });
       expect(r.ok).toBe(true);
       const calls = transport.callsFor('Input.dispatchKeyEvent');
       expect(calls.length).toBe(2);
-      expect(calls[0]?.params?.type).toBe('keyDown');
+      expect(calls[0]?.params?.type).toBe('rawKeyDown');
       expect(calls[0]?.params?.key).toBe('Enter');
+      expect(calls[0]?.params?.code).toBe('Enter');
+      expect(calls[0]?.params?.windowsVirtualKeyCode).toBe(13);
       expect(calls[0]?.params?.modifiers).toBe(0);
       expect(calls[1]?.params?.type).toBe('keyUp');
     });
 
-    it('combines modifiers (Ctrl+Shift)', async () => {
+    it('combines modifiers (Ctrl+Shift) with CDP bitfield Alt=1 Ctrl=2 Meta=4 Shift=8', async () => {
       const r = await translator.execute({
         type: 'press',
         key: 'a',
         modifiers: { ctrl: true, shift: true },
       });
       expect(r.ok).toBe(true);
-      const c = transport.callsFor('Input.dispatchKeyEvent')[0];
-      expect(c?.params?.modifiers).toBe(3);
+      const calls = transport.callsFor('Input.dispatchKeyEvent');
+      // keyDown(Control) → keyDown(Shift) → rawKeyDown(a) → keyUp(a) → keyUp(Shift) → keyUp(Control)
+      expect(calls.length).toBe(6);
+      expect(calls[0]?.params?.key).toBe('Control');
+      expect(calls[0]?.params?.modifiers).toBe(2);
+      const mainDown = calls.find((c) => c.params?.key === 'a' && c.params?.type === 'rawKeyDown');
+      expect(mainDown?.params?.modifiers).toBe(10);
+      expect(mainDown?.params?.text).toBeUndefined();
     });
 
-    it('Alt alone maps to 4', async () => {
+    it('Alt alone maps to bit 1', async () => {
       const r = await translator.execute({ type: 'press', key: 'F4', modifiers: { alt: true } });
       expect(r.ok).toBe(true);
-      const c = transport.callsFor('Input.dispatchKeyEvent')[0];
-      expect(c?.params?.modifiers).toBe(4);
+      const calls = transport.callsFor('Input.dispatchKeyEvent');
+      expect(calls[0]?.params?.key).toBe('Alt');
+      expect(calls[0]?.params?.modifiers).toBe(1);
+      const mainDown = calls.find((c) => c.params?.key === 'F4' && c.params?.type === 'rawKeyDown');
+      expect(mainDown?.params?.modifiers).toBe(1);
+    });
+
+    it('parses chord strings like "Control+V" without text on the main key', async () => {
+      const r = await translator.execute({ type: 'press', key: 'Control+V' });
+      expect(r.ok).toBe(true);
+      const calls = transport.callsFor('Input.dispatchKeyEvent');
+      expect(calls.map((c) => `${c.params?.type}:${c.params?.key}`)).toEqual([
+        'rawKeyDown:Control',
+        'rawKeyDown:v',
+        'keyUp:v',
+        'keyUp:Control',
+      ]);
+      expect(calls[1]?.params?.text).toBeUndefined();
+      expect(calls[1]?.params?.windowsVirtualKeyCode).toBe(86);
+    });
+
+    it('returns INVALID_ARGUMENT for unknown keys', async () => {
+      const r = await translator.execute({ type: 'press', key: 'Foosball' });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.type).toBe('INVALID_ARGUMENT');
+        expect(r.error.message).toContain('Unknown key');
+      }
+      expect(transport.callsFor('Input.dispatchKeyEvent').length).toBe(0);
     });
   });
 
@@ -310,7 +346,8 @@ describe('ActionTranslator', () => {
       if (!r.ok) {
         expect(r.error.type).toBe('JS_EVALUATION_ERROR');
         expect(r.error.message).toBe('SyntaxError');
-        expect(r.error.recoveryHint).toContain('syntax');
+        expect(r.error.recoveryHint).toContain('sintaxis');
+        expect(r.error.hint).toBe(r.error.recoveryHint);
       }
     });
 
@@ -358,6 +395,171 @@ describe('ActionTranslator', () => {
       if (r.ok) expect(r.value).toBe('mhtml-blob');
       const c = transport.callsFor('Page.captureSnapshot')[0];
       expect(c?.params?.format).toBe('mhtml');
+    });
+
+    it('screenshot passes clip (normalized with scale 1) and jpeg quality', async () => {
+      transport.setSendResponse('Page.captureScreenshot', { data: 'x' });
+      const r = await translator.execute({
+        type: 'screenshot',
+        format: 'jpeg',
+        quality: 70,
+        clip: { x: 10, y: 20, width: 300, height: 200 },
+      });
+      expect(r.ok).toBe(true);
+      const c = transport.callsFor('Page.captureScreenshot')[0];
+      expect(c?.params?.format).toBe('jpeg');
+      expect(c?.params?.quality).toBe(70);
+      expect(c?.params?.clip).toEqual({ x: 10, y: 20, width: 300, height: 200, scale: 1 });
+    });
+
+    it('screenshot rejects invalid clip with INVALID_ARGUMENT (no CDP call)', async () => {
+      const r = await translator.execute({
+        type: 'screenshot',
+        clip: { x: 0, y: 0, width: 0, height: 10 },
+      });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.type).toBe('INVALID_ARGUMENT');
+      expect(transport.callsFor('Page.captureScreenshot').length).toBe(0);
+    });
+
+    it('screenshot exposes telemetry meta (cdpMs, base64Chars, format)', async () => {
+      transport.setSendResponse('Page.captureScreenshot', { data: 'abc123' });
+      const r = await translator.execute({ type: 'screenshot' });
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.meta?.base64Chars).toBe(6);
+        expect(typeof r.meta?.cdpMs).toBe('number');
+        expect(r.meta?.format).toBe('png');
+      }
+    });
+
+    it('guardrail: oversized png retries with jpeg 80 and succeeds', async () => {
+      const big = 'x'.repeat(900_001);
+      transport.send = vi.fn(async (method: string, params?: any) => {
+        if (method === 'Page.captureScreenshot') {
+          return { data: params?.format === 'png' ? big : 'small' };
+        }
+        return {};
+      });
+      const r = await translator.execute({ type: 'screenshot' });
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.value).toBe('small');
+        expect(r.meta?.format).toBe('jpeg');
+        expect(r.meta?.quality).toBe(80);
+      }
+      const shots = (transport.send as any).mock.calls.filter(
+        (c: any[]) => c[0] === 'Page.captureScreenshot',
+      );
+      expect(shots.length).toBe(2);
+      expect(shots[1][1]).toMatchObject({ format: 'jpeg', quality: 80 });
+    });
+
+    it('guardrail: still oversized after jpeg 80 → 60 → SCREENSHOT_TOO_LARGE with hint', async () => {
+      const big = 'x'.repeat(900_001);
+      transport.send = vi.fn(async () => ({ data: big }));
+      const r = await translator.execute({ type: 'screenshot' });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.type).toBe('SCREENSHOT_TOO_LARGE');
+        expect(r.error.recoverable).toBe(true);
+        expect(r.error.hint).toContain('clip');
+        expect(r.error.hint).toContain('jpeg');
+      }
+      const calls = (transport.send as any).mock.calls.filter(
+        (c: any[]) => c[0] === 'Page.captureScreenshot',
+      );
+      expect(calls.length).toBe(3);
+      expect(calls[0][1].format).toBe('png');
+      expect(calls[1][1]).toMatchObject({ format: 'jpeg', quality: 80 });
+      expect(calls[2][1]).toMatchObject({ format: 'jpeg', quality: 60 });
+    });
+  });
+
+  describe('screenshotZoom', () => {
+    it('captures full png then crops in-page via Runtime.evaluate', async () => {
+      transport.send = vi.fn(async (method: string, params?: any) => {
+        if (method === 'Page.captureScreenshot') return { data: 'fullpng' };
+        if (method === 'Runtime.evaluate') {
+          expect(params?.awaitPromise).toBe(true);
+          expect(params?.expression).toContain('fullpng');
+          expect(params?.expression).toContain('"x":10');
+          return { result: { value: 'cropped' } };
+        }
+        return {};
+      });
+      const r = await translator.execute({
+        type: 'screenshotZoom',
+        region: { x: 10, y: 20, width: 100, height: 50 },
+      });
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.value).toBe('cropped');
+        expect(r.meta?.region).toEqual({ x: 10, y: 20, width: 100, height: 50 });
+        expect(r.meta?.base64Chars).toBe(7);
+        expect(r.meta?.format).toBe('jpeg');
+      }
+    });
+
+    it('rejects invalid region with INVALID_ARGUMENT (no CDP call)', async () => {
+      const r = await translator.execute({
+        type: 'screenshotZoom',
+        region: { x: 0, y: 0, width: -5, height: 10 },
+      });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.type).toBe('INVALID_ARGUMENT');
+    });
+
+    it('empty crop (region outside viewport) is a JS_EVALUATION_ERROR', async () => {
+      transport.send = vi.fn(async (method: string) => {
+        if (method === 'Page.captureScreenshot') return { data: 'fullpng' };
+        if (method === 'Runtime.evaluate') return { result: { value: '' } };
+        return {};
+      });
+      const r = await translator.execute({
+        type: 'screenshotZoom',
+        region: { x: 9999, y: 9999, width: 100, height: 100 },
+      });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.type).toBe('JS_EVALUATION_ERROR');
+    });
+
+    it('in-page exception is a JS_EVALUATION_ERROR', async () => {
+      transport.send = vi.fn(async (method: string) => {
+        if (method === 'Page.captureScreenshot') return { data: 'fullpng' };
+        if (method === 'Runtime.evaluate') return { exceptionDetails: { text: 'decode failed' } };
+        return {};
+      });
+      const r = await translator.execute({
+        type: 'screenshotZoom',
+        region: { x: 0, y: 0, width: 100, height: 100 },
+      });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.type).toBe('JS_EVALUATION_ERROR');
+        expect(r.error.message).toBe('decode failed');
+      }
+    });
+
+    it('guardrail: oversized crop retries jpeg 80 → 60 → SCREENSHOT_TOO_LARGE', async () => {
+      const big = 'x'.repeat(900_001);
+      const evalFormats: string[] = [];
+      transport.send = vi.fn(async (method: string, params?: any) => {
+        if (method === 'Page.captureScreenshot') return { data: 'fullpng' };
+        if (method === 'Runtime.evaluate') {
+          const m = params?.expression?.match(/toDataURL\('([^']+)'/);
+          if (m) evalFormats.push(m[1]);
+          return { result: { value: big } };
+        }
+        return {};
+      });
+      const r = await translator.execute({
+        type: 'screenshotZoom',
+        region: { x: 0, y: 0, width: 100, height: 100 },
+      });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.type).toBe('SCREENSHOT_TOO_LARGE');
+      expect(evalFormats).toEqual(['image/jpeg', 'image/jpeg', 'image/jpeg']);
     });
   });
 
@@ -570,6 +772,168 @@ describe('ActionTranslator', () => {
     });
   });
 
+  describe('refs (element map)', () => {
+    it('click with ref resolves in-page and clicks at the element center', async () => {
+      transport.setSendResponse('Runtime.evaluate', {
+        result: { value: JSON.stringify({ ok: true, x: 120, y: 40 }) },
+      });
+      const r = await translator.execute({ type: 'click', ref: 'e3' });
+      expect(r.ok).toBe(true);
+      const evals = transport.callsFor('Runtime.evaluate');
+      expect(evals.length).toBe(1);
+      expect(evals[0]?.params?.expression).toContain('__yjElementMap');
+      expect(evals[0]?.params?.expression).toContain('"e3"');
+      const mouse = transport.callsFor('Input.dispatchMouseEvent');
+      expect(mouse.length).toBe(2);
+      expect(mouse[0]?.params?.x).toBe(120);
+      expect(mouse[0]?.params?.y).toBe(40);
+      expect(transport.callsFor('DOM.focus').length).toBe(0);
+    });
+
+    it('click with stale ref returns REF_NOT_FOUND with observe hint', async () => {
+      transport.setSendResponse('Runtime.evaluate', {
+        result: { value: JSON.stringify({ ok: false }) },
+      });
+      const r = await translator.execute({ type: 'click', ref: 'e9' });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.type).toBe('REF_NOT_FOUND');
+        expect(r.error.recoverable).toBe(true);
+        expect(r.error.hint).toContain('observe');
+        expect(r.error.hint).toContain('refs frescas');
+      }
+      expect(transport.callsFor('Input.dispatchMouseEvent').length).toBe(0);
+    });
+
+    it('click with neither selector nor ref is INVALID_ARGUMENT (no CDP call)', async () => {
+      const r = await translator.execute({ type: 'click' } as any);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.type).toBe('INVALID_ARGUMENT');
+      expect(transport.sendCallCount()).toBe(0);
+    });
+
+    it('focus with ref focuses in-page via the resolve script', async () => {
+      transport.setSendResponse('Runtime.evaluate', {
+        result: { value: JSON.stringify({ ok: true, x: 1, y: 2 }) },
+      });
+      const r = await translator.execute({ type: 'focus', ref: 'e2' });
+      expect(r.ok).toBe(true);
+      const js = transport.callsFor('Runtime.evaluate')[0]?.params?.expression;
+      expect(js).toContain('el.focus()');
+      expect(transport.callsFor('DOM.focus').length).toBe(0);
+    });
+
+    it('type with ref focuses + clears in-page, then inserts text', async () => {
+      transport.setSendResponse('Runtime.evaluate', {
+        result: { value: JSON.stringify({ ok: true, x: 1, y: 2 }) },
+      });
+      const r = await translator.execute({ type: 'type', ref: 'e4', text: 'hi', clearFirst: true });
+      expect(r.ok).toBe(true);
+      const js = transport.callsFor('Runtime.evaluate')[0]?.params?.expression;
+      expect(js).toContain('el.focus()');
+      expect(js).toContain("el.value = ''");
+      const inserts = transport.callsFor('Input.insertText');
+      expect(inserts.length).toBe(2);
+      expect(transport.callsFor('DOM.querySelector').length).toBe(0);
+    });
+
+    it('type with stale ref returns REF_NOT_FOUND and types nothing', async () => {
+      transport.setSendResponse('Runtime.evaluate', {
+        result: { value: JSON.stringify({ ok: false }) },
+      });
+      const r = await translator.execute({ type: 'type', ref: 'e4', text: 'hi' });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.type).toBe('REF_NOT_FOUND');
+      expect(transport.callsFor('Input.insertText').length).toBe(0);
+    });
+  });
+
+  describe('form_input', () => {
+    it('sets a text input and returns previous/new', async () => {
+      transport.setSendResponse('Runtime.evaluate', {
+        result: { value: JSON.stringify({ ok: true, previous: 'old', new: 'new@x.com', sensitive: false, tag: 'INPUT', inputType: 'text' }) },
+      });
+      const r = await translator.execute({ type: 'form_input', selector: '#email', value: 'new@x.com' });
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect((r.value as any).previous).toBe('old');
+        expect((r.value as any).new).toBe('new@x.com');
+      }
+      const js = transport.callsFor('Runtime.evaluate')[0]?.params?.expression;
+      expect(js).toContain('document.querySelector("#email")');
+      expect(js).toContain("new Event('input', { bubbles: true })");
+    });
+
+    it('redacts previous/new for sensitive fields', async () => {
+      transport.setSendResponse('Runtime.evaluate', {
+        result: { value: JSON.stringify({ ok: true, previous: '[value redacted]', new: '[value redacted]', sensitive: true, tag: 'INPUT', inputType: 'password' }) },
+      });
+      const r = await translator.execute({ type: 'form_input', selector: '#pw', value: 's3cret' });
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect((r.value as any).previous).toBe('[value redacted]');
+        expect((r.value as any).new).toBe('[value redacted]');
+        expect((r.value as any).sensitive).toBe(true);
+      }
+    });
+
+    it('resolves by ref and maps stale refs to REF_NOT_FOUND', async () => {
+      transport.setSendResponse('Runtime.evaluate', {
+        result: { value: JSON.stringify({ error: 'REF_NOT_FOUND' }) },
+      });
+      const r = await translator.execute({ type: 'form_input', ref: 'e8', value: 'x' });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.type).toBe('REF_NOT_FOUND');
+        expect(r.error.hint).toContain('observe');
+      }
+      const js = transport.callsFor('Runtime.evaluate')[0]?.params?.expression;
+      expect(js).toContain('__yjElementMap');
+    });
+
+    it('select with unknown option fails listing available options', async () => {
+      transport.setSendResponse('Runtime.evaluate', {
+        result: { value: JSON.stringify({ error: 'NO_OPTION', options: ['es', 'en', 'fr'] }) },
+      });
+      const r = await translator.execute({ type: 'form_input', selector: '#lang', value: 'de' });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.type).toBe('INVALID_ARGUMENT');
+        expect(r.error.message).toContain('es, en, fr');
+        expect(r.error.hint).toContain('Available');
+      }
+    });
+
+    it('checkbox with non-boolean value is a guided BAD_VALUE error', async () => {
+      transport.setSendResponse('Runtime.evaluate', {
+        result: { value: JSON.stringify({ error: 'BAD_VALUE', expected: 'boolean', inputType: 'checkbox' }) },
+      });
+      const r = await translator.execute({ type: 'form_input', selector: '#cb', value: 'yes' });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.type).toBe('INVALID_ARGUMENT');
+        expect(r.error.message).toContain('boolean');
+        expect(r.error.hint).toContain('boolean');
+      }
+    });
+
+    it('non-form element maps to ELEMENT_NOT_INTERACTABLE', async () => {
+      transport.setSendResponse('Runtime.evaluate', {
+        result: { value: JSON.stringify({ error: 'NOT_INPUT' }) },
+      });
+      const r = await translator.execute({ type: 'form_input', selector: '#div', value: 'x' });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.type).toBe('ELEMENT_NOT_INTERACTABLE');
+    });
+
+    it('missing selector and ref is INVALID_ARGUMENT (no CDP call)', async () => {
+      const r = await translator.execute({ type: 'form_input', value: 'x' } as any);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.type).toBe('INVALID_ARGUMENT');
+      expect(transport.sendCallCount()).toBe(0);
+    });
+  });
+
   describe('error wrapping', () => {
     it('unknown action type returns UNSUPPORTED_ACTION', async () => {
       const action = { type: 'totallyFake' } as unknown as BrowserAction;
@@ -602,6 +966,19 @@ describe('makeError', () => {
   it('NAVIGATION_TIMEOUT is recoverable', () => {
     const e = makeError('NAVIGATION_TIMEOUT', 'x');
     expect(e.recoverable).toBe(true);
+  });
+
+  it('REF_NOT_FOUND is recoverable with the observe hint by default', () => {
+    const e = makeError('REF_NOT_FOUND', 'stale ref e7');
+    expect(e.recoverable).toBe(true);
+    expect(e.hint).toContain('observe');
+    expect(e.recoveryHint).toBe(e.hint);
+  });
+
+  it('REF_NOT_FOUND classifies to YJ.ACT.DOM_TARGET_STALE', () => {
+    const e = arsenalToDoctrine(makeError('REF_NOT_FOUND', 'stale ref e7'));
+    expect(e.code).toBe('YJ.ACT.DOM_TARGET_STALE');
+    expect(e.message).toBe('stale ref e7');
   });
 
   it('includes recoveryHint when provided', () => {

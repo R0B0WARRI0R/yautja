@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { REGISTRY, lookupCode, codesInFamily, MVP_CODES } from '../../src/doctrine/registry.js';
 
 describe('Error code registry', () => {
-  it('has exactly 23 MVP codes (12 core + 5 P11 + 1 P12 + 3 P13 + 1 P13.5 + 1 P16)', () => {
-    expect(MVP_CODES).toHaveLength(23);
+  it('has exactly 26 MVP codes (12 core + 5 P11 + 1 P12 + 3 P13 + 1 P13.5 + 2 P14.1 + 1 P16 + 1 link watchdog)', () => {
+    expect(MVP_CODES).toHaveLength(26);
   });
 
   it('every code matches YJ.FAMILY.NAME pattern', () => {

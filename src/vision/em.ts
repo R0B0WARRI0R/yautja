@@ -1,4 +1,5 @@
 import { BaseSensor, type Anomaly, type SensorQuery, type Transport } from './base-sensor.js';
+import { REDACTED_VALUE } from './redaction.js';
 
 export type { Anomaly, SensorQuery, Transport } from './base-sensor.js';
 
@@ -16,6 +17,8 @@ export interface InteractiveElement {
   selector: string;
   visible: boolean;
   disabled: boolean;
+  /** ref estable del element map (e1, e2, …) — usable en acciones con `ref`. */
+  ref?: string;
 }
 
 export interface FormField {
@@ -26,6 +29,8 @@ export interface FormField {
   placeholder: string;
   required: boolean;
   selector: string;
+  /** ref estable del element map (e1, e2, …) — usable en acciones con `ref`. */
+  ref?: string;
 }
 
 export interface InteractiveView {
@@ -97,6 +102,42 @@ const EXTRACTION_SCRIPT = `(function() {
     return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
   }
 
+  // Sensitive-field detector — keep in sync with src/vision/redaction.ts.
+  function sensitive(el) {
+    var t = (el.type || el.getAttribute('type') || '').toString().toLowerCase();
+    if (t === 'password' || t === 'hidden') return true;
+    var ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+    if (!ac) return false;
+    var tokens = ['current-password', 'new-password', 'one-time-code', 'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year'];
+    for (var j = 0; j < tokens.length; j++) {
+      if (ac.indexOf(tokens[j]) !== -1) return true;
+    }
+    return false;
+  }
+
+  // --- Element map con refs (estilo Claude in Chrome) ---
+  // keep in sync with src/vision/element-map.ts (createRefMap). El mapa vive
+  // en la página entre extracciones: ref → WeakRef(el), WeakMap(el → ref) y
+  // contador monótono. Se purga al inicio de cada extracción.
+  var refMap = window.__yjElementMap;
+  if (!refMap) { refMap = {}; window.__yjElementMap = refMap; }
+  var refReverse = window.__yjElementReverseMap;
+  if (!refReverse) { refReverse = new WeakMap(); window.__yjElementReverseMap = refReverse; }
+  if (typeof window.__yjRefCounter !== 'number') window.__yjRefCounter = 0;
+  for (var refKey in refMap) {
+    var purgedEl = refMap[refKey] && refMap[refKey].deref ? refMap[refKey].deref() : null;
+    if (!purgedEl || !document.contains(purgedEl)) delete refMap[refKey];
+  }
+  function assignRef(el) {
+    var existing = refReverse.get(el);
+    if (existing && refMap[existing]) return existing;
+    window.__yjRefCounter += 1;
+    var ref = 'e' + window.__yjRefCounter;
+    refMap[ref] = new WeakRef(el);
+    refReverse.set(el, ref);
+    return ref;
+  }
+
   // --- Semantic ---
   var title = document.title || '';
   var headingEls = document.querySelectorAll('h1, h2, h3');
@@ -124,7 +165,9 @@ const EXTRACTION_SCRIPT = `(function() {
   for (var i = 0; i < buttonEls.length && buttons.length < 15; i++) {
     var el = buttonEls[i];
     if (!visible(el)) continue;
-    var text = (el.textContent || el.value || '').trim();
+    var text = el.textContent
+      ? el.textContent.trim()
+      : (sensitive(el) ? ${JSON.stringify(REDACTED_VALUE)} : (el.value || '').trim());
     if (!text && !el.getAttribute('aria-label') && !el.getAttribute('placeholder')) continue;
     buttons.push({
       tag: el.tagName,
@@ -132,6 +175,7 @@ const EXTRACTION_SCRIPT = `(function() {
       selector: getSelector(el),
       visible: true,
       disabled: el.disabled || false,
+      ref: assignRef(el),
     });
   }
 
@@ -148,6 +192,7 @@ const EXTRACTION_SCRIPT = `(function() {
       selector: getSelector(el),
       visible: true,
       disabled: false,
+      ref: assignRef(el),
     });
   }
 
@@ -170,6 +215,7 @@ const EXTRACTION_SCRIPT = `(function() {
       placeholder: el.placeholder || '',
       required: el.required || false,
       selector: getSelector(el),
+      ref: assignRef(el),
     });
   }
 

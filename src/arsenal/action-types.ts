@@ -17,18 +17,20 @@ export type BrowserAction =
   | { type: 'goBack' }
   | { type: 'goForward' }
   | { type: 'reload'; ignoreCache?: boolean }
-  | { type: 'click'; selector: string; button?: 'left' | 'right' | 'middle'; clickCount?: number }
-  | { type: 'doubleClick'; selector: string }
+  | { type: 'click'; selector?: string; ref?: string; button?: 'left' | 'right' | 'middle'; clickCount?: number }
+  | { type: 'doubleClick'; selector?: string; ref?: string }
   | { type: 'hover'; selector: string }
-  | { type: 'focus'; selector: string }
-  | { type: 'type'; selector: string; text: string; clearFirst?: boolean; delayMs?: number; stealth?: boolean }
+  | { type: 'focus'; selector?: string; ref?: string }
+  | { type: 'type'; selector?: string; ref?: string; text: string; clearFirst?: boolean; delayMs?: number; stealth?: boolean }
+  | { type: 'form_input'; selector?: string; ref?: string; value: string | boolean | number }
   | { type: 'press'; key: string; modifiers?: { ctrl?: boolean; shift?: boolean; alt?: boolean; meta?: boolean } }
   | { type: 'select'; selector: string; values: string[] }
   | { type: 'check'; selector: string; checked: boolean }
   | { type: 'scroll'; direction: 'up' | 'down' | 'left' | 'right'; amount?: number; selector?: string }
   | { type: 'evaluate'; expression: string; returnByValue?: boolean }
   | { type: 'evaluateAsync'; expression: string }
-  | { type: 'screenshot'; fullPage?: boolean; format?: 'png' | 'jpeg' }
+  | { type: 'screenshot'; fullPage?: boolean; format?: 'png' | 'jpeg'; quality?: number; clip?: { x: number; y: number; width: number; height: number; scale?: number } }
+  | { type: 'screenshotZoom'; region: { x: number; y: number; width: number; height: number }; format?: 'png' | 'jpeg'; quality?: number }
   | { type: 'saveSnapshot' }
   | { type: 'getCookies'; urls?: string[] }
   | { type: 'setCookie'; cookie: { name: string; value: string; domain: string; path?: string; secure?: boolean; httpOnly?: boolean } }
@@ -42,5 +44,5 @@ export type BrowserAction =
   | { type: 'wait'; condition: WaitCondition; timeoutMs?: number };
 
 export type ActionResult =
-  | { ok: true; value?: any }
+  | { ok: true; value?: any; meta?: Record<string, any> }
   | { ok: false; error: ArsenalError };

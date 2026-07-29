@@ -44,6 +44,13 @@ export interface MacroContext {
   /** Re-attach to the active browser tab (use after tab switch/close). */
   reattach(): Promise<void>;
 
+  /**
+   * Invoke any MCP tool through the Helmet dispatch (handleToolCall) and
+   * return the JSON envelope as a string. Used by recorded macros
+   * (macro_record) to replay steps; also handy for tools not in this list.
+   */
+  callTool(name: string, args?: Record<string, unknown>): Promise<string>;
+
   // Macro-only utilities (NOT on Helmet)
   sleep(ms: number): Promise<void>;
   log(message: string): void;

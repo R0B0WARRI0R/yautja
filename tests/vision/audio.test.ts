@@ -386,6 +386,59 @@ describe('AudioSensor', () => {
     });
   });
 
+  describe('readEntries', () => {
+    it('errorsOnly filters to error level', () => {
+      transport.emit('Runtime.consoleAPICalled', consoleEvent('error', [{ type: 'string', value: 'e1' }]));
+      transport.emit('Runtime.consoleAPICalled', consoleEvent('warning', [{ type: 'string', value: 'w1' }]));
+      transport.emit('Runtime.consoleAPICalled', consoleEvent('log', [{ type: 'string', value: 'l1' }]));
+      transport.emit('Runtime.exceptionThrown', exceptionEvent('Boom'));
+      const entries = sensor.readEntries({ errorsOnly: true });
+      expect(entries.map((e) => e.text)).toEqual(['e1', 'Boom']);
+    });
+
+    it('max returns the most recent N entries', () => {
+      for (let i = 0; i < 5; i++) {
+        transport.emit('Runtime.consoleAPICalled', consoleEvent('log', [{ type: 'string', value: `m${i}` }]));
+      }
+      const entries = sensor.readEntries({ max: 2 });
+      expect(entries.map((e) => e.text)).toEqual(['m3', 'm4']);
+    });
+
+    it('default max is 100', () => {
+      for (let i = 0; i < 150; i++) {
+        transport.emit('Runtime.consoleAPICalled', consoleEvent('log', [{ type: 'string', value: `m${i}` }]));
+      }
+      const entries = sensor.readEntries();
+      expect(entries).toHaveLength(100);
+      expect(entries[0]!.text).toBe('m50');
+      expect(entries[99]!.text).toBe('m149');
+    });
+
+    it('does not mutate the buffer (read then read again)', () => {
+      transport.emit('Runtime.consoleAPICalled', consoleEvent('log', [{ type: 'string', value: 'x' }]));
+      expect(sensor.readEntries()).toHaveLength(1);
+      expect(sensor.readEntries()).toHaveLength(1);
+    });
+
+    it('clear empties the buffer for incremental reads', () => {
+      transport.emit('Runtime.consoleAPICalled', consoleEvent('log', [{ type: 'string', value: 'x' }]));
+      sensor.clear();
+      expect(sensor.readEntries()).toHaveLength(0);
+    });
+  });
+
+  describe('ring buffer retention', () => {
+    it('retains 500 entries by default', () => {
+      for (let i = 0; i < 600; i++) {
+        transport.emit('Runtime.consoleAPICalled', consoleEvent('log', [{ type: 'string', value: `m${i}` }]));
+      }
+      const entries = sensor.getEntries();
+      expect(entries).toHaveLength(500);
+      expect(entries[0]!.text).toBe('m100');
+      expect(entries[499]!.text).toBe('m599');
+    });
+  });
+
   describe('lifecycle', () => {
     it('unsubscribe stops processing consoleAPICalled', () => {
       sensor.unsubscribe();

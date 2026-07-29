@@ -8,9 +8,9 @@ import type { ArgsSchema, MacroContext, MacroDef, MacroRegistryEntry, MacroSourc
 import { DEFAULT_MACRO_TIMEOUT_MS } from './types.js';
 import type { BrowserAction } from '../arsenal/action-types.js';
 
-/** Inline duck-typed surface required by MacroRunner — exactly the 5 Helmet
+/** Inline duck-typed surface required by MacroRunner — exactly the 6 Helmet
  *  instance methods the curated MacroContext exposes. Avoids a separate interface. */
-type HostSurface = Pick<MacroContext, 'observe' | 'act' | 'inspect' | 'diff' | 'reattach'>;
+type HostSurface = Pick<MacroContext, 'observe' | 'act' | 'inspect' | 'diff' | 'reattach' | 'callTool'>;
 
 class TimeoutError extends Error {
   constructor(ms: number) {
@@ -218,6 +218,7 @@ export class MacroRunner {
       inspect: (d: 'network' | 'dom' | 'console' | 'performance' | 'security') => h.inspect(d),
       diff: () => h.diff(),
       reattach: () => h.reattach(),
+      callTool: (name: string, args?: Record<string, unknown>) => h.callTool(name, args),
       sleep: (ms: number) => new Promise<void>(r => setTimeout(r, ms)),
       log: (m: string) => { logBuffer.push(m); },
     };

@@ -70,6 +70,10 @@ vi.mock('../src/connection/extension-server.js', () => {
     public webRequestStart = vi.fn(async (_extId: string) => {});
     public webRequestStop = vi.fn(async (_extId: string) => {});
     public webRequestList = vi.fn(async (_extId: string) => ({ requests: [], count: 0, totalEventsSeen: 0 }));
+    // Multi-instancia (Tanda A)
+    public setBrokerSessionId = vi.fn((_sessionId: string) => {});
+    public setBrokerClient = vi.fn((_client: any) => {});
+    public dispatchBrokerEvent = vi.fn((_payload: any) => {});
 
     constructor(port: number = 9876) {
       this.port = port;
@@ -77,6 +81,20 @@ vi.mock('../src/connection/extension-server.js', () => {
     }
   }
   return { ExtensionServer: MockExtensionServer };
+});
+
+vi.mock('../src/connection/broker-client.js', () => {
+  // Sin broker vivo en tests: start() false → el helmet queda en standalone.
+  class MockBrokerClient {
+    public start = vi.fn(async () => false);
+    public stop = vi.fn(async () => {});
+    public isRegistered = vi.fn(() => false);
+    public onEvent = vi.fn((_handler: any) => () => {});
+    public onStatusChange = vi.fn((_handler: any) => () => {});
+    public getBrokerSessionId = vi.fn(() => null);
+    public sendToBroker = vi.fn(async () => ({}));
+  }
+  return { BrokerClient: MockBrokerClient };
 });
 
 import { Helmet } from '../src/helmet.js';

@@ -106,6 +106,21 @@ describe('EMSensor', () => {
       expect(params.expression).toContain('visible');
     });
 
+    it('expression maintains the element map (assign, purge, keep-in-sync note)', async () => {
+      setEvaluateResponse(transport, makeSummary());
+      sensor.subscribe();
+      await sensor.summarize();
+      const call = transport.send.mock.calls[0]!;
+      const params = call[1] as Record<string, any>;
+      expect(params.expression).toContain('__yjElementMap');
+      expect(params.expression).toContain('__yjElementReverseMap');
+      expect(params.expression).toContain('__yjRefCounter');
+      expect(params.expression).toContain('assignRef');
+      expect(params.expression).toContain('new WeakRef(el)');
+      expect(params.expression).toContain('document.contains');
+      expect(params.expression).toContain('keep in sync with src/vision/element-map.ts');
+    });
+
     it('returns parsed DOMSummary', async () => {
       const expected = makeSummary({ url: 'http://test/page', semantic: { pageType: 'login', title: 'Sign In', headings: ['Login'], mainContentPreview: '...', language: 'en' } });
       setEvaluateResponse(transport, expected);

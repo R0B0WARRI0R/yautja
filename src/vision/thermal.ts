@@ -112,7 +112,10 @@ export interface ThermalConfig {
 }
 
 const DEFAULT_CONFIG: ThermalConfig = {
-  maxTransactions: 100,
+  // Ring buffer de 500 transacciones (tope documentado): histórico para
+  // read_network_requests sin crecer sin límite; syncBuffer evicta las más
+  // antiguas por startedAt al excederlo.
+  maxTransactions: 500,
   slowThresholdMs: 2000,
 };
 
@@ -357,6 +360,21 @@ export class ThermalSensor extends BaseSensor<NetworkSummary> {
 
   getTransactions(): NetworkTransaction[] {
     return Array.from(this.transactions.values());
+  }
+
+  /**
+   * Lectura incremental para read_network_requests: filtra por substring de
+   * URL (opcional) y devuelve como mucho las `max` transacciones más
+   * recientes (default 100; el Map conserva orden de inserción). El buffer
+   * es un ring de maxTransactions (500 por defecto).
+   */
+  readTransactions(opts?: { urlContains?: string; max?: number }): NetworkTransaction[] {
+    let txns = Array.from(this.transactions.values());
+    if (opts?.urlContains) {
+      txns = txns.filter((t) => t.request.url.includes(opts.urlContains!));
+    }
+    const max = opts?.max ?? 100;
+    return txns.slice(-max);
   }
 
   private syncBuffer(): void {

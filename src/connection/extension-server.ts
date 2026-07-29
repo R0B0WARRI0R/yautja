@@ -1,5 +1,63 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { RollingBuffer } from '../memory/rolling-buffer.js';
+import type { BrokerClient } from './broker-client.js';
+
+/**
+ * Timeouts por clase de comando:
+ * - heavy: comandos que esperan al renderer (Page.navigate, Runtime.evaluate
+ *   con awaitPromise = evaluateAsync) — 60s.
+ * - default: el resto — 30s.
+ * - health: sonda de liveness — 5s (debe responder al instante).
+ */
+const COMMAND_TIMEOUT_MS = {
+  heavy: 60_000,
+  default: 30_000,
+  health: 5_000,
+} as const;
+
+/** Timeouts consecutivos que declaran el enlace degradado. */
+const DEGRADED_THRESHOLD = 3;
+
+/**
+ * Enlace extensión↔helmet degradado: N timeouts consecutivos indican handlers
+ * colgados en el service worker (renderer saturado). Mientras dura, los
+ * comandos de navegador fallan rápido con este error en vez de esperar 30s.
+ */
+export class ExtensionLinkDegradedError extends Error {
+  readonly code = 'EXTENSION_LINK_DEGRADED' as const;
+  constructor() {
+    super('Enlace extensión degradado; recuperación automática en curso — reintenta en unos segundos');
+    this.name = 'ExtensionLinkDegradedError';
+  }
+}
+
+/**
+ * Multi-instancia (Tanda A): este helmet es CLIENT y perdió al broker (o
+ * nunca llegó a registrarse). Los comandos de navegador fallan rápido con
+ * este error tipado, sin tumbar el helmet, mientras el bucle de reelección
+ * (Tanda C) busca otro broker o promueve este helmet.
+ */
+export class BrokerDisconnectedError extends Error {
+  readonly code = 'BROKER_DISCONNECTED' as const;
+  constructor() {
+    super('broker disconnected — browser tools no disponibles en esta instancia; la extensión la controla el helmet broker (puerto base). La reelección automática (Tanda C) reintentará el registro o promoverá este helmet a broker.');
+    this.name = 'BrokerDisconnectedError';
+  }
+}
+
+/**
+ * Namespaces por sesión (Tanda B): un CLIENT intentó operar sobre una tab (o
+ * grupo) que pertenece al grupo de sesión de OTRA sesión (otro cliente o la
+ * broker-session). El broker deniega el comando con este error tipado, que
+ * viaja al cliente como `errorType` en el `clientResult`.
+ */
+export class TabOwnedByOtherSessionError extends Error {
+  readonly code = 'TAB_OWNED_BY_OTHER_SESSION' as const;
+  constructor(target: string, owner: string) {
+    super(`${target} pertenece a otra sesión (${owner}); usa tu propio grupo o pide handoff`);
+    this.name = 'TabOwnedByOtherSessionError';
+  }
+}
 
 export interface ExtensionTab {
   tabId: number;
@@ -8,6 +66,8 @@ export interface ExtensionTab {
   active: boolean;
   index: number;
   windowId: number;
+  /** chrome.tabs groupId (-1 = sin grupo). Presente desde que el SW lo expone. */
+  groupId?: number;
 }
 
 export interface ExtensionEvent {
@@ -51,10 +111,31 @@ export class ExtensionServer {
   private statusHandlers: Set<StatusHandler> = new Set();
   private connected = false;
   private currentTabId: number | null = null;
+  private extensionId: string | null = null;
   private enabledDomains: Set<string> = new Set();
   private eventBuffer: RollingBuffer<ExtensionEvent>;
   private networkCaptureCallback?: (msg: any) => void;
   private gqlCaptureCallback?: (msg: any) => void;
+  // ─── Watchdog de enlace (timeouts consecutivos = handlers colgados) ──
+  private consecutiveTimeouts = 0;
+  private linkDegraded = false;
+  private lastHealthMs: number | null = null;
+  /** Último comando idempotente que expiró (solo para el log de recuperación). */
+  private lastFailedRetryable: string | null = null;
+  // ─── Multi-instancia (Tanda A): broker "winner takes <puerto base>" ──
+  /** Sockets de helmets CLIENT registrados (solo los usa el BROKER). */
+  private clientSockets: Map<string, WebSocket> = new Map();
+  /** Enlace al broker (solo en modo CLIENT; null en broker/standalone). */
+  private brokerClient: BrokerClient | null = null;
+  /** sessionId propio que el BROKER expone a sus clientes en `registered`. */
+  private brokerSessionId = 'broker';
+  // ─── Namespaces por sesión (Tanda B; solo los usa el BROKER) ──────
+  /** Grupo de tabs → sessionId dueño (broker-session o client). */
+  private sessionGroups: Map<number, string> = new Map();
+  /** Tab → groupId (sincronizado con listTabs; -1/sin grupo = ausencia). */
+  private tabToGroup: Map<number, number> = new Map();
+  /** Pares sesión:tab-de-usuario ya auditados (evita spam en stderr). */
+  private userTabAudited: Set<string> = new Set();
 
   constructor(port = 9876, maxBufferedEvents = 500) {
     this.port = port;
@@ -62,34 +143,349 @@ export class ExtensionServer {
   }
 
   async start(): Promise<void> {
-    return new Promise((resolve, reject) => {
+    // Asignación dinámica de puerto: si el resuelto (CLI > env > 9876) está
+    // ocupado (otra instancia de Kimi/helmet viva), se prueba el siguiente
+    // hasta 10 candidatos. La extensión rota por la misma ventana
+    // (DEFAULT_PORTS en background.js), así que ambos lados se encuentran
+    // sin configuración manual.
+    const MAX_ATTEMPTS = 10;
+    const basePort = this.port;
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const candidate = basePort + attempt;
       try {
-        this.wss = new WebSocketServer({ port: this.port });
+        await this.tryListen(candidate);
+        if (attempt > 0) {
+          this.port = candidate;
+          process.stderr.write(`[Yautja] Port ${basePort} busy — using ${candidate} instead (auto)\n`);
+        }
+        return;
       } catch (err) {
-        reject(new Error(`ExtensionServer: failed to bind port ${this.port}: ${err}`));
+        lastErr = err;
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code !== 'EADDRINUSE') throw err;
+      }
+    }
+    throw new Error(`ExtensionServer: no free port in range ${basePort}..${basePort + MAX_ATTEMPTS - 1}: ${lastErr}`);
+  }
+
+  private tryListen(port: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let wss: WebSocketServer;
+      try {
+        wss = new WebSocketServer({ port });
+      } catch (err) {
+        reject(new Error(`ExtensionServer: failed to bind port ${port}: ${err}`));
         return;
       }
 
-      this.wss.on('connection', (socket) => {
-        // Only allow one extension connection at a time
-        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-          socket.close(4000, 'Another extension already connected');
-          return;
-        }
-        this.socket = socket;
-        this.setupSocket(socket);
-      });
+      const onError = (err: NodeJS.ErrnoException) => {
+        wss.close(() => reject(err));
+      };
+      wss.on('error', onError);
 
-      this.wss.on('error', (err) => {
-        if (!this.connected) {
-          reject(new Error(`ExtensionServer: server error: ${err.message}`));
-        }
-      });
-
-      this.wss.on('listening', () => {
+      wss.on('listening', () => {
+        wss.off('error', onError);
+        this.wss = wss;
+        this.wss.on('connection', (socket) => this.handleNewConnection(socket));
+        this.wss.on('error', (err) => {
+          process.stderr.write(`[Yautja] ExtensionServer error post-listen: ${err.message}\n`);
+        });
         resolve();
       });
     });
+  }
+
+  /**
+   * Protocolo broker↔cliente (Tanda A multi-instancia), en el MISMO puerto
+   * que la extensión. El primer mensaje decide el slot:
+   * - `{type:'hello', ...}` (o cualquier otro) → slot de extensión (clásico).
+   * - `{type:'register', role:'client', sessionId, groupId?}` → slot de
+   *   cliente broker; se responde `{type:'registered', brokerSessionId}`.
+   *   El `groupId` opcional (Tanda C) repuebla sessionGroups del broker en un
+   *   re-registro tras reelección.
+   * - `{type:'brokerInfo'}` → sonda de discovery (Tanda C): todo helmet es
+   *   broker-capable y responde siempre `{type:'brokerInfo', accepts:true,
+   *   sessionId, hasExtension}` y cierra; no ocupa ningún slot.
+   * Cliente→broker: `{type:'clientCommand', sessionId, id, payload}` — el
+   * broker ejecuta `payload` contra la extensión (mismo pipeline sendCommand)
+   * y responde `{type:'clientResult', id, ok, result|error}`; sin extensión,
+   * `ok:false` con 'broker: extension not connected'. Las violaciones de
+   * namespace (Tanda B) responden `ok:false` con `errorType` tipado.
+   * Broker→clientes: `{type:'clientEvent', payload}` — eventos CDP de la
+   * extensión enrutados por namespace (Tanda B): cada evento solo va al
+   * cliente dueño del grupo de la tab origen; eventos sin tab o de tabs sin
+   * grupo quedan en la broker-session.
+   * Heartbeat: `{type:'ping'}` del cliente → `{type:'pong'}` del broker.
+   */
+  private handleNewConnection(socket: WebSocket): void {
+    const slotFree = !(this.socket && this.socket.readyState === WebSocket.OPEN);
+    if (slotFree) {
+      // Asignación optimista del slot de extensión (compat: el socket queda
+      // usable para comandos desde la conexión TCP, sin esperar al hello).
+      this.socket = socket;
+    }
+    const onFirstMessage = (data: WebSocket.RawData) => {
+      let msg: any;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        socket.close(4001, 'Invalid first message');
+        return;
+      }
+      socket.off('message', onFirstMessage);
+      if (msg?.type === 'brokerInfo') {
+        // Sonda de discovery (Tanda C): responde siempre y libera el slot de
+        // extensión si la sonda lo ocupó optimistamente al conectar.
+        const hasExtension = this.connected
+          && this.socket !== null
+          && this.socket !== socket
+          && this.socket.readyState === WebSocket.OPEN;
+        if (this.socket === socket) this.socket = null;
+        try {
+          socket.send(JSON.stringify({
+            type: 'brokerInfo',
+            accepts: true,
+            sessionId: this.brokerSessionId,
+            hasExtension,
+          }));
+        } catch {}
+        socket.close();
+        return;
+      }
+      if (msg?.type === 'register' && msg.role === 'client' && typeof msg.sessionId === 'string' && msg.sessionId) {
+        // Cliente broker: no ocupa el slot de la extensión.
+        if (this.socket === socket) this.socket = null;
+        this.acceptClient(socket, msg.sessionId, typeof msg.groupId === 'number' ? msg.groupId : undefined);
+        return;
+      }
+      if (!slotFree) {
+        socket.close(4000, 'Another extension already connected');
+        return;
+      }
+      this.setupSocket(socket);
+      this.handleExtensionMessage(msg);
+    };
+    socket.on('message', onFirstMessage);
+    socket.on('close', () => {
+      // Si murió sin identificarse y ocupaba el slot optimista, liberarlo.
+      if (this.socket === socket) {
+        this.socket = null;
+        this.connected = false;
+      }
+    });
+    socket.on('error', () => {
+      // close handler will fire
+    });
+  }
+
+  private acceptClient(socket: WebSocket, sessionId: string, groupId?: number): void {
+    const prev = this.clientSockets.get(sessionId);
+    if (prev && prev !== socket && prev.readyState === WebSocket.OPEN) {
+      prev.close(4002, 'session re-registered');
+    }
+    this.clientSockets.set(sessionId, socket);
+    // Re-registro tras reelección (Tanda C): el cliente trae su grupo de
+    // sesión actual → repoblar sessionGroups de este (nuevo) broker.
+    if (typeof groupId === 'number' && groupId >= 0) {
+      this.sessionGroups.set(groupId, sessionId);
+    }
+    socket.on('message', (data) => {
+      let msg: any;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+      this.handleClientMessage(socket, msg);
+    });
+    socket.on('close', () => {
+      if (this.clientSockets.get(sessionId) === socket) {
+        this.clientSockets.delete(sessionId);
+        this.forgetSessionGroups(sessionId);
+      }
+    });
+    socket.on('error', () => {
+      // close handler will fire
+    });
+    socket.send(JSON.stringify({ type: 'registered', brokerSessionId: this.brokerSessionId }));
+  }
+
+  private handleClientMessage(socket: WebSocket, msg: any): void {
+    switch (msg?.type) {
+      case 'ping':
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'pong' }));
+        }
+        break;
+      case 'clientCommand':
+        this.executeClientCommand(socket, msg);
+        break;
+    }
+  }
+
+  private executeClientCommand(socket: WebSocket, msg: any): void {
+    const reply = (ok: boolean, result?: any, error?: string, errorType?: string) => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify(ok
+        ? { type: 'clientResult', id: msg.id, ok, result }
+        : { type: 'clientResult', id: msg.id, ok, error, ...(errorType ? { errorType } : {}) }));
+    };
+    if (!this.isExtensionConnected()) {
+      reply(false, undefined, 'broker: extension not connected');
+      return;
+    }
+    const sessionId = typeof msg.sessionId === 'string' ? msg.sessionId : null;
+    // Política de tabs (Tanda B): namespaces por sesión.
+    const violation = this.checkClientTabPolicy(sessionId, msg.payload);
+    if (violation) {
+      reply(false, undefined, violation.message, violation.code);
+      return;
+    }
+    this.sendCommand(msg.payload)
+      .then((result) => {
+        this.trackClientCommand(sessionId, msg.payload, result);
+        reply(true, result);
+      })
+      .catch((err) => reply(false, undefined, err instanceof Error ? err.message : String(err)));
+  }
+
+  /**
+   * Política de namespaces (Tanda B): una sesión solo opera sobre tabs de su
+   * propio grupo. Tabs del grupo de OTRA sesión (otro cliente o la
+   * broker-session) → TabOwnedByOtherSessionError. Tabs sin grupo (del
+   * usuario) → PERMITIDO en v1, pero auditado en stderr (una vez por
+   * sesión+tab); la política dura para user-tabs queda para una iteración
+   * futura.
+   */
+  private checkClientTabPolicy(sessionId: string | null, payload: any): TabOwnedByOtherSessionError | null {
+    if (!payload || typeof payload !== 'object') return null;
+    // openTab con groupId ajeno → denegar (sin groupId es tab suelta: permitir).
+    if (payload.type === 'openTab' && typeof payload.groupId === 'number' && payload.groupId >= 0) {
+      const owner = this.sessionGroups.get(payload.groupId);
+      if (owner !== undefined && owner !== sessionId) {
+        return new TabOwnedByOtherSessionError(`group ${payload.groupId}`, owner);
+      }
+    }
+    const tabId = typeof payload.tabId === 'number' ? payload.tabId : null;
+    if (tabId === null) return null;
+    const groupId = this.tabToGroup.get(tabId);
+    if (groupId === undefined) {
+      const key = `${sessionId ?? '?'}:${tabId}`;
+      if (!this.userTabAudited.has(key)) {
+        this.userTabAudited.add(key);
+        process.stderr.write(`[broker] session ${sessionId ?? '?'} tocó tab de usuario ${tabId} (${String(payload.type)})\n`);
+      }
+      return null;
+    }
+    const owner = this.sessionGroups.get(groupId);
+    if (owner !== undefined && owner !== sessionId) {
+      return new TabOwnedByOtherSessionError(`tab ${tabId}`, owner);
+    }
+    return null;
+  }
+
+  /**
+   * Registro de grupos por sesión (Tanda B): tras un clientCommand OK,
+   * `sessionGroupCreate` registra el groupId para ese sessionId; `openTab`
+   * dentro de un grupo registra la tab; `listTabs` resincroniza tabToGroup.
+   */
+  private trackClientCommand(sessionId: string | null, payload: any, result: any): void {
+    if (Array.isArray(result?.tabs)) {
+      this.syncTabGroups(result.tabs);
+    }
+    if (!sessionId || !payload || !result) return;
+    if (payload.type === 'sessionGroupCreate' && typeof result.groupId === 'number') {
+      this.sessionGroups.set(result.groupId, sessionId);
+      if (typeof result.tabId === 'number') {
+        this.tabToGroup.set(result.tabId, result.groupId);
+      }
+    }
+    if (payload.type === 'openTab' && typeof payload.groupId === 'number' && payload.groupId >= 0 && typeof result.tabId === 'number') {
+      this.tabToGroup.set(result.tabId, payload.groupId);
+    }
+  }
+
+  /** Sincroniza tabToGroup con una respuesta listTabs (fuente de verdad). */
+  private syncTabGroups(tabs: ExtensionTab[]): void {
+    const seen = new Set<number>();
+    for (const tab of tabs) {
+      if (typeof tab?.tabId !== 'number') continue;
+      seen.add(tab.tabId);
+      if (typeof tab.groupId === 'number' && tab.groupId >= 0) {
+        this.tabToGroup.set(tab.tabId, tab.groupId);
+      } else {
+        this.tabToGroup.delete(tab.tabId);
+      }
+    }
+    // listTabs devuelve TODAS las tabs: las ausentes están cerradas.
+    for (const tabId of Array.from(this.tabToGroup.keys())) {
+      if (!seen.has(tabId)) this.tabToGroup.delete(tabId);
+    }
+  }
+
+  /**
+   * Heartbeat de grupo (Tanda B): al morir un cliente (socket cerrado) el
+   * broker olvida sus registros de grupo — NO sus tabs reales. Sus tabs
+   * vuelven a ser "de usuario" para la política: otra sesión puede operarlas.
+   * Si la sesión se re-registró con otro socket, esto no se ejecuta (guard
+   * en el close handler).
+   */
+  private forgetSessionGroups(sessionId: string): void {
+    const ownedGroups = new Set<number>();
+    for (const [groupId, owner] of this.sessionGroups) {
+      if (owner === sessionId) ownedGroups.add(groupId);
+    }
+    if (ownedGroups.size === 0) return;
+    for (const groupId of ownedGroups) this.sessionGroups.delete(groupId);
+    for (const [tabId, groupId] of Array.from(this.tabToGroup)) {
+      if (ownedGroups.has(groupId)) this.tabToGroup.delete(tabId);
+    }
+  }
+
+  /**
+   * Enrutado de eventos por namespace (Tanda B, fin del broadcast
+   * indiscriminado): cada evento CDP va SOLO al cliente dueño del grupo de
+   * la tab origen. Eventos sin tabId, de tabs sin grupo o de tabs del grupo
+   * de la broker-session NO se reenvían: los procesa localmente la
+   * broker-session (comportamiento por defecto de siempre).
+   */
+  private routeEventToClients(msg: any): void {
+    if (this.clientSockets.size === 0) return;
+    const tabId = typeof msg.tabId === 'number' ? msg.tabId : null;
+    if (tabId === null) return;
+    const groupId = this.tabToGroup.get(tabId);
+    if (groupId === undefined) return;
+    const owner = this.sessionGroups.get(groupId);
+    if (owner === undefined || owner === this.brokerSessionId) return;
+    const client = this.clientSockets.get(owner);
+    if (client && client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(JSON.stringify({ type: 'clientEvent', payload: msg }));
+      } catch {}
+    }
+  }
+
+  // ─── Multi-instancia: lado CLIENT ─────────────────────────────────
+
+  /** Registra el enlace al broker (modo CLIENT). Pasar null en standalone. */
+  setBrokerClient(client: BrokerClient | null): void {
+    this.brokerClient = client;
+    if (client) {
+      client.onStatusChange((registered) => {
+        this.notifyStatus(registered ? { connected: true } : { connected: false });
+      });
+    }
+  }
+
+  /** sessionId que este helmet (BROKER) expone a sus clientes. */
+  setBrokerSessionId(sessionId: string): void {
+    this.brokerSessionId = sessionId;
+  }
+
+  /** Evento reenviado por el broker: se inyecta en el pipeline local de eventos. */
+  dispatchBrokerEvent(payload: any): void {
+    this.handleExtensionMessage(payload);
   }
 
   async stop(): Promise<void> {
@@ -99,6 +495,14 @@ export class ExtensionServer {
       pending.reject(new Error('ExtensionServer: shutting down'));
     }
     this.pending.clear();
+
+    // Los clientes broker registrados reciben el cierre y pasan a degradado.
+    for (const [, client] of this.clientSockets) {
+      try {
+        client.close();
+      } catch {}
+    }
+    this.clientSockets.clear();
 
     if (this.socket) {
       this.socket.close();
@@ -113,10 +517,17 @@ export class ExtensionServer {
     this.connected = false;
     this.currentTabId = null;
     this.enabledDomains.clear();
+    this.sessionGroups.clear();
+    this.tabToGroup.clear();
+    this.userTabAudited.clear();
   }
 
   isExtensionConnected(): boolean {
-    return this.connected && this.socket !== null && this.socket.readyState === WebSocket.OPEN;
+    if (this.connected && this.socket !== null && this.socket.readyState === WebSocket.OPEN) {
+      return true;
+    }
+    // Modo CLIENT registrado: la extensión es alcanzable a través del broker.
+    return this.brokerClient?.isRegistered() ?? false;
   }
 
   getPort(): number {
@@ -155,7 +566,13 @@ export class ExtensionServer {
 
   async listTabs(): Promise<ExtensionTab[]> {
     const result = await this.sendCommand({ type: 'listTabs' });
-    return result.tabs || [];
+    const tabs: ExtensionTab[] = result.tabs || [];
+    // Solo el BROKER mantiene el registro (ejecución local contra la extensión);
+    // en modo CLIENT la respuesta viene del broker, que ya sincronizó el suyo.
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.syncTabGroups(tabs);
+    }
+    return tabs;
   }
 
   async attachTab(tabId: number): Promise<void> {
@@ -170,9 +587,40 @@ export class ExtensionServer {
     }
   }
 
-  async openTab(url: string): Promise<{ tabId: number; url: string }> {
-    const result = await this.sendCommand({ type: 'openTab', url });
+  async openTab(url: string, groupId?: number): Promise<{ tabId: number; url: string }> {
+    const result = await this.sendCommand({ type: 'openTab', url, groupId });
+    if (this.socket && this.socket.readyState === WebSocket.OPEN && typeof groupId === 'number' && groupId >= 0) {
+      this.tabToGroup.set(result.tabId, groupId);
+    }
     return { tabId: result.tabId, url: result.url || url };
+  }
+
+  /** Crea el grupo de pestañas de sesión (sandbox estilo "MCP tab group"). */
+  async sessionGroupCreate(title = 'Yautja', color = 'purple'): Promise<{ groupId: number; tabId: number }> {
+    const result = await this.sendCommand({ type: 'sessionGroupCreate', title, color });
+    // Ejecución local (broker/standalone): registrar el grupo para la
+    // broker-session. En modo CLIENT lo registra el broker vía trackClientCommand.
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.sessionGroups.set(result.groupId, this.brokerSessionId);
+      if (typeof result.tabId === 'number') {
+        this.tabToGroup.set(result.tabId, result.groupId);
+      }
+    }
+    return { groupId: result.groupId, tabId: result.tabId };
+  }
+
+  /**
+   * Lee una clave de chrome.storage.local de la extensión (kill switches).
+   * Devuelve undefined si la clave no existe.
+   */
+  async storageGet(key: string): Promise<any> {
+    const result = await this.sendCommand({ type: 'storageGet', key });
+    return result?.value;
+  }
+
+  /** Id de la extensión Yautja Bridge (del hello); null hasta conectar. */
+  getExtensionId(): string | null {
+    return this.extensionId;
   }
 
   async closeTab(tabId: number): Promise<void> {
@@ -324,6 +772,15 @@ export class ExtensionServer {
       this.connected = false;
       this.socket = null;
       this.currentTabId = null;
+      // Rechazar pendientes: con el socket cerrado ya no llegarán respuestas.
+      // Si el cierre lo provocó el watchdog, el error tipado permite fallar rápido.
+      for (const [, p] of this.pending) {
+        clearTimeout(p.timer);
+        p.reject(this.linkDegraded
+          ? new ExtensionLinkDegradedError()
+          : new Error('ExtensionServer: connection closed'));
+      }
+      this.pending.clear();
       this.notifyStatus({ connected: false });
     });
 
@@ -344,7 +801,14 @@ export class ExtensionServer {
         return;
       case 'hello':
         this.connected = true;
+        this.consecutiveTimeouts = 0;
+        if (typeof msg.id === 'string' && msg.id) this.extensionId = msg.id;
         this.notifyStatus({ connected: true, extensionVersion: msg.version });
+        if (this.linkDegraded) {
+          // El WS puede reconectar sobre un service worker aún colgado:
+          // solo un health OK levanta la degradación.
+          this.probeLinkRecovery();
+        }
         break;
 
       case 'ping':
@@ -363,6 +827,8 @@ export class ExtensionServer {
         if (pending) {
           clearTimeout(pending.timer);
           this.pending.delete(id);
+          // Cualquier respuesta (OK o error) demuestra que el SW responde.
+          this.consecutiveTimeouts = 0;
           if (type === 'result') {
             pending.resolve(msg.result);
           } else {
@@ -373,6 +839,9 @@ export class ExtensionServer {
       }
 
       case 'tabs': {
+        if (Array.isArray(msg.tabs)) {
+          this.syncTabGroups(msg.tabs);
+        }
         const pending = id ? this.pending.get(id) : undefined;
         if (pending) {
           clearTimeout(pending.timer);
@@ -404,6 +873,9 @@ export class ExtensionServer {
             } catch {}
           }
         }
+
+        // Multi-instancia (Tanda B): enrutar el evento solo al dueño del grupo.
+        this.routeEventToClients(msg);
         break;
       }
 
@@ -426,8 +898,31 @@ export class ExtensionServer {
     return this.sendCommand(msg, timeoutMs);
   }
 
-  private sendCommand(msg: any, timeoutMs = 30000): Promise<any> {
+  /** Estado del enlace extensión↔helmet (para session_summary y diagnóstico). */
+  getLinkState(): { connected: boolean; consecutiveTimeouts: number; linkDegraded: boolean; lastHealthMs: number | null } {
+    return {
+      connected: this.isExtensionConnected(),
+      consecutiveTimeouts: this.consecutiveTimeouts,
+      linkDegraded: this.linkDegraded,
+      lastHealthMs: this.lastHealthMs,
+    };
+  }
+
+  private sendCommand(msg: any, timeoutMs?: number): Promise<any> {
+    // Routing transparente (Tanda A): sin extensión local, un CLIENT registrado
+    // reenvía el comando al broker (+5s de margen sobre su propio timeout).
+    if ((!this.socket || this.socket.readyState !== WebSocket.OPEN) && this.brokerClient) {
+      if (!this.brokerClient.isRegistered()) {
+        return Promise.reject(new BrokerDisconnectedError());
+      }
+      return this.brokerClient.sendToBroker(msg, timeoutMs ?? this.timeoutFor(msg) + 5_000);
+    }
     return new Promise((resolve, reject) => {
+      // Enlace degradado: fallar rápido (la sonda health sí pasa).
+      if (this.linkDegraded && msg.type !== 'health') {
+        reject(new ExtensionLinkDegradedError());
+        return;
+      }
       if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
         reject(new Error('ExtensionServer: extension not connected'));
         return;
@@ -435,11 +930,22 @@ export class ExtensionServer {
 
       const id = this.nextId++;
       const fullMsg = { id, ...msg };
+      const timeout = timeoutMs ?? this.timeoutFor(msg);
+      const startedAt = Date.now();
 
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`ExtensionServer: command timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
+        this.consecutiveTimeouts++;
+        const label = msg.method ? `${msg.type}:${msg.method}` : String(msg.type);
+        process.stderr.write(
+          `[Yautja] extension command timeout (${label}) after ${Date.now() - startedAt}ms — consecutiveTimeouts=${this.consecutiveTimeouts}\n`,
+        );
+        this.rememberRetryable(msg);
+        if (this.consecutiveTimeouts >= DEGRADED_THRESHOLD) {
+          this.declareLinkDegraded();
+        }
+        reject(new Error(`ExtensionServer: command timed out after ${timeout}ms`));
+      }, timeout);
 
       this.pending.set(id, { resolve, reject, timer });
 
@@ -451,6 +957,62 @@ export class ExtensionServer {
         reject(new Error(`ExtensionServer: failed to send: ${err}`));
       }
     });
+  }
+
+  /** Timeout por clase de comando (ver COMMAND_TIMEOUT_MS). */
+  private timeoutFor(msg: any): number {
+    if (msg.type === 'health') return COMMAND_TIMEOUT_MS.health;
+    if (msg.type === 'command' || msg.type === 'commandTarget') {
+      const method: string = msg.method ?? '';
+      if (method === 'Page.navigate') return COMMAND_TIMEOUT_MS.heavy;
+      if (method === 'Runtime.evaluate' && msg.params?.awaitPromise === true) return COMMAND_TIMEOUT_MS.heavy;
+    }
+    return COMMAND_TIMEOUT_MS.default;
+  }
+
+  /**
+   * Tipos de comando idempotentes (solo lectura). navigate NO lo es (efectos
+   * externos); los `command`/`commandTarget` CDP tampoco en general. Tras una
+   * recuperación no se re-despacha nada automáticamente (el caller ya recibió
+   * su rechazo) — solo se registra para el log de diagnóstico.
+   */
+  private static readonly RETRYABLE_TYPES = new Set([
+    'listTabs', 'listAllTargets', 'managementGetAll', 'storageGet',
+    'getCapturedGql', 'webRequestList', 'health', 'ping',
+  ]);
+
+  private rememberRetryable(msg: any): void {
+    this.lastFailedRetryable = ExtensionServer.RETRYABLE_TYPES.has(msg.type) ? String(msg.type) : null;
+  }
+
+  /** Declara el enlace degradado y cierra el socket: la extensión reconecta sola. */
+  private declareLinkDegraded(): void {
+    if (this.linkDegraded) return;
+    this.linkDegraded = true;
+    process.stderr.write(
+      `[Yautja] extension link DEGRADED (${this.consecutiveTimeouts} consecutive timeouts) — closing socket; extension will auto-reconnect\n`,
+    );
+    try { this.socket?.close(); } catch {}
+  }
+
+  /** Tras reconexión, un health decide si se levanta la degradación. */
+  private probeLinkRecovery(): void {
+    this.sendCommand({ type: 'health' })
+      .then((health) => {
+        this.linkDegraded = false;
+        this.consecutiveTimeouts = 0;
+        this.lastHealthMs = Date.now();
+        const retry = this.lastFailedRetryable ? ` — last retryable command lost: ${this.lastFailedRetryable}` : '';
+        process.stderr.write(
+          `[Yautja] extension link recovered (health ok, pendingHandlers=${health?.pendingHandlers ?? '?'})${retry}\n`,
+        );
+        this.lastFailedRetryable = null;
+      })
+      .catch(() => {
+        // SW todavía colgado: seguimos degradados; los próximos timeouts
+        // (health a 5s) volverán a cerrar el socket hasta que Chrome lo mate.
+        process.stderr.write('[Yautja] extension link still degraded after reconnect (health failed)\n');
+      });
   }
 
   private notifyStatus(status: ExtensionStatus): void {

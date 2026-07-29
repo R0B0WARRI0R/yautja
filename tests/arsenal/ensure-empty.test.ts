@@ -129,6 +129,33 @@ describe('ensureEmpty — script against fake DOM', () => {
     const out = runScript(buildEnsureEmptyScript('#nope', 'auto'), null, () => true);
     expect(out.found).toBe(false);
   });
+
+  it('password input: residual is redacted in-page and flagged sensitive', () => {
+    const el: any = new FakeHTMLInputElement('s3cret-pw');
+    el.type = 'password';
+    const out = runScript(buildEnsureEmptyScript('#pw', 'auto'), el, (e) => { e.value = ''; return true; }, { HTMLInputElement: FakeHTMLInputElement });
+    expect(out.sensitive).toBe(true);
+    expect(out.residual).toBe('[value redacted]');
+    expect(out.residual).not.toContain('s3cret');
+    expect(out.afterClean).toBe(true);
+  });
+
+  it('autocomplete=cc-number input: residual is redacted', () => {
+    const el: any = new FakeHTMLInputElement('4111 1111 1111 1111');
+    el.type = 'text';
+    el.getAttribute = (a: string) => (a === 'autocomplete' ? 'cc-number' : null);
+    const out = runScript(buildEnsureEmptyScript('#cc', 'auto'), el, (e) => { e.value = ''; return true; }, { HTMLInputElement: FakeHTMLInputElement });
+    expect(out.sensitive).toBe(true);
+    expect(out.residual).toBe('[value redacted]');
+  });
+
+  it('non-sensitive input: residual stays in clear and sensitive is false', () => {
+    const el: any = new FakeHTMLInputElement('public text');
+    el.type = 'text';
+    const out = runScript(buildEnsureEmptyScript('#q', 'auto'), el, (e) => { e.value = ''; return true; }, { HTMLInputElement: FakeHTMLInputElement });
+    expect(out.sensitive).toBe(false);
+    expect(out.residual).toBe('public text');
+  });
 });
 
 describe('ensureEmpty — transport wrapper', () => {
@@ -157,5 +184,22 @@ describe('ensureEmpty — transport wrapper', () => {
     expect((await ensureEmpty(t as any, '#x')).found).toBe(false);
     t.responder = () => ({});
     expect((await ensureEmpty(t as any, '#x')).found).toBe(false);
+  });
+
+  it('redacts residual in TS when the script flags sensitive (belt-and-braces)', async () => {
+    const t = new MockTransport();
+    // Even if an old injected script leaked the raw residual with the flag,
+    // the TS boundary must redact it.
+    t.responder = () => ({ result: { value: JSON.stringify({ found: true, wasClean: false, afterClean: true, strategyUsed: 'execCommand', residual: 's3cret-pw', sensitive: true }) } });
+    const r = await ensureEmpty(t as any, '#pw');
+    expect(r.residual).toBe('[value redacted]');
+  });
+
+  it('keeps residual in clear when sensitive flag is absent/false', async () => {
+    const t = new MockTransport();
+    t.responder = () => ({ result: { value: JSON.stringify({ found: true, wasClean: false, afterClean: true, strategyUsed: 'execCommand', residual: 'public', sensitive: false }) } });
+    expect((await ensureEmpty(t as any, '#q')).residual).toBe('public');
+    t.responder = () => ({ result: { value: JSON.stringify({ found: true, wasClean: false, afterClean: true, strategyUsed: 'execCommand', residual: 'legacy' }) } });
+    expect((await ensureEmpty(t as any, '#q')).residual).toBe('legacy');
   });
 });

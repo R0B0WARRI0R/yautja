@@ -143,7 +143,7 @@ export function formatDomain(domain: SensorDomain, state: BrowserState, _budget:
       if (d.interactive.buttons.length > 0) {
         lines.push('Buttons:');
         for (const b of d.interactive.buttons.slice(0, 8)) {
-          if (b.visible) lines.push(`  [${b.tag}] "${b.text}" → ${b.selector.substring(0, 50)}`);
+          if (b.visible) lines.push(`  [${b.tag}] "${b.text}" → ${b.selector.substring(0, 50)}${b.ref ? ` (ref: ${b.ref})` : ''}`);
         }
       }
       break;

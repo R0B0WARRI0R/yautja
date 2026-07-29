@@ -19,7 +19,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { scrubSecrets } from './browser-fetch.js';
 
-export type EvidenceKind = 'browserFetch' | 'intercept' | 'manual';
+export type EvidenceKind = 'browserFetch' | 'intercept' | 'manual' | 'session-recording' | 'screenshot';
 
 export interface EvidenceRecord {
   id: string;

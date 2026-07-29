@@ -247,6 +247,27 @@ export const MVP_CODES: readonly ErrorCodeDef[] = [
     default_recovery_allowed: RECOVERY.reobserve,
     default_recovery_recommended: 'REOBSERVE_THEN_RETRY',
   },
+  // ─── P14.1: session plans + kill switches ──────────────────
+  {
+    code: 'YJ.POLICY.PLAN_NOT_FOUND',
+    introduced_in: '1.7', category: 'policy', severity: 'correctable',
+    retryable: false, default_retry_strategy: 'ABORT',
+    user_confirmation_required: false,
+    default_message_en: 'No pending plan to approve.',
+    default_agent_summary_en: 'Propose a plan first with plan_propose (items + domains + requestedLevel), present it to the user, and only call plan_approve after their explicit approval.',
+    default_recovery_allowed: RECOVERY.abort,
+    default_recovery_recommended: 'ABORT',
+  },
+  {
+    code: 'YJ.POLICY.FEATURE_DISABLED',
+    introduced_in: '1.7', category: 'policy', severity: 'correctable',
+    retryable: false, default_retry_strategy: 'ABORT',
+    user_confirmation_required: false,
+    default_message_en: 'Feature disabled by a kill switch in chrome.storage.local.',
+    default_agent_summary_en: 'The feature is disabled via its kill switch key in chrome.storage.local. Do NOT retry in a loop: ask the user to re-enable it (set the key to true) or use an alternative tool.',
+    default_recovery_allowed: RECOVERY.abort,
+    default_recovery_recommended: 'ABORT',
+  },
   // ─── P16: trusted gestures ─────────────────────────────────
   {
     code: 'YJ.PROTOCOL.CAPABILITY_MISSING',
@@ -257,6 +278,17 @@ export const MVP_CODES: readonly ErrorCodeDef[] = [
     default_agent_summary_en: 'The action requires a capability this backend lacks (e.g. trusted file chooser). Delegate to an alternative backend (e.g. SuperAPI file_upload) or use a human hand-off. Do NOT report fake success.',
     default_recovery_allowed: RECOVERY.abort,
     default_recovery_recommended: 'ABORT',
+  },
+  // ─── Extension link watchdog ───────────────────────────────
+  {
+    code: 'YJ.NET.EXTENSION_LINK_DEGRADED',
+    introduced_in: '1.8', category: 'net', severity: 'recoverable',
+    retryable: true, default_retry_strategy: 'RETRY_SAME',
+    user_confirmation_required: false,
+    default_message_en: 'Extension link degraded: consecutive command timeouts (extension handlers stuck, likely against a busy renderer).',
+    default_agent_summary_en: 'Automatic recovery is in progress (socket closed, extension reconnects, health probe). Retry in a few seconds; do NOT stack commands meanwhile.',
+    default_recovery_allowed: RECOVERY.retrySame,
+    default_recovery_recommended: 'RETRY_SAME',
   },
 ] as const;
 

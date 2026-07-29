@@ -22,7 +22,7 @@ export interface TabServerLike {
   listTabs(): Promise<TabSummary[]>;
   attachTab(tabId: number): Promise<void>;
   detachAll(): Promise<void>;
-  openTab(url: string): Promise<{ tabId: number; url: string }>;
+  openTab(url: string, groupId?: number): Promise<{ tabId: number; url: string }>;
   getCurrentTabId(): number | null;
   send(method: string, params?: Record<string, any>): Promise<any>;
 }
@@ -80,9 +80,9 @@ export class TabRegistry {
    * Open a tab, attach to it, and report the VERIFIED url (location.href
    * after attach) — never the previously active tab's url.
    */
-  async openVerified(url: string, opts?: { settleMs?: number }): Promise<OpenTabVerified> {
+  async openVerified(url: string, opts?: { settleMs?: number; groupId?: number }): Promise<OpenTabVerified> {
     const previousActiveTabId = await this.activeTabId();
-    const opened = await this.server.openTab(url);
+    const opened = await this.server.openTab(url, opts?.groupId);
 
     await sleep(opts?.settleMs ?? 1500); // let the page start loading
 

@@ -36,7 +36,10 @@ export class AudioSensor extends BaseSensor<ConsoleSummary> {
 
   constructor(transport: Transport, config?: Partial<AudioConfig>) {
     super(transport);
-    this.config = { maxEntries: 100, dedupWindowMs: 2000, ...config };
+    // Ring buffer de 500 entradas (tope documentado): histórico suficiente
+    // para read_console_messages sin crecer sin límite; al excederlo se
+    // evictan las más antiguas en addEntry.
+    this.config = { maxEntries: 500, dedupWindowMs: 2000, ...config };
   }
 
   protected doSubscribe(): void {
@@ -123,6 +126,18 @@ export class AudioSensor extends BaseSensor<ConsoleSummary> {
 
   getEntries(): ConsoleEntry[] {
     return [...this.entries];
+  }
+
+  /**
+   * Lectura incremental para read_console_messages: filtra por nivel error
+   * (opcional) y devuelve como mucho las `max` entradas más recientes
+   * (default 100). El buffer es un ring de maxEntries (500 por defecto).
+   */
+  readEntries(opts?: { errorsOnly?: boolean; max?: number }): ConsoleEntry[] {
+    let list = this.entries;
+    if (opts?.errorsOnly) list = list.filter((e) => e.level === 'error');
+    const max = opts?.max ?? 100;
+    return list.slice(-max);
   }
 }
 

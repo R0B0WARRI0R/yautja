@@ -58,10 +58,22 @@ export class MitmProxyServer {
       throw new Error(`Proxy script not found: ${this.scriptPath}`);
     }
 
-    // Check if port is already in use
-    const inUse = await this.isPortInUse(this.port);
-    if (inUse) {
-      throw new Error(`Port ${this.port} already in use`);
+    // Asignación dinámica: si el puerto base está ocupado (otro helmet/proxy
+    // vivo), probar el siguiente hasta 10 candidatos, igual que el WS de la
+    // extensión. Así varias instancias de Kimi conviven sin configuración.
+    const MAX_ATTEMPTS = 10;
+    const basePort = this.port;
+    let chosen = -1;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const candidate = basePort + attempt;
+      if (!(await this.isPortInUse(candidate))) { chosen = candidate; break; }
+    }
+    if (chosen === -1) {
+      throw new Error(`No free proxy port in range ${basePort}..${basePort + MAX_ATTEMPTS - 1}`);
+    }
+    if (chosen !== basePort) {
+      this.port = chosen;
+      process.stderr.write(`[Yautja] Proxy port ${basePort} busy — using ${chosen} instead (auto)\n`);
     }
 
     return new Promise((resolve, reject) => {

@@ -461,4 +461,65 @@ describe('ThermalSensor', () => {
       expect(slow!.data).toMatchObject({ durationMs: 11000 });
     });
   });
+
+  describe('readTransactions', () => {
+    it('urlContains filters by URL substring', () => {
+      transport.emit('Network.requestWillBeSent', req('r1', 'http://a/api/users'));
+      transport.emit('Network.requestWillBeSent', req('r2', 'http://a/static/app.js'));
+      transport.emit('Network.requestWillBeSent', req('r3', 'http://a/api/orders'));
+      const txns = sensor.readTransactions({ urlContains: '/api/' });
+      expect(txns.map((t) => t.id)).toEqual(['r1', 'r3']);
+    });
+
+    it('max returns the most recent N transactions', () => {
+      for (let i = 0; i < 5; i++) {
+        transport.emit('Network.requestWillBeSent', req(`r${i}`, `http://a/${i}`, { timestamp: i + 1 }));
+      }
+      const txns = sensor.readTransactions({ max: 2 });
+      expect(txns.map((t) => t.id)).toEqual(['r3', 'r4']);
+    });
+
+    it('default max is 100', () => {
+      for (let i = 0; i < 150; i++) {
+        transport.emit('Network.requestWillBeSent', req(`r${i}`, `http://a/${i}`, { timestamp: i + 1 }));
+      }
+      const txns = sensor.readTransactions();
+      expect(txns).toHaveLength(100);
+      expect(txns[0]!.id).toBe('r50');
+      expect(txns[99]!.id).toBe('r149');
+    });
+
+    it('filter combines with max', () => {
+      for (let i = 0; i < 6; i++) {
+        transport.emit('Network.requestWillBeSent', req(`r${i}`, `http://a/api/${i}`, { timestamp: i + 1 }));
+      }
+      transport.emit('Network.requestWillBeSent', req('other', 'http://a/static/x', { timestamp: 10 }));
+      const txns = sensor.readTransactions({ urlContains: '/api/', max: 3 });
+      expect(txns.map((t) => t.id)).toEqual(['r3', 'r4', 'r5']);
+    });
+
+    it('does not mutate the buffer (read then read again)', () => {
+      transport.emit('Network.requestWillBeSent', req('r1', 'http://a/1'));
+      expect(sensor.readTransactions()).toHaveLength(1);
+      expect(sensor.readTransactions()).toHaveLength(1);
+    });
+
+    it('clear empties the buffer for incremental reads', () => {
+      transport.emit('Network.requestWillBeSent', req('r1', 'http://a/1'));
+      sensor.clear();
+      expect(sensor.readTransactions()).toHaveLength(0);
+    });
+  });
+
+  describe('ring buffer retention', () => {
+    it('retains 500 transactions by default', () => {
+      for (let i = 0; i < 600; i++) {
+        transport.emit('Network.requestWillBeSent', req(`r${i}`, `http://a/${i}`, { timestamp: i + 1 }));
+      }
+      const txns = sensor.getTransactions();
+      expect(txns).toHaveLength(500);
+      expect(txns[0]!.id).toBe('r100');
+      expect(txns[499]!.id).toBe('r599');
+    });
+  });
 });
