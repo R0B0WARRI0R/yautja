@@ -247,7 +247,9 @@ export class BrokerClient {
     this.heartbeat = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         try {
-          this.ws.send(JSON.stringify({ type: 'ping' }));
+          // Incluir sessionId en el ping para que el broker pueda refrescar
+          // el heartbeat de los grupos de esta sesión.
+          this.ws.send(JSON.stringify({ type: 'ping', sessionId: this.sessionId }));
         } catch {}
       }
     }, HEARTBEAT_INTERVAL_MS);

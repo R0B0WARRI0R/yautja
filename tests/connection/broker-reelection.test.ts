@@ -239,7 +239,7 @@ describe('Reelección de broker (Tanda C)', () => {
     const broker = await makeServer(base, 'sess_broker');
     const client = await makeClient(base, 'sess_g', 555);
     expect(await client.start()).toBe(true);
-    expect((broker as any).sessionGroups.get(555)).toBe('sess_g');
+    expect((broker as any).sessionGroups.get(555).sessionId).toBe('sess_g');
   });
 
   it('resiliencia MV3: la reconexión de la extensión al broker no rompe a los clientes', async () => {

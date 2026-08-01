@@ -163,7 +163,7 @@ describe('Broker namespaces por sesión (Tanda B)', () => {
     await vi.waitFor(() => expect((broker as any).clientSockets.size).toBe(1), { timeout: 2000, interval: 20 });
     // Solo queda registrado el grupo de B (200); el de A se olvidó.
     expect((broker as any).sessionGroups.size).toBe(1);
-    expect((broker as any).sessionGroups.get(200)).toBe('sess_b');
+    expect((broker as any).sessionGroups.get(200).sessionId).toBe('sess_b');
     expect((broker as any).tabToGroup.has(10)).toBe(false);
 
     // …pero tras la muerte de A la tab vuelve a ser "de usuario": permitido.

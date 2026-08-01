@@ -59,6 +59,34 @@ export class TabOwnedByOtherSessionError extends Error {
   }
 }
 
+// ─── Session lifecycle types (heartbeat + TTL) ───────────────────────
+
+/** Una entrada de grupo de sesión con heartbeat para detección de zombis. */
+export interface SessionGroupEntry {
+  sessionId: string;
+  groupId: number;
+  lastHeartbeat: number;
+}
+
+/** Resumen de una sesión del broker para la tool `sessionList`. */
+export interface SessionOverview {
+  sessionId: string;
+  isBroker: boolean;
+  isAlive: boolean;
+  groupIds: number[];
+  tabCount: number;
+  lastSeen: number | null;
+}
+
+/** TTL por defecto: 2 min sin heartbeat = sesión zombie. */
+const DEFAULT_GROUP_TTL_MS = 120_000;
+/** Intervalo del barrido de grupos muertos. */
+const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
+/** TTL por defecto para el watchdog de silencio MCP (5 min). */
+const DEFAULT_MCP_SILENCE_TTL_MS = 300_000;
+/** Intervalo del watchdog de silencio MCP. */
+const DEFAULT_MCP_WATCHDOG_INTERVAL_MS = 30_000;
+
 export interface ExtensionTab {
   tabId: number;
   url: string;
@@ -130,16 +158,39 @@ export class ExtensionServer {
   /** sessionId propio que el BROKER expone a sus clientes en `registered`. */
   private brokerSessionId = 'broker';
   // ─── Namespaces por sesión (Tanda B; solo los usa el BROKER) ──────
-  /** Grupo de tabs → sessionId dueño (broker-session o client). */
-  private sessionGroups: Map<number, string> = new Map();
+  /** Grupo de tabs → entrada con sessionId + heartbeat (broker-session o client). */
+  private sessionGroups: Map<number, SessionGroupEntry> = new Map();
   /** Tab → groupId (sincronizado con listTabs; -1/sin grupo = ausencia). */
   private tabToGroup: Map<number, number> = new Map();
   /** Pares sesión:tab-de-usuario ya auditados (evita spam en stderr). */
   private userTabAudited: Set<string> = new Set();
+  // ─── Heartbeat + TTL (zombie detection) ────────────────────────
+  /** Timer del barrido periódico de grupos sin heartbeat. */
+  private groupSweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** TTL configurable (para tests). */
+  private readonly groupTtlMs: number;
+  /** Intervalo configurable (para tests). */
+  private readonly sweepIntervalMs: number;
+  // ─── MCP silence watchdog ──────────────────────────────────────
+  /** Última vez que se recibió un comando MCP (cualquier tool call). */
+  private mcpLastActivity = Date.now();
+  /** Timer del watchdog de silencio MCP. */
+  private mcpWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+  /** TTL del silencio MCP configurable (para tests). */
+  private readonly mcpSilenceTtlMs: number;
+  /** Si el watchdog ya liberó los grupos (evita repeticiones). */
+  private mcpWatchdogFired = false;
 
-  constructor(port = 9876, maxBufferedEvents = 500) {
+  constructor(port = 9876, maxBufferedEvents = 500, opts?: {
+    groupTtlMs?: number;
+    sweepIntervalMs?: number;
+    mcpSilenceTtlMs?: number;
+  }) {
     this.port = port;
     this.eventBuffer = new RollingBuffer(maxBufferedEvents);
+    this.groupTtlMs = opts?.groupTtlMs ?? DEFAULT_GROUP_TTL_MS;
+    this.sweepIntervalMs = opts?.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
+    this.mcpSilenceTtlMs = opts?.mcpSilenceTtlMs ?? DEFAULT_MCP_SILENCE_TTL_MS;
   }
 
   async start(): Promise<void> {
@@ -288,7 +339,11 @@ export class ExtensionServer {
     // Re-registro tras reelección (Tanda C): el cliente trae su grupo de
     // sesión actual → repoblar sessionGroups de este (nuevo) broker.
     if (typeof groupId === 'number' && groupId >= 0) {
-      this.sessionGroups.set(groupId, sessionId);
+      this.sessionGroups.set(groupId, {
+        sessionId,
+        groupId,
+        lastHeartbeat: Date.now(),
+      });
     }
     socket.on('message', (data) => {
       let msg: any;
@@ -314,6 +369,10 @@ export class ExtensionServer {
   private handleClientMessage(socket: WebSocket, msg: any): void {
     switch (msg?.type) {
       case 'ping':
+        // Refrescar heartbeat si el cliente incluye su sessionId.
+        if (typeof msg.sessionId === 'string' && msg.sessionId) {
+          this.recordHeartbeat(msg.sessionId);
+        }
         if (socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: 'pong' }));
         }
@@ -362,9 +421,9 @@ export class ExtensionServer {
     if (!payload || typeof payload !== 'object') return null;
     // openTab con groupId ajeno → denegar (sin groupId es tab suelta: permitir).
     if (payload.type === 'openTab' && typeof payload.groupId === 'number' && payload.groupId >= 0) {
-      const owner = this.sessionGroups.get(payload.groupId);
-      if (owner !== undefined && owner !== sessionId) {
-        return new TabOwnedByOtherSessionError(`group ${payload.groupId}`, owner);
+      const entry = this.sessionGroups.get(payload.groupId);
+      if (entry !== undefined && entry.sessionId !== sessionId) {
+        return new TabOwnedByOtherSessionError(`group ${payload.groupId}`, entry.sessionId);
       }
     }
     const tabId = typeof payload.tabId === 'number' ? payload.tabId : null;
@@ -378,9 +437,9 @@ export class ExtensionServer {
       }
       return null;
     }
-    const owner = this.sessionGroups.get(groupId);
-    if (owner !== undefined && owner !== sessionId) {
-      return new TabOwnedByOtherSessionError(`tab ${tabId}`, owner);
+    const entry = this.sessionGroups.get(groupId);
+    if (entry !== undefined && entry.sessionId !== sessionId) {
+      return new TabOwnedByOtherSessionError(`tab ${tabId}`, entry.sessionId);
     }
     return null;
   }
@@ -395,8 +454,15 @@ export class ExtensionServer {
       this.syncTabGroups(result.tabs);
     }
     if (!sessionId || !payload || !result) return;
+    // Refresh heartbeat: cualquier comando exitoso de una sesión actualiza
+    // su último heartbeat en todos sus grupos.
+    this.refreshSessionHeartbeat(sessionId);
     if (payload.type === 'sessionGroupCreate' && typeof result.groupId === 'number') {
-      this.sessionGroups.set(result.groupId, sessionId);
+      this.sessionGroups.set(result.groupId, {
+        sessionId,
+        groupId: result.groupId,
+        lastHeartbeat: Date.now(),
+      });
       if (typeof result.tabId === 'number') {
         this.tabToGroup.set(result.tabId, result.groupId);
       }
@@ -433,14 +499,169 @@ export class ExtensionServer {
    */
   private forgetSessionGroups(sessionId: string): void {
     const ownedGroups = new Set<number>();
-    for (const [groupId, owner] of this.sessionGroups) {
-      if (owner === sessionId) ownedGroups.add(groupId);
+    for (const [groupId, entry] of this.sessionGroups) {
+      if (entry.sessionId === sessionId) ownedGroups.add(groupId);
     }
     if (ownedGroups.size === 0) return;
     for (const groupId of ownedGroups) this.sessionGroups.delete(groupId);
     for (const [tabId, groupId] of Array.from(this.tabToGroup)) {
       if (ownedGroups.has(groupId)) this.tabToGroup.delete(tabId);
     }
+  }
+
+  // ─── Heartbeat + TTL: zombie detection API ────────────────────────
+
+  /** Refresca el heartbeat de todos los grupos de una sesión. */
+  refreshSessionHeartbeat(sessionId: string): void {
+    const now = Date.now();
+    for (const [, entry] of this.sessionGroups) {
+      if (entry.sessionId === sessionId) {
+        entry.lastHeartbeat = now;
+      }
+    }
+  }
+
+  /** Recibe un heartbeat de un cliente (ping/pong con sessionId). */
+  recordHeartbeat(sessionId: string): void {
+    this.refreshSessionHeartbeat(sessionId);
+  }
+
+  /** Inicia el barrido periódico de grupos sin heartbeat. */
+  startGroupSweep(): void {
+    if (this.groupSweepTimer) return;
+    this.groupSweepTimer = setInterval(
+      () => this.sweepDeadGroups(),
+      this.sweepIntervalMs,
+    );
+    this.groupSweepTimer.unref?.();
+  }
+
+  /** Barrido: elimina grupos cuyo heartbeat expiró. Devuelve cuántos limpió. */
+  sweepDeadGroups(): number {
+    const now = Date.now();
+    const dead: number[] = [];
+    for (const [groupId, entry] of this.sessionGroups) {
+      if (now - entry.lastHeartbeat > this.groupTtlMs) {
+        dead.push(groupId);
+      }
+    }
+    for (const groupId of dead) {
+      const entry = this.sessionGroups.get(groupId)!;
+      this.sessionGroups.delete(groupId);
+      for (const [tabId, gid] of this.tabToGroup) {
+        if (gid === groupId) this.tabToGroup.delete(tabId);
+      }
+      process.stderr.write(
+        `[broker] group ${groupId} expired (session ${entry.sessionId} silent >${this.groupTtlMs / 1000}s)\n`,
+      );
+    }
+    return dead.length;
+  }
+
+  // ─── MCP silence watchdog ──────────────────────────────────────────
+
+  /** Marca actividad MCP (llamar en cada tool call). */
+  markMcpActivity(): void {
+    this.mcpLastActivity = Date.now();
+    this.mcpWatchdogFired = false;
+  }
+
+  /** Inicia el watchdog de silencio MCP. */
+  startMcpWatchdog(): void {
+    if (this.mcpWatchdogTimer) return;
+    this.mcpLastActivity = Date.now();
+    this.mcpWatchdogTimer = setInterval(
+      () => this.checkMcpSilence(),
+      DEFAULT_MCP_WATCHDOG_INTERVAL_MS,
+    );
+    this.mcpWatchdogTimer.unref?.();
+  }
+
+  /** Si el MCP lleva demasiado silencioso, libera los grupos del broker-session. */
+  private checkMcpSilence(): void {
+    if (this.mcpWatchdogFired) return;
+    if (Date.now() - this.mcpLastActivity > this.mcpSilenceTtlMs) {
+      process.stderr.write(
+        `[broker] MCP silence >${this.mcpSilenceTtlMs / 1000}s — releasing broker-session groups\n`,
+      );
+      this.forgetSessionGroups(this.brokerSessionId);
+      this.mcpWatchdogFired = true;
+    }
+  }
+
+  // ─── Session management API (sessionList + sessionDestroy) ─────────
+
+  /** Lista todas las sesiones conocidas (vivas, zombis, broker). */
+  getSessionOverview(): SessionOverview[] {
+    const result: SessionOverview[] = [];
+    const seen = new Set<string>();
+
+    // Broker session
+    const brokerGroups = [...this.sessionGroups]
+      .filter(([, e]) => e.sessionId === this.brokerSessionId)
+      .map(([gid]) => gid);
+    const brokerAlive = this.socket !== null && this.socket.readyState === WebSocket.OPEN;
+    result.push({
+      sessionId: this.brokerSessionId,
+      isBroker: true,
+      isAlive: brokerAlive,
+      groupIds: brokerGroups,
+      tabCount: brokerGroups.reduce((n, gid) =>
+        n + [...this.tabToGroup.values()].filter(v => v === gid).length, 0),
+      lastSeen: brokerAlive ? Date.now() : null,
+    });
+    seen.add(this.brokerSessionId);
+
+    // Client sessions
+    for (const [sessionId, socket] of this.clientSockets) {
+      const alive = socket.readyState === WebSocket.OPEN;
+      const groups = [...this.sessionGroups]
+        .filter(([, e]) => e.sessionId === sessionId)
+        .map(([gid]) => gid);
+      result.push({
+        sessionId,
+        isBroker: false,
+        isAlive: alive,
+        groupIds: groups,
+        tabCount: groups.reduce((n, gid) =>
+          n + [...this.tabToGroup.values()].filter(v => v === gid).length, 0),
+        lastSeen: alive ? Date.now() : null,
+      });
+      seen.add(sessionId);
+    }
+
+    // Dead sessions (en sessionGroups pero sin socket)
+    for (const [, entry] of this.sessionGroups) {
+      if (!seen.has(entry.sessionId)) {
+        const groups = [...this.sessionGroups]
+          .filter(([, e]) => e.sessionId === entry.sessionId)
+          .map(([gid]) => gid);
+        result.push({
+          sessionId: entry.sessionId,
+          isBroker: false,
+          isAlive: false,
+          groupIds: groups,
+          tabCount: 0,
+          lastSeen: entry.lastHeartbeat || null,
+        });
+        seen.add(entry.sessionId);
+      }
+    }
+
+    return result;
+  }
+
+  /** Fuerza el cleanup de una sesión: libera grupos + cierra socket. */
+  forceForgetSession(sessionId: string): boolean {
+    const before = this.sessionGroups.size;
+    this.forgetSessionGroups(sessionId);
+    const socket = this.clientSockets.get(sessionId);
+    if (socket) {
+      try { socket.close(4003, 'session destroyed by admin'); } catch {}
+      this.clientSockets.delete(sessionId);
+    }
+    const after = this.sessionGroups.size;
+    return after < before;
   }
 
   /**
@@ -457,8 +678,8 @@ export class ExtensionServer {
     const groupId = this.tabToGroup.get(tabId);
     if (groupId === undefined) return;
     const owner = this.sessionGroups.get(groupId);
-    if (owner === undefined || owner === this.brokerSessionId) return;
-    const client = this.clientSockets.get(owner);
+    if (owner === undefined || owner.sessionId === this.brokerSessionId) return;
+    const client = this.clientSockets.get(owner.sessionId);
     if (client && client.readyState === WebSocket.OPEN) {
       try {
         client.send(JSON.stringify({ type: 'clientEvent', payload: msg }));
@@ -481,6 +702,11 @@ export class ExtensionServer {
   /** sessionId que este helmet (BROKER) expone a sus clientes. */
   setBrokerSessionId(sessionId: string): void {
     this.brokerSessionId = sessionId;
+  }
+
+  /** Devuelve el brokerSessionId (para cleanup desde helmet.ts). */
+  getBrokerSessionId(): string {
+    return this.brokerSessionId;
   }
 
   /** Evento reenviado por el broker: se inyecta en el pipeline local de eventos. */
@@ -520,6 +746,15 @@ export class ExtensionServer {
     this.sessionGroups.clear();
     this.tabToGroup.clear();
     this.userTabAudited.clear();
+    // Limpiar timers de heartbeat/TTL y watchdog MCP.
+    if (this.groupSweepTimer) {
+      clearInterval(this.groupSweepTimer);
+      this.groupSweepTimer = null;
+    }
+    if (this.mcpWatchdogTimer) {
+      clearInterval(this.mcpWatchdogTimer);
+      this.mcpWatchdogTimer = null;
+    }
   }
 
   isExtensionConnected(): boolean {
@@ -601,7 +836,11 @@ export class ExtensionServer {
     // Ejecución local (broker/standalone): registrar el grupo para la
     // broker-session. En modo CLIENT lo registra el broker vía trackClientCommand.
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-      this.sessionGroups.set(result.groupId, this.brokerSessionId);
+      this.sessionGroups.set(result.groupId, {
+        sessionId: this.brokerSessionId,
+        groupId: result.groupId,
+        lastHeartbeat: Date.now(),
+      });
       if (typeof result.tabId === 'number') {
         this.tabToGroup.set(result.tabId, result.groupId);
       }
@@ -909,6 +1148,8 @@ export class ExtensionServer {
   }
 
   private sendCommand(msg: any, timeoutMs?: number): Promise<any> {
+    // Cualquier comando (local o reenviado) cuenta como actividad MCP.
+    this.markMcpActivity();
     // Routing transparente (Tanda A): sin extensión local, un CLIENT registrado
     // reenvía el comando al broker (+5s de margen sobre su propio timeout).
     if ((!this.socket || this.socket.readyState !== WebSocket.OPEN) && this.brokerClient) {

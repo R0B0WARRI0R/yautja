@@ -340,6 +340,11 @@ export class Helmet {
     // El sessionId propio se expone siempre: en `registered` (como broker) y
     // en las respuestas brokerInfo del discovery (Tanda C).
     this.server.setBrokerSessionId(this.sessionId);
+
+    // Iniciar heartbeat sweep y MCP silence watchdog (zombie detection).
+    this.server.startGroupSweep?.();
+    this.server.startMcpWatchdog?.();
+
     if (this.server.getPort() === this.config.port) {
       process.stderr.write(`[Yautja] multi-instance role=broker (port ${this.server.getPort()}, session ${this.sessionId})\n`);
     } else {
@@ -642,6 +647,15 @@ export class Helmet {
     rl.on('close', () => {
       const force = setTimeout(() => process.exit(0), 3000);
       force.unref();
+
+      // Cleanup proactivo (Solución 3): liberar los grupos de la broker-session
+      // ANTES de morir, para que la próxima sesión no los encuentre secuestrados.
+      // Solo si somos broker (el server tiene los sessionGroups).
+      const brokerSessionId = this.server.getBrokerSessionId?.();
+      if (brokerSessionId) {
+        this.server.forceForgetSession?.(brokerSessionId);
+      }
+
       this.stop()
         .catch(() => {})
         .finally(() => process.exit(0));
@@ -740,6 +754,8 @@ export class Helmet {
   }
 
   private async handleToolCall(name: string, args: any): Promise<YautjaResponse<unknown>> {
+    // Cualquier tool call cuenta como actividad MCP para el watchdog.
+    this.server.markMcpActivity?.();
     switch (name) {
       case 'observe': {
         const { text, state } = await this.observeCore(args.question || 'overview');
@@ -1695,6 +1711,32 @@ export class Helmet {
             message: err instanceof Error ? err.message : String(err),
           }));
         }
+      }
+      case 'sessionList': {
+        const sessions = this.server.getSessionOverview?.() ?? [];
+        return this.nativeSuccess('sessionList', args, { sessions, count: sessions.length });
+      }
+      case 'sessionDestroy': {
+        const sessionId = args.sessionId as string;
+        if (!sessionId || typeof sessionId !== 'string') {
+          return this.nativeFailure('sessionDestroy', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: 'sessionId required (string)',
+          }));
+        }
+        // Proteger la sesión actual de auto-destrucción accidental.
+        if (sessionId === this.sessionId) {
+          return this.nativeFailure('sessionDestroy', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: 'Cannot destroy your own active session. Use a different sessionId.',
+          }));
+        }
+        const released = this.server.forceForgetSession?.(sessionId) ?? false;
+        return this.nativeSuccess('sessionDestroy', args, {
+          sessionId,
+          released,
+          message: released
+            ? `Session ${sessionId} groups released and socket closed`
+            : `Session ${sessionId} had no groups to release (already clean or unknown)`,
+        });
       }
       case 'session_summary': {
         // T14B: resumen compacto de la sesión para el LLM cliente.
@@ -3476,6 +3518,22 @@ const MCP_TOOLS = [
       properties: {
         maxChars: { type: 'number', description: 'Max size of the summary JSON in chars (default 4000)' },
       },
+    },
+  },
+  {
+    name: 'sessionList',
+    description: 'List all broker sessions (alive, zombie, broker) with their tab groups. Use to diagnose TabOwnedByOtherSessionError or find zombie sessions holding tabs hostage.',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'sessionDestroy',
+    description: 'Force-destroy a session: release its tab groups and close its socket. The nuclear option for zombie sessions that block tab access. Cannot destroy your own active session.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        sessionId: { type: 'string', description: 'Session ID to destroy (from sessionList)' },
+      },
+      required: ['sessionId'],
     },
   },
   // ─── Extension inspection tools ───────────────────────────────────
