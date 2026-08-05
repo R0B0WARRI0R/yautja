@@ -22,6 +22,11 @@ describe('SiteProfileSchema', () => {
       expect(parsed.data.id).toBe('perplexity');
       expect(parsed.data.rules.intercept).toBe('forbid');
       expect(parsed.data.preFlight).toHaveLength(2);
+      const readyAllOf = parsed.data.waitDefaults.ready.allOf ?? [];
+      const submit = readyAllOf.find((p: any) => p.type === 'submitState');
+      expect(submit).toBeDefined();
+      expect(submit.state).toBe('idle');
+      expect(submit.signals).toEqual([{ kind: 'ariaLabel', value: 'Enviar' }]);
     }
   });
 

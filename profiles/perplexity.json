@@ -1,6 +1,6 @@
 {
   "id": "perplexity",
-  "version": 1,
+  "version": 2,
   "match": {
     "hosts": ["www.perplexity.ai", "perplexity.ai"]
   },
@@ -34,7 +34,15 @@
     "ready": {
       "allOf": [
         { "type": "ariaBusy", "value": false },
-        { "type": "noPulse", "root": "main" }
+        { "type": "noPulse", "root": "main" },
+        {
+          "type": "submitState",
+          "selector": "button[aria-label=\"Enviar\"], button[aria-label=\"Pausar\"]",
+          "state": "idle",
+          "signals": [
+            { "kind": "ariaLabel", "value": "Enviar" }
+          ]
+        }
       ]
     }
   },
