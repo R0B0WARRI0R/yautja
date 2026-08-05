@@ -26,6 +26,13 @@ export interface StreamWatchState {
   lastChangeAt: number;
 }
 
+/**
+ * Flag tal como viaja por el wire (Runtime.evaluate over IPC): `lastChangeAt`
+ * es estado interno del reducer y nunca se envía. El parser devuelve este
+ * tipo; el reducer en página lo conserva en `state` pero no lo expone.
+ */
+export type WireStreamWatchState = Omit<StreamWatchState, 'lastChangeAt'>;
+
 /** Estado inicial del observador. */
 export const STREAM_WATCH_INITIAL: StreamWatchState = {
   armed: false,
@@ -139,14 +146,14 @@ export function buildStreamWatchScript(opts: StreamWatchOptions): string {
 /** Expresión de lectura del flag (barata, no snapshot). */
 export const STREAM_WATCH_READ_EXPR = `(() => { const s = window.${STREAM_WATCH_KEY}; if (!s) return null; return { armed: !!s.armed, done: !!s.done, textLength: typeof s.textLength === 'number' ? s.textLength : 0 }; })()`;
 
-/** Parser tolerante del flag (mismo estilo que parseStripResult). */
-export function parseStreamWatchState(raw: unknown): StreamWatchState | null {
+/** Parser tolerante del flag (mismo estilo que parseStripResult).
+ *  Devuelve `WireStreamWatchState` — el timestamp interno no viaja. */
+export function parseStreamWatchState(raw: unknown): WireStreamWatchState | null {
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, any>;
   return {
     armed: r.armed === true,
     done: r.done === true,
     textLength: typeof r.textLength === 'number' ? r.textLength : 0,
-    lastChangeAt: 0,
   };
 }

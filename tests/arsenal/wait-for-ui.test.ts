@@ -286,6 +286,40 @@ describe('waitForUi', () => {
     expect(installs).toBe(1);
   });
 
+  it('streamSettled waits across the initial-state arm after install', async () => {
+    // I4: explicit path: install returns the initial-state snapshot
+    // (armed:false, done:false), the motor commits installed=true and the
+    // next reads pick up the real transitions until done=true.
+    let installs = 0;
+    let readIdx = 0;
+    const reads = [
+      { armed: true, done: false, textLength: 8 },   // arma pero aún no termina
+      { armed: true, done: false, textLength: 14 },  // sigue streameando
+      { armed: true, done: true, textLength: 32 },   // termina
+    ];
+    const t = new MockTransport();
+    t.handler = (method, params) => {
+      if (method !== 'Runtime.evaluate') return {};
+      const expr: string = params?.expression ?? '';
+      if (expr.includes('MutationObserver')) {
+        installs++;
+        return { result: { value: { armed: false, done: false, textLength: 0 } } };
+      }
+      if (expr.includes('const s = window.__yautjaStream')) {
+        const v = reads[Math.min(readIdx, reads.length - 1)];
+        readIdx++;
+        return { result: { value: v } };
+      }
+      return { result: { value: undefined } };
+    };
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'streamSettled', selector: '#answer', silenceMs: 300, minLength: 5 }],
+      timeoutMs: 1500, pollMs: 15,
+    });
+    expect(r.matched).toBe('anyOf');
+    expect(installs).toBe(1);
+  });
+
   it('streamSettled does not match while the page flag reports done:false', async () => {
     const t = transportMatching([['MutationObserver', () => ({ armed: false, done: false, textLength: 0 })], ['const s = window.__yautjaStream', () => ({ armed: true, done: false, textLength: 128 })]]);
     const r = await waitForUi({ transport: t }, {

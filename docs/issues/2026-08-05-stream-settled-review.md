@@ -2,8 +2,8 @@
 
 **Fecha:** 2026-08-05
 **Origen:** review crítica del trabajo de la sesión
-(commits `67943fc`, `825c090`, `37a66c3`, `f9aa9d7`, `2381a19`).
-**Estado:** Issue abierta. No priorizada por ahora.
+(commits `67943fc`, `825c090`, `37a66c3`, `f9aa9d7`, `2381a19`, …).
+**Estado:** Issue abierta. C2, I3 e I4 cerrados (commits posteriores). I1 re-bajada a nice-to-have no funcional. I2 queda como deuda viva.
 
 ## Contexto
 
@@ -13,63 +13,64 @@ identificaron los siguientes puntos. Algunos se arreglaron (C1, C3)
 y se commitean en `2381a19`. El resto quedan aquí como deuda
 técnica viva.
 
-## Críticos pendientes
+## Críticos
 
-### C2 — Guard de idempotencia con configs distintas
+### C2 — Guard de idempotencia con configs distintas ✅ (commit `76829c5`)
 
-**Archivo:** `src/arsenal/watch-stream.ts:72`
+Antes:
 
 ```js
 if (window.__yautjaStreamObs) return window[KEY] || null;
 ```
 
-Si el script se ha inyectado antes con otra `selector`/`silenceMs`,
-el guard devuelve el estado del observer anterior e ignora la
-configuración nueva. En SPAs con navegación interna esto puede
-producir falsos `done` con la config antigua.
+Si el script se había inyectado antes con otra `selector`/`silenceMs`,
+el guard devolvía el estado del observer anterior e ignoraba la
+configuración nueva. En SPAs con navegación interna podía producir
+falsos `done` con la config rota.
 
-**Sugerencia:** invalidar el guard cuando la `CFG` no coincida con
-una marca de versión (e.g., `window.__yautjaStreamCfg`), o al menos
-loggear un WARN. Añadir test que cubra: "segunda inyección con
-distinta config no devuelve estado viejo".
+Ahora `buildStreamWatchScript` firma la CFG en
+`window.__yautjaStreamCfg` y desconecta el observer viejo
+(`try/catch`) cuando la nueva CFG difiere. Helper puro
+`shouldReinstall` exportado, embebido vía `.toString()` en el
+script in-page y testeable en Node. Tres tests unitarios del
+helper y dos tests de integración del motor.
 
 ## Importantes
 
-### I1 — Inconsistencia de idioma en `watch-stream.ts`
+### I1 — Inconsistencia de idioma en `watch-stream.ts` ⏬ nice-to-have
 
-`wait-for-ui.ts:1-19` y el resto del arsenal están en inglés.
-`watch-stream.ts:1-14` mezcla español. Decidir convención del
-repo y traducir todo el módulo al idioma consistente.
+Re-bajado. Inspección del repo (`grep -E '//|/\*'` en `src/arsenal/`)
+muestra que el español coexiste con inglés en muchos archivos
+(strip-interference.ts, kill-switch.ts, translator.ts). El nuevo
+módulo en español encaja con al menos uno de los pares más
+cercanos (`strip-interference.ts`). No es funcional; queda como
+decisión estilística pendiente.
 
-### I2 — Mensaje genérico tras fallo permanente de install
+### I2 — Mensaje genérico tras fallo permanente de install ⚠️ deuda viva
 
 `wait-for-ui.ts` case `streamSettled`: cuando el script de install
 nunca puede inyectarse, el motor termina en `WAIT_TIMEOUT` con el
-mensaje existente `'waitFor predicates not met after submit'` desde
-`helmet.ts:1324`. No diferencia "selector nunca apareció" de "el
-stream no empezó". Considerar un mensaje dedicado a predicados
-`streamSettled` o un campo `lastReason` en `WaitForUiResult`.
+mensaje existente desde `helmet.ts:1324`. No diferencia
+"selector nunca apareció" de "el stream no empezó".
 
-### I3 — `parseStreamWatchState` siempre `lastChangeAt: 0`
+**Estado:** queda abierta. Tocar este punto requiere editar
+`src/helmet.ts` y posiblemente `src/arsenal/translator.ts`, que
+tienen WIP del usuario sin commitear.
 
-La interfaz `StreamWatchState` declara `lastChangeAt`, pero por el
-wire no viaja (es estado interno). Quien consuma el parser puede
-confundirse si espera un timestamp real. Sugerencia:
+### I3 — `parseStreamWatchState` siempre `lastChangeAt: 0` ✅
 
-```ts
-export type WireStreamState = Omit<StreamWatchState, 'lastChangeAt'>;
-```
+Cerrado: nuevo tipo `WireStreamWatchState = Omit<StreamWatchState, 'lastChangeAt'>`
+publicado y devuelto por el parser. El reducer interno sigue usando
+`StreamWatchState` con `lastChangeAt`; el wire solo ve el subtipo
+limpio.
 
-O documentar la asimetría en el JSDoc.
+### I4 — No hay test de "install devuelve estado inicial" ✅
 
-### I4 — No hay test de "install devuelve estado inicial"
-
-El test "streamSettled installs the observer once" cubre el camino
-de éxito, pero no prueba explícitamente que cuando la install
-devuelve `{ armed:false, done:false }` (estado inicial real), el
-motor fija `installed = true` y luego entra al loop de lecturas del
-flag. Test sencillo: simular `MutationObserver` devuelve el
-snapshot inicial, asegurar match.
+Test nuevo en `wait-for-ui.test.ts` (`'streamSettled waits across
+the initial-state arm after install'`): simula la install con
+snapshot inicial `{ armed:false, done:false }` y tres lecturas que
+transicionan hasta `done:true`. Assert `installs === 1` y
+`matched: 'anyOf'`.
 
 ## Menores
 
@@ -87,8 +88,12 @@ exportar marcadores (`STREAM_WATCH_INSTALL_MARKER`,
 `STREAM_WATCH_READ_MARKER`) desde `watch-stream.ts` y reusarlos
 en tests.
 
-## Veredicto
+## Veredicto actualizado
 
-El núcleo funciona y los tests son razonables. La deuda viva es
-principalmente observabilidad (I2), consistencia (I1) y seguridad
-contra el footgun del guard (C2).
+Cerrado: C2, I3, I4 (todos con commits propios).
+Deuda viva: **solo I2**, y esa requiere editar archivos que el
+usuario tiene como WIP sin commitear.
+
+El núcleo funciona; los tests cubren idle/transitions/initial-arm/
+reinstall-on-config-change. No hay deuda técnica activa que valga
+la pena otra ronda.
