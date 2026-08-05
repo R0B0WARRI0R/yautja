@@ -16,7 +16,12 @@
  *     `quietMs`. Without a `getPendingRequests` provider (translator
  *     legacy path) it degrades to a plain quietMs sleep — same behavior as
  *     the old stub, but explicit and documented.
+ *   - streamSettled (P17 fase A) installs a 2-phase MutationObserver in the
+ *     page ONCE (watch-stream.ts) and then only reads its published flag —
+ *     the "stream finished" signal at zero per-poll snapshot cost.
  */
+
+import { buildStreamWatchScript, STREAM_WATCH_READ_EXPR, parseStreamWatchState } from './watch-stream.js';
 
 export interface Transport {
   send(method: string, params?: Record<string, any>): Promise<any>;
@@ -35,6 +40,7 @@ export type WaitPredicate =
   | { type: 'noPulse'; root?: string }
   | { type: 'networkIdle'; quietMs: number }
   | { type: 'textSettled'; selector: string; stableMs: number; minLength?: number }
+  | { type: 'streamSettled'; selector: string; silenceMs: number; minLength?: number }
   | { type: 'fn'; expression: string }
   | { type: 'timeout'; ms: number }
   | {
@@ -165,6 +171,27 @@ function buildChecker(pred: WaitPredicate, deps: WaitForUiDeps, start: number): 
       return async () => {
         if (firedAt === 0) firedAt = Date.now() + pred.ms;
         return Date.now() >= firedAt;
+      };
+    }
+    case 'streamSettled': {
+      const installScript = buildStreamWatchScript({
+        selector: pred.selector,
+        silenceMs: pred.silenceMs,
+        minLength: pred.minLength,
+      });
+      let installed = false;
+      return async () => {
+        if (!installed) {
+          // Install once: on success the page keeps its own observer running
+          // and publishing to window.__yautjaStream; on failure (page not
+          // ready yet) we retry on the next poll.
+          const v = await evaluate(deps, installScript);
+          if (!v || typeof v !== 'object') return false;
+          installed = true;
+        }
+        const flag = await evaluate(deps, STREAM_WATCH_READ_EXPR);
+        const st = parseStreamWatchState(flag);
+        return !!st && st.armed && st.done;
       };
     }
     case 'submitState': {

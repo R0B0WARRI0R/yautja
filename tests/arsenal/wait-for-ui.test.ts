@@ -262,4 +262,45 @@ describe('waitForUi', () => {
     });
     expect(r.matched).toBe('timeout');
   });
+
+  it('streamSettled installs the observer once, then matches on the page flag', async () => {
+    let installs = 0;
+    const t = new MockTransport();
+    t.handler = (method, params) => {
+      if (method !== 'Runtime.evaluate') return {};
+      const expr: string = params?.expression ?? '';
+      if (expr.includes('MutationObserver')) {
+        installs++;
+        return { result: { value: { armed: false, done: false, textLength: 0 } } };
+      }
+      if (expr.includes('const s = window.__yautjaStream')) {
+        return { result: { value: { armed: true, done: true, textLength: 512 } } };
+      }
+      return { result: { value: undefined } };
+    };
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'streamSettled', selector: '#answer', silenceMs: 400 }],
+      ...FAST,
+    });
+    expect(r.matched).toBe('anyOf');
+    expect(installs).toBe(1);
+  });
+
+  it('streamSettled does not match while the page flag reports done:false', async () => {
+    const t = transportMatching([['MutationObserver', () => ({ armed: false, done: false, textLength: 0 })], ['const s = window.__yautjaStream', () => ({ armed: true, done: false, textLength: 128 })]]);
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'streamSettled', selector: '#answer', silenceMs: 300, minLength: 10 }],
+      timeoutMs: 150, pollMs: 15,
+    });
+    expect(r.matched).toBe('timeout');
+  });
+
+  it('streamSettled retries installation while the page is not ready', async () => {
+    const t = transportMatching([['MutationObserver', () => undefined]]);
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'streamSettled', selector: '#answer', silenceMs: 200 }],
+      timeoutMs: 150, pollMs: 15,
+    });
+    expect(r.matched).toBe('timeout');
+  });
 });
