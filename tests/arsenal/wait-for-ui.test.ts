@@ -320,6 +320,43 @@ describe('waitForUi', () => {
     expect(installs).toBe(1);
   });
 
+  it('streamSettled timeout carries failureReason with last flag observed', async () => {
+    // I2 (Opción A): when the predicate times out, the result surfaces the
+    // last flag read (or null if the page never published one) and the
+    // configured selector. Enables helmet to give a useful diagnostic
+    // without touching the WIP'd helmet.ts code.
+    const t = transportMatching([
+      ['MutationObserver', () => ({ armed: false, done: false, textLength: 0 })],
+      ['const s = window.__yautjaStream', () => ({ armed: true, done: false, textLength: 42 })],
+    ]);
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'streamSettled', selector: '#answer', silenceMs: 300, minLength: 5 }],
+      timeoutMs: 80, pollMs: 15,
+    });
+    expect(r.matched).toBe('timeout');
+    expect(r.failureReason).toEqual({
+      kind: 'streamSettled',
+      selector: '#answer',
+      lastFlag: { armed: true, done: false, textLength: 42 },
+      lastInstallFailed: false,
+    });
+  });
+
+  it('streamSettled timeout reports lastInstallFailed when the page never accepts the script', async () => {
+    const t = transportMatching([['MutationObserver', () => undefined]]);
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'streamSettled', selector: '#answer', silenceMs: 200 }],
+      timeoutMs: 80, pollMs: 15,
+    });
+    expect(r.matched).toBe('timeout');
+    expect(r.failureReason).toEqual({
+      kind: 'streamSettled',
+      selector: '#answer',
+      lastFlag: null,
+      lastInstallFailed: true,
+    });
+  });
+
   it('streamSettled does not match while the page flag reports done:false', async () => {
     const t = transportMatching([['MutationObserver', () => ({ armed: false, done: false, textLength: 0 })], ['const s = window.__yautjaStream', () => ({ armed: true, done: false, textLength: 128 })]]);
     const r = await waitForUi({ transport: t }, {

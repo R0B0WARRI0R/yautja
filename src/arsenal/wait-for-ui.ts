@@ -68,6 +68,19 @@ export interface WaitForUiResult {
   matched: 'anyOf' | 'allOf' | 'timeout';
   which?: number;
   elapsedMs: number;
+  /**
+   * Optional diagnostic for timeouts. Populated by predicates that can
+   * distinguish between failure modes (e.g., install never returned a
+   * valid payload vs. selector appeared but stream never settled). Lets
+   * callers (helmet waitFor / smartType waitReady) build informative
+   * error messages without the motor having to swallow the detail.
+   */
+  failureReason?: {
+    kind: 'streamSettled' | string;
+    selector?: string;
+    lastFlag?: { armed: boolean; done: boolean; textLength: number } | null;
+    lastInstallFailed?: boolean;
+  };
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -79,6 +92,10 @@ function sleep(ms: number): Promise<void> {
 
 type Checker = () => Promise<boolean>;
 
+interface FailureReasonRef {
+  value: WaitForUiResult['failureReason'] | undefined;
+}
+
 async function evaluate(deps: WaitForUiDeps, expression: string): Promise<any> {
   try {
     const r = await deps.transport.send('Runtime.evaluate', { expression, returnByValue: true });
@@ -88,7 +105,12 @@ async function evaluate(deps: WaitForUiDeps, expression: string): Promise<any> {
   }
 }
 
-function buildChecker(pred: WaitPredicate, deps: WaitForUiDeps, start: number): Checker {
+function buildChecker(
+  pred: WaitPredicate,
+  deps: WaitForUiDeps,
+  start: number,
+  failureRef: FailureReasonRef,
+): Checker {
   switch (pred.type) {
     case 'selector': {
       const state = pred.state ?? 'visible';
@@ -182,17 +204,33 @@ function buildChecker(pred: WaitPredicate, deps: WaitForUiDeps, start: number): 
         minLength: pred.minLength,
       });
       let installed = false;
+      let lastInstallFailed = true;     // assume failure until proven otherwise
+      let lastFlag: { armed: boolean; done: boolean; textLength: number } | null = null;
+      const commitFailure = () => {
+        failureRef.value = {
+          kind: 'streamSettled',
+          selector: pred.selector,
+          lastFlag,
+          lastInstallFailed,
+        };
+      };
       return async () => {
         if (!installed) {
           // Install once: on success the page keeps its own observer running
           // and publishing to window.__yautjaStream; on failure (page not
           // ready yet) we retry on the next poll.
           const v = await evaluate(deps, installScript);
-          if (!v || typeof v !== 'object') return false;
+          if (!v || typeof v !== 'object') { lastInstallFailed = true; commitFailure(); return false; }
+          lastInstallFailed = false;
           installed = true;
         }
         const flag = await evaluate(deps, STREAM_WATCH_READ_EXPR);
         const st = parseStreamWatchState(flag);
+        lastFlag = st ? { armed: st.armed, done: st.done, textLength: st.textLength } : null;
+        // Always surface the latest snapshot so a final timeout carries the
+        // most recent view the page published — even when `armed && done`
+        // never became true. Failure-mode distinguishability is the point.
+        commitFailure();
         return !!st && st.armed && st.done;
       };
     }
@@ -221,9 +259,10 @@ export async function waitForUi(deps: WaitForUiDeps, opts: WaitForUiOptions): Pr
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const pollMs = opts.pollMs ?? DEFAULT_POLL_MS;
   const deadline = start + timeoutMs;
+  const failureRef: FailureReasonRef = { value: undefined };
 
-  const allOf = (opts.allOf ?? []).map((p) => buildChecker(p, deps, start));
-  const anyOf = (opts.anyOf ?? []).map((p) => buildChecker(p, deps, start));
+  const allOf = (opts.allOf ?? []).map((p) => buildChecker(p, deps, start, failureRef));
+  const anyOf = (opts.anyOf ?? []).map((p) => buildChecker(p, deps, start, failureRef));
 
   // Vacuous case: no predicates → nothing to wait for.
   if (allOf.length === 0 && anyOf.length === 0) {
@@ -245,5 +284,5 @@ export async function waitForUi(deps: WaitForUiDeps, opts: WaitForUiOptions): Pr
     }
     await sleep(pollMs);
   }
-  return { matched: 'timeout', elapsedMs: Date.now() - start };
+  return { matched: 'timeout', elapsedMs: Date.now() - start, failureReason: failureRef.value };
 }
