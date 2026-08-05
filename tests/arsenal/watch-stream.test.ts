@@ -3,6 +3,7 @@ import {
   computeStreamTick,
   buildStreamWatchScript,
   parseStreamWatchState,
+  shouldReinstall,
   STREAM_WATCH_INITIAL,
   STREAM_WATCH_KEY,
 } from '../../src/arsenal/watch-stream.js';
@@ -60,9 +61,27 @@ describe('buildStreamWatchScript', () => {
     expect(script).toContain('document.body');
   });
 
-  it('is idempotent via the observer guard', () => {
+  it('is idempotent via the observer guard, and forces reinstall on config change', () => {
     const script = buildStreamWatchScript({ selector: '#answer', silenceMs: 400 });
     expect(script).toContain('__yautjaStreamObs');
+    expect(script).toContain('__yautjaStreamCfg');
+    expect(script).toContain('disconnect');
+  });
+});
+
+describe('shouldReinstall', () => {
+  it('reinstalls when there is no prior config', () => {
+    expect(shouldReinstall(undefined, { selector: '#a', silenceMs: 100, minLength: 1 })).toBe(true);
+  });
+  it('keeps the observer when the config matches', () => {
+    const cfg = { selector: '#a', silenceMs: 100, minLength: 1 };
+    expect(shouldReinstall(cfg, cfg)).toBe(false);
+  });
+  it('reinstalls when any field differs (selector, silenceMs, minLength)', () => {
+    const cfg = { selector: '#a', silenceMs: 100, minLength: 1 };
+    expect(shouldReinstall(cfg, { ...cfg, selector: '#b' })).toBe(true);
+    expect(shouldReinstall(cfg, { ...cfg, silenceMs: 250 })).toBe(true);
+    expect(shouldReinstall(cfg, { ...cfg, minLength: 5 })).toBe(true);
   });
 });
 

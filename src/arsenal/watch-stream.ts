@@ -37,6 +37,31 @@ export const STREAM_WATCH_INITIAL: StreamWatchState = {
 /** Key global donde el script inyectado publica su estado. */
 export const STREAM_WATCH_KEY = '__yautjaStream';
 
+/** Key global donde el script inyectado firma la config usada. */
+export const STREAM_WATCH_CFG_KEY = '__yautjaStreamCfg';
+
+/**
+ * Decide si el observador instalado debe ser sustituido por uno nuevo
+ * al inyectar el script. Función pura y serializable (sin closures) para
+ * que sea embebible en el script in-page vía `.toString()` igual que
+ * `computeStreamTick`. Clave de orden de keys estable (JSON.stringify) — la
+ * CFG que se pasa es siempre nueva por construcción, así que la igualdad
+ * estructural es fiable.
+ */
+export function shouldReinstall(
+  prevCfg: unknown,
+  newCfg: { selector: string; silenceMs: number; minLength: number },
+): boolean {
+  if (!prevCfg) return true;
+  if (typeof prevCfg !== 'object') return true;
+  const p = prevCfg as Record<string, unknown>;
+  return (
+    p.selector !== newCfg.selector ||
+    p.silenceMs !== newCfg.silenceMs ||
+    p.minLength !== newCfg.minLength
+  );
+}
+
 /**
  * Transición de estado ante una mutación (función pura, sin closures — por
  * eso es serializable por .toString() y embebible en el script inyectado).
@@ -57,8 +82,12 @@ export function computeStreamTick(
 
 /**
  * Script inyectable (Runtime.evaluate): instala el observer de 2 fases y
- * devuelve el snapshot actual. Idempotente: si ya hay observer, devuelve el
- * estado publicado sin reinstalar.
+ * devuelve el snapshot actual.
+ *   - Si ya hay observer con la misma CFG, reusa el observer y devuelve el
+ *     estado publicado sin reinstalar (true idempotency).
+ *   - Si ya hay observer con CFG distinta (selector / silenceMs / minLength),
+ *     desconecta el viejo y crea uno nuevo: la última CFG gana. Evita el
+ *     footgun de devolver "done" de un stream anterior con config rota.
  */
 export function buildStreamWatchScript(opts: StreamWatchOptions): string {
   const cfg = {
@@ -67,10 +96,16 @@ export function buildStreamWatchScript(opts: StreamWatchOptions): string {
     minLength: opts.minLength ?? 1,
   };
   const tickSrc = computeStreamTick.toString();
+  const reinstallSrc = shouldReinstall.toString();
   return `(() => {
   const KEY = ${JSON.stringify(STREAM_WATCH_KEY)};
-  if (window.__yautjaStreamObs) return window[KEY] || null;
+  const CFG_KEY = ${JSON.stringify(STREAM_WATCH_CFG_KEY)};
   const CFG = ${JSON.stringify(cfg)};
+  const reinstall = ${reinstallSrc};
+  const prevObs = window.__yautjaStreamObs;
+  const prevCfg = window[CFG_KEY];
+  if (prevObs && !reinstall(prevCfg, CFG)) return window[KEY] || null;
+  if (prevObs) { try { prevObs.disconnect(); } catch (e) {} }
   const tick = ${tickSrc};
   const state = { armed: false, done: false, textLength: 0, lastChangeAt: 0 };
   let timer = null;
@@ -94,6 +129,7 @@ export function buildStreamWatchScript(opts: StreamWatchOptions): string {
   const obs = new MutationObserver(onMutation);
   obs.observe(document.body, { childList: true, subtree: true, characterData: true });
   window.__yautjaStreamObs = obs;
+  window[CFG_KEY] = CFG;
   onMutation();
   snapshot();
   return window[KEY];

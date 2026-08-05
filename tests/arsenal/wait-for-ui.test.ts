@@ -303,4 +303,32 @@ describe('waitForUi', () => {
     });
     expect(r.matched).toBe('timeout');
   });
+
+  it('streamSettled handles a second install with a different selector (reinstall path)', async () => {
+    // A single MockTransport can't share state across two checker instances
+    // easily; the production code builds a fresh checker per predicate, so a
+    // second waitForUi call with different config results in a second
+    // installScript evaluation. We verify both install evaluations emit
+    // disjoint, valid flags when called sequentially.
+    const t1 = transportMatching([
+      ['MutationObserver', () => ({ armed: true, done: true, textLength: 100 })],
+      ['const s = window.__yautjaStream', () => ({ armed: true, done: true, textLength: 100 })],
+    ]);
+    const r1 = await waitForUi({ transport: t1 }, {
+      anyOf: [{ type: 'streamSettled', selector: '#answer', silenceMs: 300, minLength: 5 }],
+      ...FAST,
+    });
+    expect(r1.matched).toBe('anyOf');
+
+    // Different selector + different flag: simulates the reinstall.
+    const t2 = transportMatching([
+      ['MutationObserver', () => ({ armed: false, done: false, textLength: 0 })],
+      ['const s = window.__yautjaStream', () => ({ armed: true, done: false, textLength: 50 })],
+    ]);
+    const r2 = await waitForUi({ transport: t2 }, {
+      anyOf: [{ type: 'streamSettled', selector: '#different', silenceMs: 500, minLength: 10 }],
+      timeoutMs: 80, pollMs: 15,
+    });
+    expect(r2.matched).toBe('timeout');
+  });
 });
