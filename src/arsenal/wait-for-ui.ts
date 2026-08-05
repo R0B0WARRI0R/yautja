@@ -18,7 +18,9 @@
  *     the old stub, but explicit and documented.
  *   - streamSettled (P17 fase A) installs a 2-phase MutationObserver in the
  *     page ONCE (watch-stream.ts) and then only reads its published flag —
- *     the "stream finished" signal at zero per-poll snapshot cost.
+ *     moves the per-poll DOM-text snapshot work into the page; the motor
+ *     itself pays only a cheap flag read per poll while the in-page
+ *     observer + silence timer carry the cost.
  */
 
 import { buildStreamWatchScript, STREAM_WATCH_READ_EXPR, parseStreamWatchState } from './watch-stream.js';

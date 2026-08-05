@@ -1,8 +1,9 @@
 # Design: Evento `stream-complete` para detección push de fin de stream (P17)
 
 **Fecha:** 2026-08-05
-**Estado:** Propuesta (no aprobado) — follow-up de `submitState` predicate (2026-08-05-submitstate-predicate-design.md)
+**Estado:** Fase A implementada (commit `f9aa9d7`). Pendiente: Fase B (aserción close de red vía WebSocket/SSE) + bridge en `extension/background.js` (WIP del usuario, fuera de esta iteración).
 **Repo:** Yautja (D:\Yautja)
+**Origen:** Follow-up de `submitState` predicate (2026-08-05-submitstate-predicate-design.md).
 
 ## Problema
 
