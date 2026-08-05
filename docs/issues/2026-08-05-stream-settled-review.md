@@ -46,16 +46,38 @@ módulo en español encaja con al menos uno de los pares más
 cercanos (`strip-interference.ts`). No es funcional; queda como
 decisión estilística pendiente.
 
-### I2 — Mensaje genérico tras fallo permanente de install ⚠️ deuda viva
+### I2 — Mensaje genérico tras fallo permanente de install ✅ parcial (Opción A, commit `9516a7d`)
 
-`wait-for-ui.ts` case `streamSettled`: cuando el script de install
-nunca puede inyectarse, el motor termina en `WAIT_TIMEOUT` con el
-mensaje existente desde `helmet.ts:1324`. No diferencia
-"selector nunca apareció" de "el stream no empezó".
+Antes: `wait-for-ui.ts` case `streamSettled` terminaba en
+`WAIT_TIMEOUT` con la misma shape que cualquier timeout. No
+diferenciaba "selector nunca apareció" de "el stream no empezó".
 
-**Estado:** queda abierta. Tocar este punto requiere editar
-`src/helmet.ts` y posiblemente `src/arsenal/translator.ts`, que
-tienen WIP del usuario sin commitear.
+Ahora: `WaitForUiResult.failureReason?: { kind, selector, lastFlag,
+lastInstallFailed }` se rellena en cada poll del `streamSettled`.
+Cuando el `waitForUi` termina en `matched: 'timeout'`, el `result`
+incluye el `failureReason` con:
+
+- `kind: 'streamSettled'` (reservado para discriminadores futuros).
+- `selector`: el pedido (e.g., `#answer`).
+- `lastFlag`: la última publicación del reducer en página, con
+  `{ armed, done, textLength }`. `null` si la página nunca aceptó el
+  script.
+- `lastInstallFailed`: `true` si el `Runtime.evaluate` del install
+  devolvió algo no-objeto en algún poll (página bloquea CSP /
+  sandbox / navegación).
+
+Cobertura de tests (`tests/arsenal/wait-for-ui.test.ts`):
+
+- `'streamSettled timeout carries failureReason with last flag observed'`
+- `'streamSettled timeout reports lastInstallFailed when the page never accepts the script'`
+
+**Estado**:Opción A cerrada. Queda pendiente para una iteración futura,
+**solo si el usuario lo pide y una vez commiteado su WIP**, el
+mensaje dedicado en `helmet.ts:1324` (actualmente
+`'waitReady predicates not met after submit'`). Para ese día, el
+`failureReason` ya está disponible vía `response.result.wait` (que
+helmet devuelve en `smartType`). La integración es puramente
+presentational: leer `failureReason` y emitir un mensaje mejor.
 
 ### I3 — `parseStreamWatchState` siempre `lastChangeAt: 0` ✅
 
@@ -90,10 +112,20 @@ en tests.
 
 ## Veredicto actualizado
 
-Cerrado: C2, I3, I4 (todos con commits propios).
-Deuda viva: **solo I2**, y esa requiere editar archivos que el
-usuario tiene como WIP sin commitear.
+Cerrado: **C2, I3, I4, I2 (Opción A)** — todos con commits
+propios:
+
+| ID | Commit |
+|---|---|
+| C1 | `2381a19` (rewording honesto) |
+| C2 | `76829c5` (reinstall on config change) |
+| C3 | `2381a19` (spec actualizado) |
+| I3 | `97b1c48` (WireStreamWatchState) |
+| I4 | `97b1c48` (test install-state initial) |
+| I2A | `9516a7d` (failureReason) |
+
+Abierto: I1 (nice-to-have no funcional), I2B (mensaje dedicado en
+helmet, requiere WIP), M1, M2.
 
 El núcleo funciona; los tests cubren idle/transitions/initial-arm/
-reinstall-on-config-change. No hay deuda técnica activa que valga
-la pena otra ronda.
+reinstall/diagnostic-on-timeout.
