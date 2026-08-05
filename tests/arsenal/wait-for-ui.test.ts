@@ -208,4 +208,58 @@ describe('waitForUi', () => {
     expect(r.which).toBe(1);
     expect(r.elapsedMs).toBeGreaterThanOrEqual(90);
   });
+
+  it('submitState idle matches when aria-label signal matches', async () => {
+    const t = transportMatching([['document.querySelector', () => ({ found: true, ariaLabel: 'Enviar', innerHTML: '', className: 'reset', disabled: true })]]);
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'submitState', selector: 'button[aria-label="Enviar"]', state: 'idle', signals: [{ kind: 'ariaLabel', value: 'Enviar' }] }],
+      ...FAST,
+    });
+    expect(r.matched).toBe('anyOf');
+  });
+
+  it('submitState idle does not match while button shows streaming label', async () => {
+    const t = transportMatching([['document.querySelector', () => ({ found: true, ariaLabel: 'Pausar', innerHTML: '', className: 'reset', disabled: false })]]);
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'submitState', selector: 'button[aria-label="Enviar"], button[aria-label="Pausar"]', state: 'idle', signals: [{ kind: 'ariaLabel', value: 'Enviar' }] }],
+      timeoutMs: 150, pollMs: 15,
+    });
+    expect(r.matched).toBe('timeout');
+  });
+
+  it('submitState streaming matches via iconContains signal', async () => {
+    const t = transportMatching([['document.querySelector', () => ({ found: true, ariaLabel: 'Pausar', innerHTML: '<svg class="pause-icon"></svg>', className: 'reset', disabled: false })]]);
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'submitState', selector: 'button[aria-label="Pausar"]', state: 'streaming', signals: [{ kind: 'iconContains', value: 'pause-icon' }] }],
+      ...FAST,
+    });
+    expect(r.matched).toBe('anyOf');
+  });
+
+  it('submitState never matches when the button is absent', async () => {
+    const t = transportMatching([['document.querySelector', () => ({ found: false })]]);
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'submitState', selector: '#no-such-button', state: 'idle', signals: [{ kind: 'ariaLabel', value: 'Enviar' }] }],
+      timeoutMs: 150, pollMs: 15,
+    });
+    expect(r.matched).toBe('timeout');
+  });
+
+  it('submitState signals are OR-ed: one match wins', async () => {
+    const t = transportMatching([['document.querySelector', () => ({ found: true, ariaLabel: 'Enviar', innerHTML: '', className: 'reset stream-btn', disabled: true })]]);
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'submitState', selector: 'button', state: 'idle', signals: [{ kind: 'iconContains', value: 'zzz' }, { kind: 'classContains', value: 'stream-btn' }] }],
+      ...FAST,
+    });
+    expect(r.matched).toBe('anyOf');
+  });
+
+  it('submitState disabled signal requires the exact flag value', async () => {
+    const t = transportMatching([['document.querySelector', () => ({ found: true, ariaLabel: 'Enviar', innerHTML: '', className: '', disabled: false })]]);
+    const r = await waitForUi({ transport: t }, {
+      anyOf: [{ type: 'submitState', selector: 'button', state: 'idle', signals: [{ kind: 'disabled', value: true }] }],
+      timeoutMs: 150, pollMs: 15,
+    });
+    expect(r.matched).toBe('timeout');
+  });
 });

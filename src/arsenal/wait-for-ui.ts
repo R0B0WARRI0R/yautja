@@ -22,6 +22,12 @@ export interface Transport {
   send(method: string, params?: Record<string, any>): Promise<any>;
 }
 
+export type SubmitSignal =
+  | { kind: 'ariaLabel'; value: string }
+  | { kind: 'iconContains'; value: string }
+  | { kind: 'classContains'; value: string }
+  | { kind: 'disabled'; value: boolean };
+
 export type WaitPredicate =
   | { type: 'selector'; selector: string; state?: 'attached' | 'visible' | 'hidden' | 'detached' }
   | { type: 'urlMatch'; pattern: string }
@@ -30,7 +36,13 @@ export type WaitPredicate =
   | { type: 'networkIdle'; quietMs: number }
   | { type: 'textSettled'; selector: string; stableMs: number; minLength?: number }
   | { type: 'fn'; expression: string }
-  | { type: 'timeout'; ms: number };
+  | { type: 'timeout'; ms: number }
+  | {
+      type: 'submitState';
+      selector: string;
+      state: 'idle' | 'streaming';
+      signals: SubmitSignal[];
+    };
 
 export interface WaitForUiDeps {
   transport: Transport;
@@ -153,6 +165,23 @@ function buildChecker(pred: WaitPredicate, deps: WaitForUiDeps, start: number): 
       return async () => {
         if (firedAt === 0) firedAt = Date.now() + pred.ms;
         return Date.now() >= firedAt;
+      };
+    }
+    case 'submitState': {
+      const signals = Array.isArray(pred.signals) ? pred.signals : [];
+      const script = `(() => { const el = document.querySelector(${JSON.stringify(pred.selector)}); if (!el) return { found: false }; return { found: true, ariaLabel: el.getAttribute('aria-label') || null, innerHTML: el.innerHTML || '', className: typeof el.className === 'string' ? el.className : '', disabled: el.disabled !== undefined ? !!el.disabled : el.getAttribute('disabled') !== null }; })()`;
+      return async () => {
+        const v = await evaluate(deps, script);
+        if (!v || !v.found) return false;
+        return signals.some((s) => {
+          switch (s.kind) {
+            case 'ariaLabel': return v.ariaLabel === s.value;
+            case 'iconContains': return (v.innerHTML || '').includes(s.value);
+            case 'classContains': return (v.className || '').includes(s.value);
+            case 'disabled': return v.disabled === s.value;
+            default: return false;
+          }
+        });
       };
     }
   }
