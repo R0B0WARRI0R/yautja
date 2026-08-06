@@ -35,7 +35,7 @@ import { CdpRemoteClient } from './connection/cdp-remote.js';
 import { MitmProxyServer } from './proxy/mitm-proxy.js';
 import { success, failure, SCHEMA_VERSION } from './doctrine/types.js';
 import type { YautjaError, YautjaResponse, OperationMeta, StateMeta, ContextMeta } from './doctrine/types.js';
-import { toYautjaError } from './doctrine/registry.js';
+import { toYautjaError, UNKNOWN_ERROR_CODE } from './doctrine/registry.js';
 import { classifyLegacyError } from './doctrine/classifier.js';
 import { generateTraceId, generateOperationId } from './doctrine/ids.js';
 import { TelemetryCollector } from './doctrine/telemetry.js';
@@ -1309,11 +1309,13 @@ export class Helmet {
               { anyOf: waitReady.anyOf, allOf: waitReady.allOf, timeoutMs: waitReady.timeoutMs ?? 30_000, pollMs: waitReady.pollMs ?? 250 },
             );
             if (wait.matched === 'timeout') {
-              const env = this.nativeFailure('smartType', args, toYautjaError('YJ.ACT.WAIT_TIMEOUT', {
+              // The type succeeded but a downstream wait timed out. Surface
+              // both pieces of info without mutating the failure envelope
+              // (YautjaResponse is built once and now treated as immutable).
+              const failureEnv = this.nativeFailure('smartType', args, toYautjaError('YJ.ACT.WAIT_TIMEOUT', {
                 message: 'waitReady predicates not met after submit',
               }));
-              (env as { result?: unknown }).result = { typeTx: response.result, wait };
-              return env;
+              return { ...failureEnv, result: { typeTx: response.result, wait } };
             }
             (response.result as any).wait = wait;
           }
@@ -1688,7 +1690,7 @@ export class Helmet {
               return this.native(name, args, { jobs: this.sessionScheduler.list() });
             case 'remove': {
               if (!this.sessionScheduler.remove(String(args.id ?? ''))) {
-                throw new Error(`unknown job id: ${args.id}`);
+                throw toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: `unknown job id: ${args.id}` });
               }
               return this.native(name, args, { success: true, id: args.id });
             }
@@ -1707,9 +1709,7 @@ export class Helmet {
               }));
           }
         } catch (err) {
-          return this.nativeFailure(name, args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
-            message: err instanceof Error ? err.message : String(err),
-          }));
+          return this.nativeFailure(name, args, this.classifyCaughtError(err));
         }
       }
       case 'sessionList': {
@@ -2548,10 +2548,14 @@ export class Helmet {
           { selector, files, timeoutMs: args.timeoutMs },
         );
         if (!result.ok) {
-          const err = toYautjaError(result.code, { message: result.detail });
-          if (result.code === 'YJ.PROTOCOL.CAPABILITY_MISSING') {
-            err.agent_summary = `${result.detail}. Trusted file upload unavailable on this backend; delegate to SuperAPI file_upload or hand off to the user. Do NOT report fake success.`;
-          }
+          // YautjaError is frozen at runtime by registry-pass-1; build the
+          // agent_summary once at construction rather than mutating afterwards.
+          const err = toYautjaError(result.code, {
+            message: result.detail,
+            agent_summary: result.code === 'YJ.PROTOCOL.CAPABILITY_MISSING'
+              ? `${result.detail}. Trusted file upload unavailable on this backend; delegate to SuperAPI file_upload or hand off to the user. Do NOT report fake success.`
+              : undefined,
+          });
           return this.nativeFailure('trustedFileChooser', args, err);
         }
         return this.nativeSuccess('trustedFileChooser', args, {
@@ -2757,11 +2761,31 @@ export class Helmet {
         })();
         // Preserve the original payload for backward compatibility (macros,
         // tm tools, etc. carry structured fields like `stage` consumers read).
-        env.result = payload;
-        return env;
+        // Spread instead of mutating env.result so the envelope stays
+        // immutable once constructed.
+        return { ...env, result: payload };
       }
     }
     return this.nativeSuccess(name, args, payload);
+  }
+
+  /**
+   * Routes a caught exception into a typed YautjaError. If the error already
+   * carries a YJ.* code (i.e. it was thrown as a YautjaError somewhere up
+   * the stack), pass it through unchanged — preserves the original severity
+   * and category. Otherwise it is an unclassified runtime failure: return
+   * the typed UNKNOWN_ERROR_CODE sentinel so callers always see a typed
+   * error instead of the legacy INVALID_ARGUMENT bucket.
+   */
+  private classifyCaughtError(err: unknown): YautjaError {
+    if (err && typeof err === 'object' && 'code' in err && typeof (err as { code: unknown }).code === 'string' && (err as { code: string }).code.startsWith('YJ.')) {
+      return err as YautjaError;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return toYautjaError(UNKNOWN_ERROR_CODE, {
+      message,
+      agent_summary: 'A tool raised an unclassified error. The original message is preserved in the error.message field; report this as a bug if it indicates a contract gap.',
+    });
   }
 
   private recordFailure(operation: OperationMeta, error: YautjaError, started: number, context: ContextMeta): void {
@@ -2802,7 +2826,7 @@ export class Helmet {
       this.recordToolCall(name, args, false, null);
       const message = err instanceof Error ? err.message : String(err);
       const context = this.buildContextMeta(message.length);
-      const yerr = classifyLegacyError({ type: 'UNKNOWN_ERROR', message, recoverable: false });
+      const yerr = this.classifyCaughtError(err);
       this.recordFailure(operation, yerr, started, context);
       return JSON.stringify(failure(yerr, { operation, state: this.buildStateMeta(), context }));
     }

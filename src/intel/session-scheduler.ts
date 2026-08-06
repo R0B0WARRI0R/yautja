@@ -23,6 +23,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { toYautjaError } from '../doctrine/registry.js';
 
 /** Mínimo intervalo permitido (guardarraíl anti-spam). */
 export const MIN_INTERVAL_MS = 60_000;
@@ -253,22 +254,23 @@ export class SessionScheduler {
   }
 
   private validatePayload(payload: any): JobPayload {
+    const invalid = (msg: string) => toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: msg });
     if (!payload || typeof payload !== 'object') {
-      throw new Error('payload must be {type:"tool",tool,args?} or {type:"macro",name,args?}');
+      throw invalid('payload must be {type:"tool",tool,args?} or {type:"macro",name,args?}');
     }
     if (payload.type === 'tool') {
       if (typeof payload.tool !== 'string' || payload.tool.length === 0) {
-        throw new Error('payload.tool must be a non-empty tool name');
+        throw invalid('payload.tool must be a non-empty tool name');
       }
       if (SCHEDULER_EXCLUDED_TOOLS.has(payload.tool)) {
-        throw new Error(
+        throw invalid(
           `tool "${payload.tool}" cannot be scheduled: gate/plan grants require the user's phrase in chat and are never automated`,
         );
       }
       const out: JobPayload = { type: 'tool', tool: payload.tool };
       if (payload.args !== undefined) {
         if (typeof payload.args !== 'object' || payload.args === null || Array.isArray(payload.args)) {
-          throw new Error('payload.args must be an object');
+          throw invalid('payload.args must be an object');
         }
         out.args = payload.args;
       }
@@ -276,49 +278,50 @@ export class SessionScheduler {
     }
     if (payload.type === 'macro') {
       if (typeof payload.name !== 'string' || payload.name.length === 0) {
-        throw new Error('payload.name must be a non-empty macro name');
+        throw invalid('payload.name must be a non-empty macro name');
       }
       if (this.executors.macroExists && !this.executors.macroExists(payload.name)) {
-        throw new Error(`unknown macro: ${payload.name}`);
+        throw invalid(`unknown macro: ${payload.name}`);
       }
       const out: JobPayload = { type: 'macro', name: payload.name };
       if (payload.args !== undefined) out.args = payload.args;
       return out;
     }
-    throw new Error(`payload.type must be "tool" or "macro" (got ${JSON.stringify(payload.type)})`);
+    throw invalid(`payload.type must be "tool" or "macro" (got ${JSON.stringify(payload.type)})`);
   }
 
   private validateSchedule(schedule: any, now: number): { spec: ScheduleSpec; nextRunAt: number } {
+    const invalid = (msg: string) => toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: msg });
     if (!schedule || typeof schedule !== 'object') {
-      throw new Error('schedule must be {kind:"once",at} | {kind:"interval",everyMs} | {kind:"cron",expr}');
+      throw invalid('schedule must be {kind:"once",at} | {kind:"interval",everyMs} | {kind:"cron",expr}');
     }
     switch (schedule.kind) {
       case 'once': {
         if (typeof schedule.at !== 'number' || !Number.isFinite(schedule.at)) {
-          throw new Error('schedule.at must be a finite epoch-ms timestamp');
+          throw invalid('schedule.at must be a finite epoch-ms timestamp');
         }
-        if (schedule.at <= now) throw new Error('schedule.at is in the past');
+        if (schedule.at <= now) throw invalid('schedule.at is in the past');
         return { spec: { kind: 'once', at: schedule.at }, nextRunAt: schedule.at };
       }
       case 'interval': {
         if (typeof schedule.everyMs !== 'number' || !Number.isFinite(schedule.everyMs)) {
-          throw new Error('schedule.everyMs must be a finite number');
+          throw invalid('schedule.everyMs must be a finite number');
         }
         if (schedule.everyMs < MIN_INTERVAL_MS) {
-          throw new Error(`schedule.everyMs must be >= ${MIN_INTERVAL_MS}ms (anti-spam guard)`);
+          throw invalid(`schedule.everyMs must be >= ${MIN_INTERVAL_MS}ms (anti-spam guard)`);
         }
         return { spec: { kind: 'interval', everyMs: schedule.everyMs }, nextRunAt: now + schedule.everyMs };
       }
       case 'cron': {
         if (typeof schedule.expr !== 'string' || !parseCron(schedule.expr)) {
-          throw new Error(`schedule.expr is not a valid 5-field cron expression: ${JSON.stringify(schedule.expr)}`);
+          throw invalid(`schedule.expr is not a valid 5-field cron expression: ${JSON.stringify(schedule.expr)}`);
         }
         const next = nextCronAfter(schedule.expr, now);
-        if (next === null) throw new Error('cron expression has no occurrence within 4 years');
+        if (next === null) throw invalid('cron expression has no occurrence within 4 years');
         return { spec: { kind: 'cron', expr: schedule.expr }, nextRunAt: next };
       }
       default:
-        throw new Error(`schedule.kind must be once|interval|cron (got ${JSON.stringify(schedule.kind)})`);
+        throw invalid(`schedule.kind must be once|interval|cron (got ${JSON.stringify(schedule.kind)})`);
     }
   }
 
@@ -359,7 +362,7 @@ export class SessionScheduler {
 
   setEnabled(id: string, enabled: boolean): ScheduledJob {
     const job = this.jobs.get(id);
-    if (!job) throw new Error(`unknown job id: ${id}`);
+    if (!job) throw toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: `unknown job id: ${id}` });
     job.enabled = enabled;
     if (enabled) job.missed = undefined;
     if (enabled && job.schedule.kind !== 'once') {
@@ -397,7 +400,7 @@ export class SessionScheduler {
    */
   async runNow(id: string): Promise<unknown> {
     const job = this.jobs.get(id);
-    if (!job) throw new Error(`unknown job id: ${id}`);
+    if (!job) throw toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: `unknown job id: ${id}` });
     const result = await this.execute(job, this.nowFn());
     this.persist();
     return result;
