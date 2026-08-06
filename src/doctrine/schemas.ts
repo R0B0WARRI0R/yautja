@@ -19,7 +19,7 @@ export const retryStrategySchema = z.enum([
 
 export const yautjaErrorSchema = z.object({
   code: z.string().regex(/^YJ\.[A-Z]+(\.[A-Z_]+)+$/),
-  introduced_in: z.string().regex(/^\d+\.\d+$/),
+  introduced_in: z.string().regex(/^\d+(\.\d+)*$/),
   category: errorCategorySchema,
   severity: severitySchema,
   retryable: z.boolean(),
