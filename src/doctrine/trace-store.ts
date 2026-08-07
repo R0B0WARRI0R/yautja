@@ -1,5 +1,5 @@
 import { mkdir, writeFile, readFile, rm, readdir, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import path, { join } from 'node:path';
 
 export interface TraceStoreConfig {
   rootDir: string;
@@ -93,11 +93,43 @@ export class TraceStore {
     const match = uri.match(/^resource:\/\/yautja\/traces\/([^/]+)\/(.+)$/);
     if (!match) return null;
     const [, traceId, rest] = match;
+    // Pass-2 hardening: the traceId and every rest segment become parts
+    // of an absolute filesystem path via path.join. path.join DOES
+    // normalize `..` segments, so a URI like
+    //   resource://yautja/traces/../network
+    // resolved to <rootDir>/../network.json — outside the trace root,
+    // where the MCP server then reads arbitrary JSON/PNG. The LLM
+    // (via MCP resources/read) controls `uri` and therefore controls
+    // the filesystem path.
+    //
+    // The fix validates each segment is a safe identifier (alphanum +
+    // dash/underscore/dot) and re-verifies the resolved path is inside
+    // rootDir via path.relative — defense in depth even if the regex
+    // ever loosens.
+    if (!SAFE_SEGMENT.test(traceId)) return null;
     if (rest === 'network') {
-      return join(this.config.rootDir, traceId, 'network.json');
+      const p = join(this.config.rootDir, traceId, 'network.json');
+      return isInsideRoot(this.config.rootDir, p) ? p : null;
     }
     const parts = rest.split('/');
-    const fileName = parts[0] === 'dom' ? `${parts[1]}.json` : `${parts[1]}.png`;
-    return join(this.config.rootDir, traceId, parts[0], fileName);
+    if (parts.length !== 2 || !parts.every(SAFE_SEGMENT.test.bind(SAFE_SEGMENT))) return null;
+    const subdir = parts[0];
+    const fileName = subdir === 'dom' ? `${parts[1]}.json` : `${parts[1]}.png`;
+    const p = join(this.config.rootDir, traceId, subdir, fileName);
+    return isInsideRoot(this.config.rootDir, p) ? p : null;
   }
+}
+
+/** Allow only safe identifiers — alphanumeric, dash, underscore, dot. */
+const SAFE_SEGMENT = /^[a-zA-Z0-9_.-]+$/;
+
+/**
+ * Defense in depth: even after segment validation, re-verify the
+ * resolved path is inside rootDir. path.relative returns a path
+ * starting with '..' if p is outside rootDir; on Windows it can
+ * also return an absolute path — both are "outside" for our purposes.
+ */
+function isInsideRoot(rootDir: string, p: string): boolean {
+  const rel = path.relative(rootDir, p);
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
