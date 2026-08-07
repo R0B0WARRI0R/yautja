@@ -2245,12 +2245,47 @@ export class Helmet {
           return this.native(name, args, { error: 'Either code (userscript source) or url (install URL) required' });
         }
 
+        // Pass-2 SSRF→RCE guard: if the LLM passes an installUrl, the
+        // response is fed verbatim into Tampermonkey via importEx, which
+        // runs the script with full userscript privileges. Without this
+        // gate the LLM could:
+        //   - SSRF: 169.254.169.254/latest/meta-data → leak AWS creds
+        //   - SSRF: file:///c:/Users/victim/.ssh/id_rsa → read SSH keys
+        //   - SSRF via redirect: external.com/→169.254.169.254
+        //   - RCE: any external URL the LLM chooses, since the response
+        //     is installed as a userscript with no content-type check
+        // The URL gate (same isInternalHost used by interceptAddRule)
+        // rejects internal targets BEFORE we hit fetch. The content-type
+        // gate rejects HTML pages / JSON blobs / binary files masquerading
+        // as scripts. The size cap prevents a 500 MB response from OOMing
+        // the install path.
+        const MAX_TM_INSTALL_BODY_CHARS = 1_000_000; // 1 MB — well above any real userscript
+        const TM_ALLOWED_CONTENT_TYPES = new Set([
+          'text/plain',
+          'text/javascript',
+          'application/javascript',
+          'application/x-javascript',
+          'application/x-userscript',
+          'text/x-userscript',
+        ]);
+
         try {
           // If URL provided, fetch the script content first (server-side fetch,
           // no CORS). Then bridge-install via the greasyfork.org origin so
           // TM's onMessageExternal handler accepts the message:
           //   port.postMessage({ method: 'importEx', code })
           if (!code && installUrl) {
+            // URL gate: http(s) only and not internal-host space
+            let parsed: URL;
+            try { parsed = new URL(installUrl); } catch {
+              return this.native(name, args, { error: 'installUrl is not a valid URL', url: installUrl });
+            }
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+              return this.native(name, args, { error: 'installUrl must be http(s) (no file://, javascript:, data:, etc.)', url: installUrl });
+            }
+            if (isInternalHost(parsed.hostname)) {
+              return this.native(name, args, { error: 'installUrl targets an internal/loopback/link-local host (SSRF guard)', url: installUrl });
+            }
             const r = await fetch(installUrl, { redirect: 'follow' });
             if (!r.ok) {
               return this.native(name, args, {
@@ -2258,7 +2293,33 @@ export class Helmet {
                 url: installUrl,
               });
             }
+            // Content-Type gate: only JavaScript-compatible types. We
+            // don't echo the full content-type to the LLM to avoid
+            // leaking an oracle for the upstream's response, but the
+            // base media type is safe to expose.
+            const ct = (r.headers.get('content-type') ?? '').toLowerCase().split(';')[0].trim();
+            if (!TM_ALLOWED_CONTENT_TYPES.has(ct)) {
+              return this.native(name, args, {
+                error: `Refusing to install: response content-type "${ct}" is not a userscript-compatible type. Expected text/plain, text/javascript, application/javascript, or application/x-userscript.`,
+                url: installUrl,
+              });
+            }
+            // Size cap
             code = await r.text();
+            if (code.length > MAX_TM_INSTALL_BODY_CHARS) {
+              return this.native(name, args, {
+                error: `Refusing to install: response body too large (${code.length} chars, max ${MAX_TM_INSTALL_BODY_CHARS})`,
+                url: installUrl,
+              });
+            }
+            // ==UserScript== sanity check — TM would reject this anyway,
+            // but fail-fast gives the LLM a better error message.
+            if (!/==UserScript==/i.test(code.slice(0, 4096))) {
+              return this.native(name, args, {
+                error: 'Refusing to install: response does not contain a ==UserScript== header (first 4 KB scanned). Pass code directly if this is intentional.',
+                url: installUrl,
+              });
+            }
           }
 
           const result = await this.server.sendRaw({

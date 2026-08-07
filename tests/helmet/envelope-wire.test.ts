@@ -72,6 +72,7 @@ vi.mock('../../src/connection/extension-server.js', () => {
       return {};
     });
     public on = vi.fn((_event: string, _handler: (params: any) => void) => () => {});
+    public sendRaw = vi.fn(async (_msg: any, _timeoutMs?: number) => ({ ok: true, result: { installed: true } }));
     public onEvent = vi.fn((_handler: any) => () => {});
     public setNetworkCaptureCallback = vi.fn((_cb: (msg: any) => void) => {});
     public listAllTargets = vi.fn(async () => []);
@@ -499,6 +500,112 @@ describe('P10 — doctrine envelope wire (shim 10a)', () => {
     // also truncates underlying chromium errors that could include
     // absolute paths from CDP / Target.setDiscoverTargets failures.
     expect(env.error.message).not.toMatch(/[A-Z]:\\|\\Users|\\home/);
+  });
+
+  describe('tmInstallScript SSRF→RCE guard', () => {
+    let originalFetch: typeof globalThis.fetch;
+
+    beforeEach(() => {
+      originalFetch = globalThis.fetch;
+    });
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+    });
+
+    function mockFetch(respond: (url: string) => Promise<Response>): void {
+      globalThis.fetch = ((url: any) => respond(String(url))) as typeof globalThis.fetch;
+    }
+
+    const VALID_USERSCRIPT = `// ==UserScript==
+// @name         Test
+// @namespace    test
+// @version      1.0
+// @grant        none
+// ==/UserScript==
+console.log('hi');`;
+
+    function htmlResponse(): Response {
+      return new Response('<html><body>not a userscript</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    function jsResponse(body = VALID_USERSCRIPT): Response {
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/javascript' } });
+    }
+    function jsonResponse(): Response {
+      return new Response('{"not":"a script"}', { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+
+    it('pass-2: tmInstallScript rejects SSRF to AWS metadata IP (169.254.169.254)', async () => {
+      const env = await callTool(60, 'tmInstallScript', { url: 'http://169.254.169.254/latest/meta-data/' });
+      expect(env.ok).toBe(false);
+      expect(env.error.message).toContain('internal/loopback/link-local');
+      expect(env.error.message).toContain('SSRF');
+      expect(env.error.message).not.toContain('169.254');
+    });
+
+    it('pass-2: tmInstallScript rejects SSRF to localhost', async () => {
+      const env = await callTool(61, 'tmInstallScript', { url: 'http://localhost:8080/admin/payload.js' });
+      expect(env.ok).toBe(false);
+      expect(env.error.message).toContain('internal/loopback/link-local');
+    });
+
+    it('pass-2: tmInstallScript rejects file:// scheme', async () => {
+      const env = await callTool(62, 'tmInstallScript', { url: 'file:///c:/Users/victim/.ssh/id_rsa' });
+      expect(env.ok).toBe(false);
+      expect(env.error.message).toContain('http(s)');
+      expect(env.error.message).not.toContain('victim');
+    });
+
+    it('pass-2: tmInstallScript rejects javascript: scheme', async () => {
+      const env = await callTool(63, 'tmInstallScript', { url: 'javascript:alert(1)' });
+      expect(env.ok).toBe(false);
+      expect(env.error.message).toContain('http(s)');
+    });
+
+    it('pass-2: tmInstallScript rejects HTML content-type (no userscript smuggling)', async () => {
+      mockFetch(async () => htmlResponse());
+      const env = await callTool(64, 'tmInstallScript', { url: 'https://evil.example/page' });
+      expect(env.ok).toBe(false);
+      expect(env.error.message).toContain('text/html');
+      expect(env.error.message).toContain('userscript-compatible');
+    });
+
+    it('pass-2: tmInstallScript rejects JSON content-type', async () => {
+      mockFetch(async () => jsonResponse());
+      const env = await callTool(65, 'tmInstallScript', { url: 'https://evil.example/api.json' });
+      expect(env.ok).toBe(false);
+      expect(env.error.message).toContain('application/json');
+    });
+
+    it('pass-2: tmInstallScript rejects response without ==UserScript== header', async () => {
+      mockFetch(async () => jsResponse('// just a comment, no metadata header'));
+      const env = await callTool(66, 'tmInstallScript', { url: 'https://evil.example/payload.js' });
+      expect(env.ok).toBe(false);
+      expect(env.error.message).toContain('==UserScript==');
+    });
+
+    it('pass-2: tmInstallScript rejects oversized response (1 MB cap)', async () => {
+      const big = '// ==UserScript==\n' + 'x'.repeat(1_100_000);
+      mockFetch(async () => jsResponse(big));
+      const env = await callTool(67, 'tmInstallScript', { url: 'https://evil.example/huge.js' });
+      expect(env.ok).toBe(false);
+      expect(env.error.message).toContain('too large');
+    });
+
+    it('pass-2: tmInstallScript accepts a valid userscript (happy path)', async () => {
+      mockFetch(async () => jsResponse(VALID_USERSCRIPT));
+      const env = await callTool(68, 'tmInstallScript', { url: 'https://greasyfork.example/scripts/test' });
+      // The bridge call returns success in the mock; the URL+content
+      // gates all pass. We assert the envelope is a success, proving
+      // the SSRF guard did not falsely trigger.
+      expect(env.ok).toBe(true);
+      expect(env.error).toBeUndefined();
+    });
+
+    it('pass-2: tmInstallScript rejects malformed URL', async () => {
+      const env = await callTool(69, 'tmInstallScript', { url: 'not a url' });
+      expect(env.ok).toBe(false);
+      expect(env.error.message).toContain('valid URL');
+    });
   });
 
   it('P14: gateStatus starts at default P0 with no grants', async () => {
