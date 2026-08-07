@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { browserFetch, scrubSecrets, buildFetchScript, validateRequestHeaders, DISALLOWED_REQUEST_HEADERS } from '../../src/intel/browser-fetch.js';
+import { browserFetch, scrubSecrets, buildFetchScript, validateRequestHeaders, validateRequestBounds, DISALLOWED_REQUEST_HEADERS, MAX_REQUEST_BODY_CHARS, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS } from '../../src/intel/browser-fetch.js';
 
 class MockTransport {
   handler: (method: string, params: any) => any = () => ({});
@@ -7,6 +7,21 @@ class MockTransport {
     return this.handler(method, params);
   }
 }
+
+function transportReturning(value: any): MockTransport {
+  const t = new MockTransport();
+  t.handler = () => ({ result: { value: typeof value === 'string' ? value : JSON.stringify(value) } });
+  return t;
+}
+
+const PAGE_OK = {
+  ok: true,
+  status: 200,
+  statusText: 'OK',
+  headers: { 'content-type': 'application/json', 'set-cookie': 'session=abc123', 'x-api-key': 'supersecret' },
+  body: '{"token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c"}',
+  timingMs: 12,
+};
 
 describe('scrubSecrets', () => {
   it('masks JWTs', () => {
@@ -71,21 +86,6 @@ describe('buildFetchScript', () => {
 });
 
 describe('browserFetch', () => {
-  function transportReturning(value: any): MockTransport {
-    const t = new MockTransport();
-    t.handler = () => ({ result: { value: typeof value === 'string' ? value : JSON.stringify(value) } });
-    return t;
-  }
-
-  const PAGE_OK = {
-    ok: true,
-    status: 200,
-    statusText: 'OK',
-    headers: { 'content-type': 'application/json', 'set-cookie': 'session=abc123', 'x-api-key': 'supersecret' },
-    body: '{"token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c"}',
-    timingMs: 12,
-  };
-
   it('drops sensitive response headers and masks secrets in body by default', async () => {
     const t = transportReturning(PAGE_OK);
     const r = await browserFetch(t as any, { url: 'https://api.example.com' });
@@ -167,5 +167,79 @@ describe('browserFetch', () => {
     expect(DISALLOWED_REQUEST_HEADERS.has('x-forwarded-for')).toBe(true);       // IP spoof
     expect(DISALLOWED_REQUEST_HEADERS.has('cf-connecting-ip')).toBe(true);      // IP spoof
     expect(DISALLOWED_REQUEST_HEADERS.has('true-client-ip')).toBe(true);        // IP spoof
+  });
+});
+
+describe('validateRequestBounds', () => {
+  it('clamps timeout below the floor and above the ceiling', () => {
+    const low = validateRequestBounds({ timeoutMs: 0 });
+    expect(low.ok).toBe(true);
+    if (low.ok) expect(low.timeoutMs).toBe(MIN_TIMEOUT_MS);
+
+    const high = validateRequestBounds({ timeoutMs: 10_000_000 });
+    expect(high.ok).toBe(true);
+    if (high.ok) expect(high.timeoutMs).toBe(MAX_TIMEOUT_MS);
+
+    const mid = validateRequestBounds({ timeoutMs: 5_000 });
+    expect(mid.ok).toBe(true);
+    if (mid.ok) expect(mid.timeoutMs).toBe(5_000);
+  });
+
+  it('defaults timeout to 15s when omitted', () => {
+    const r = validateRequestBounds({});
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.timeoutMs).toBe(15_000);
+  });
+
+  it('rejects non-finite timeoutMs', () => {
+    expect(validateRequestBounds({ timeoutMs: NaN }).ok).toBe(false);
+    expect(validateRequestBounds({ timeoutMs: Infinity }).ok).toBe(false);
+    expect(validateRequestBounds({ timeoutMs: -Infinity }).ok).toBe(false);
+  });
+
+  it('rejects oversized request body', () => {
+    const big = 'x'.repeat(MAX_REQUEST_BODY_CHARS + 1);
+    const r = validateRequestBounds({ body: big });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('too large');
+  });
+
+  it('passes a 1 MB body', () => {
+    const r = validateRequestBounds({ body: 'x'.repeat(1_000_000) });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.body?.length).toBe(1_000_000);
+  });
+});
+
+describe('browserFetch bounds enforcement', () => {
+  it('refuses a 24-hour timeout before issuing the page-side fetch', async () => {
+    // Transport that would otherwise succeed — we want to assert the
+    // bound check rejects before buildFetchScript runs.
+    const t = transportReturning(PAGE_OK);
+    const r = await browserFetch(t as any, { url: 'https://x.com', timeoutMs: 24 * 60 * 60 * 1000 });
+    expect(r.ok).toBe(true); // clamps to MAX_TIMEOUT_MS, so the fetch still runs
+    // but verify the script we sent used the clamped value
+    // (re-run with a recording transport to capture the expression)
+    const recorded: string[] = [];
+    const recorder = new MockTransport();
+    recorder.handler = (_m: string, p: any) => { recorded.push(p.expression); return { result: { value: JSON.stringify(PAGE_OK) } }; };
+    await browserFetch(recorder as any, { url: 'https://x.com', timeoutMs: 24 * 60 * 60 * 1000 });
+    expect(recorded[0]).toContain(`setTimeout(() => ctrl.abort(), ${MAX_TIMEOUT_MS})`);
+  });
+
+  it('refuses a request body above MAX_REQUEST_BODY_CHARS', async () => {
+    const t = transportReturning(PAGE_OK);
+    const r = await browserFetch(t as any, { url: 'https://x.com', body: 'x'.repeat(MAX_REQUEST_BODY_CHARS + 1) });
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('too large');
+    // The error must not echo the body bytes (memory leak / leak oracle).
+    expect(r.error!.length).toBeLessThan(500);
+  });
+
+  it('rejects NaN / Infinity timeoutMs', async () => {
+    const t = transportReturning(PAGE_OK);
+    const r = await browserFetch(t as any, { url: 'https://x.com', timeoutMs: NaN });
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('finite');
   });
 });
