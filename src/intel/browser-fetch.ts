@@ -5,11 +5,36 @@
  *
  * The gating decision happens in helmet (SessionGates); this module only
  * executes and sanitizes:
+ *   - request headers are screened against DISALLOWED_REQUEST_HEADERS
+ *     (host/cookie/auth overrides and IP-spoofing headers) so a tool
+ *     call cannot break virtual-host routing, leak session cookies, or
+ *     forge source IP for rate-limit bypass
  *   - sensitive response headers are dropped (set-cookie, authorization…)
  *   - secret patterns in the body are masked by default (redactResponse)
  *     so an `Authorization` echo never reaches the LLM unredacted
  *   - body capped at maxBodyChars with a truncated flag (no silent cuts)
  */
+
+/**
+ * Headers the LLM is forbidden from setting on a tool-issued fetch.
+ * Each one is a known SSRF / credential-leak / audit-trail-forgery
+ * vector that the gate system does NOT otherwise police. Names are
+ * compared case-insensitively per RFC 7230 §3.2.
+ */
+export const DISALLOWED_REQUEST_HEADERS: ReadonlySet<string> = new Set([
+  'host',                  // virtual-host routing override → classic SSRF
+  'cookie',                // arbitrary session injection
+  'authorization',         // creds forwarded to a different host
+  'proxy-authorization',   // proxy creds
+  'x-api-key',             // API key
+  'x-forwarded-for',       // source-IP spoofing (audit/rate-limit)
+  'x-real-ip',             // source-IP spoofing (nginx)
+  'x-client-ip',           // source-IP spoofing
+  'x-originating-ip',      // source-IP spoofing
+  'forwarded',             // RFC 7239 source-IP spoofing
+  'cf-connecting-ip',      // Cloudflare-specific IP spoofing
+  'true-client-ip',        // Akamai / Cloudflare Enterprise IP spoofing
+]);
 
 export interface Transport {
   send(method: string, params?: Record<string, any>): Promise<any>;
@@ -63,6 +88,27 @@ export function scrubSecrets(text: string): string {
   return out;
 }
 
+/**
+ * Return { ok:true } when every request header is allowed; otherwise
+ * { ok:false, error } naming the first offending header. The error
+ * message echoes the header NAME only (not the value, which could
+ * carry the secret the LLM is trying to exfiltrate).
+ */
+export function validateRequestHeaders(
+  headers: Record<string, string> | undefined,
+): { ok: true } | { ok: false; error: string } {
+  if (!headers) return { ok: true };
+  for (const k of Object.keys(headers)) {
+    if (DISALLOWED_REQUEST_HEADERS.has(k.toLowerCase())) {
+      return {
+        ok: false,
+        error: `Header "${k}" is reserved — tools cannot set Host/Cookie/Authorization/X-Forwarded-*/X-Real-IP/X-Api-Key (would break audit, leak creds, or spoof origin).`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
 export function buildFetchScript(opts: BrowserFetchOptions): string {
   const init: Record<string, unknown> = {
     method: (opts.method ?? 'GET').toUpperCase(),
@@ -91,6 +137,12 @@ export function buildFetchScript(opts: BrowserFetchOptions): string {
 }
 
 export async function browserFetch(transport: Transport, opts: BrowserFetchOptions): Promise<BrowserFetchResult> {
+  // Reject request-header overrides before issuing the page-side fetch.
+  // The gate system covers the URL/host allowlist but not these headers.
+  const headCheck = validateRequestHeaders(opts.headers);
+  if (!headCheck.ok) {
+    return { ok: false, timingMs: 0, truncated: false, error: headCheck.error };
+  }
   const r = await transport.send('Runtime.evaluate', {
     expression: buildFetchScript(opts),
     awaitPromise: true,

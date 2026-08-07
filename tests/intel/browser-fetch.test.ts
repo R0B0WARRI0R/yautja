@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { browserFetch, scrubSecrets, buildFetchScript } from '../../src/intel/browser-fetch.js';
+import { browserFetch, scrubSecrets, buildFetchScript, validateRequestHeaders, DISALLOWED_REQUEST_HEADERS } from '../../src/intel/browser-fetch.js';
 
 class MockTransport {
   handler: (method: string, params: any) => any = () => ({});
@@ -124,5 +124,48 @@ describe('browserFetch', () => {
     expect((await browserFetch(t as any, { url: 'https://x.com' })).ok).toBe(false);
     t.handler = () => ({ result: { value: '{{bad' } });
     expect((await browserFetch(t as any, { url: 'https://x.com' })).ok).toBe(false);
+  });
+
+  it('rejects request headers that would spoof Host or leak creds', async () => {
+    // Set up a transport that would otherwise succeed; we want to assert
+    // we never even reach it.
+    const t = transportReturning(PAGE_OK);
+    for (const denied of ['Host', 'Cookie', 'Authorization', 'X-Forwarded-For', 'X-Api-Key', 'X-Real-Ip']) {
+      const r = await browserFetch(t as any, { url: 'https://x.com', headers: { [denied]: 'whatever' } });
+      expect(r.ok, denied).toBe(false);
+      // Error message must mention the offending header name verbatim
+      // (case-preserved) — but NEVER echo the header value, which may
+      // be the very secret the LLM is trying to exfiltrate.
+      expect(r.error, denied).toContain(denied);
+      expect(r.error, denied).not.toContain('whatever');
+    }
+  });
+
+  it('allows benign request headers (Accept, Content-Type, User-Agent, custom X-Request-Id)', async () => {
+    const t = transportReturning(PAGE_OK);
+    const r = await browserFetch(t as any, {
+      url: 'https://x.com',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'yautja/1.0', 'X-Request-Id': 'req_abc' },
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it('validateRequestHeaders is case-insensitive (RFC 7230 §3.2)', () => {
+    expect(validateRequestHeaders(undefined).ok).toBe(true);
+    expect(validateRequestHeaders({}).ok).toBe(true);
+    expect(validateRequestHeaders({ Accept: 'json' }).ok).toBe(true);
+    expect(validateRequestHeaders({ HOST: 'evil.com' }).ok).toBe(false);
+    expect(validateRequestHeaders({ 'x-FORWARDED-FOR': '1.2.3.4' }).ok).toBe(false);
+  });
+
+  it('DISALLOWED_REQUEST_HEADERS includes all P0 categories', () => {
+    // snapshot guard — if anyone removes a header from the set, this
+    // test forces a deliberate change to the allowlist docs.
+    expect(DISALLOWED_REQUEST_HEADERS.has('host')).toBe(true);                  // SSRF
+    expect(DISALLOWED_REQUEST_HEADERS.has('cookie')).toBe(true);                // session hijack
+    expect(DISALLOWED_REQUEST_HEADERS.has('authorization')).toBe(true);         // cred leak
+    expect(DISALLOWED_REQUEST_HEADERS.has('x-forwarded-for')).toBe(true);       // IP spoof
+    expect(DISALLOWED_REQUEST_HEADERS.has('cf-connecting-ip')).toBe(true);      // IP spoof
+    expect(DISALLOWED_REQUEST_HEADERS.has('true-client-ip')).toBe(true);        // IP spoof
   });
 });
