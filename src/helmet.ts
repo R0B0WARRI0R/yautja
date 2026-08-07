@@ -110,6 +110,42 @@ export function resolveProxyPort(): number {
 }
 
 /**
+ * Strip information from an underlying-error message before it reaches
+ * the LLM. Pass-2 fix: ext*, tm*, and other browser/extension tools
+ * were returning raw `e.message`, which routinely contains absolute
+ * filesystem paths (e.g. `ENOENT ... C:\Users\victim\.config\yautja\...`),
+ * snippets of file contents leaked by JSON parsers, or stack-trace
+ * fragments. The LLM can use those to fingerprint the operator's
+ * machine, leak credentials from config files, or build a partial
+ * directory listing of the host.
+ *
+ * The scrubber is conservative: it strips ANSI codes, redacts
+ * well-known absolute-path prefixes (Windows drive roots, /home,
+ * /Users, /var, /etc, /tmp, /root), and truncates anything longer
+ * than 240 chars. It does NOT try to be a general safe-error library
+ * — callsites that need richer sanitization for a specific tool
+ * should layer their own scrubber on top.
+ */
+export function scrubErrorMessage(msg: unknown): string {
+  if (msg == null) return '';
+  // Unwrap the common Error-like shape (the input is `e?.message ?? e`
+  // at every callsite, but a defensive unwrap costs nothing).
+  if (typeof msg === 'object' && msg !== null && 'message' in msg && typeof (msg as any).message === 'string') {
+    msg = (msg as any).message;
+  }
+  let s = typeof msg === 'string' ? msg : String(msg);
+  // ANSI escape sequences (some libs log colored errors)
+  s = s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+  // Windows absolute paths (C:\, D:\, ...): up to next whitespace/quote
+  s = s.replace(/[A-Za-z]:\\[^\s'"<>|?*]+/g, '<path>');
+  // Unix well-known roots: /home, /Users, /var, /etc, /tmp, /root, /opt
+  s = s.replace(/\/(?:home|Users|var|etc|tmp|root|opt)\/[^\s'"<>|?*]+/g, '<path>');
+  // Truncate to keep error envelopes bounded
+  if (s.length > 240) s = s.slice(0, 240) + '…';
+  return s;
+}
+
+/**
  * SSRF guard for the redirect action. Returns true when the host
  * resolves to a private/loopback/link-local address space where a
  * network request from the page must never reach. The check is
@@ -1170,7 +1206,7 @@ export class Helmet {
           }
         }
         try { await this.server.closeTab(tabId); } catch (e: any) {
-          return this.native(name, args, { success: false, error: e.message });
+          return this.native(name, args, { success: false, error: scrubErrorMessage(e?.message ?? e) });
         }
         return this.native(name, args, { success: true, closed: tabId });
       }
@@ -1968,7 +2004,7 @@ export class Helmet {
           const manifest = await this.extIntel.readManifest(extId);
           return this.native(name, args, { extId, manifest });
         } catch (e: any) {
-          return this.native(name, args, { error: e.message });
+          return this.native(name, args, { error: scrubErrorMessage(e?.message ?? e) });
         }
       }
       case 'extSource': {
@@ -1979,7 +2015,7 @@ export class Helmet {
           const content = await this.extIntel.readSource(extId, filePath);
           return this.native(name, args, { extId, path: filePath, content });
         } catch (e: any) {
-          return this.native(name, args, { error: e.message });
+          return this.native(name, args, { error: scrubErrorMessage(e?.message ?? e) });
         }
       }
       case 'extStorage': {
@@ -1990,7 +2026,7 @@ export class Helmet {
           const data = await this.extIntel.readStorage(extId, key);
           return this.native(name, args, { extId, area: 'local', keys: Object.keys(data).length, data });
         } catch (e: any) {
-          return this.native(name, args, { error: e.message });
+          return this.native(name, args, { error: scrubErrorMessage(e?.message ?? e) });
         }
       }
       case 'extNetwork': {
@@ -2058,7 +2094,7 @@ export class Helmet {
             topHosts: Object.entries(stats.hosts).sort((a, b) => b[1] - a[1]).slice(0, 20),
           });
         } catch (e: any) {
-          return this.native(name, args, { error: e.message });
+          return this.native(name, args, { error: scrubErrorMessage(e?.message ?? e) });
         }
       }
       case 'extEval': {
@@ -2077,7 +2113,7 @@ export class Helmet {
           );
           return this.native(name, args, { result, exceptionDetails });
         } catch (e: any) {
-          return this.native(name, args, { error: e.message });
+          return this.native(name, args, { error: scrubErrorMessage(e?.message ?? e) });
         }
       }
       // ─── Tampermonkey integration tools ──────────────────────────────
@@ -2114,7 +2150,7 @@ export class Helmet {
           scripts.sort((a, b) => a.name.localeCompare(b.name));
           return this.native(name, args, { scripts, count: scripts.length, extId: tmId });
         } catch (e: any) {
-          return this.native(name, args, { error: e.message, hint: 'Tampermonkey may not be installed or no profile found' });
+          return this.native(name, args, { error: scrubErrorMessage(e?.message ?? e), hint: 'Tampermonkey may not be installed or no profile found' });
         }
       }
       case 'tmGetScript': {
@@ -2143,7 +2179,7 @@ export class Helmet {
             codeSize: source ? source.length : 0,
           });
         } catch (e: any) {
-          return this.native(name, args, { error: e.message });
+          return this.native(name, args, { error: scrubErrorMessage(e?.message ?? e) });
         }
       }
       case 'tmSearchScripts': {
@@ -2197,7 +2233,7 @@ export class Helmet {
             query: query || domain,
           });
         } catch (e: any) {
-          return this.native(name, args, { error: e.message });
+          return this.native(name, args, { error: scrubErrorMessage(e?.message ?? e) });
         }
       }
       case 'tmInstallScript': {
@@ -2238,7 +2274,7 @@ export class Helmet {
           });
         } catch (e: any) {
           return this.native(name, args, {
-            error: e.message,
+            error: scrubErrorMessage(e?.message ?? e),
             hint: 'Tampermonkey must be installed and the script must start with a valid ==UserScript== header',
           });
         }
@@ -2283,7 +2319,7 @@ export class Helmet {
           });
         } catch (e: any) {
           return this.native(name, args, {
-            error: e.message,
+            error: scrubErrorMessage(e?.message ?? e),
             hint: 'tmToggleScript uses the silent bridge — same caveats as tmInstallScript',
           });
         }
@@ -2428,7 +2464,7 @@ export class Helmet {
           this.pendingPlan = null; // consumido
           return this.nativeSuccess('plan_approve', args, { granted: true, grant, approvedPlan: plan });
         } catch (e: any) {
-          return this.nativeFailure('plan_approve', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: e.message }));
+          return this.nativeFailure('plan_approve', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: scrubErrorMessage(e?.message ?? e) }));
         }
       }
       case 'gateGrant': {
@@ -2455,7 +2491,7 @@ export class Helmet {
           });
           return this.nativeSuccess('gateGrant', args, { granted: true, grant });
         } catch (e: any) {
-          return this.nativeFailure('gateGrant', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: e.message }));
+          return this.nativeFailure('gateGrant', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', { message: scrubErrorMessage(e?.message ?? e) }));
         }
       }
       case 'gateRevoke': {
