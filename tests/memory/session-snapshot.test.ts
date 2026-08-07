@@ -103,4 +103,58 @@ describe('SessionSnapshotStore', () => {
     expect(snap.cookies).toEqual([]);
     expect(snap.localStorage).toEqual({});
   });
+
+  // -------- DoS hardening (pass-2 audit) --------
+
+  it('capture throws on empty name (defense in depth)', async () => {
+    await expect(store.capture(deps, '')).rejects.toThrow(/Invalid snapshot name/);
+  });
+
+  it('capture throws on name longer than 64 chars', async () => {
+    const longName = 'a'.repeat(65);
+    await expect(store.capture(deps, longName)).rejects.toThrow(/Invalid snapshot name/);
+  });
+
+  it('capture accepts a name exactly at the 64-char boundary', async () => {
+    const exact = 'b'.repeat(64);
+    const snap = await store.capture(deps, exact);
+    expect(snap.name).toBe(exact);
+    expect(store.load(exact)).not.toBeNull();
+  });
+
+  it('load returns null for invalid names instead of throwing', () => {
+    expect(store.load('')).toBeNull();
+    expect(store.load('a'.repeat(65))).toBeNull();
+    expect(store.load(undefined as any)).toBeNull();
+    expect(store.load(123 as any)).toBeNull();
+  });
+
+  it('list caps at 500 entries and sorts most-recent-first by mtime', async () => {
+    // Write 600 snapshots directly to the dir, with strictly increasing mtimes.
+    // We can rely on fs.writeFileSync mtime ordering if writes are serialized
+    // — vitest runs this test sequentially inside the same describe.
+    const N = 600;
+    for (let i = 0; i < N; i++) {
+      const safe = `bulk_${i.toString().padStart(4, '0')}`;
+      const snap: SessionSnapshot = {
+        name: safe,
+        createdAt: new Date(2000 + i, 0, 1).toISOString(),
+        url: 'https://x.com/',
+        origin: 'https://x.com',
+        cookies: [],
+        localStorage: {},
+      };
+      fs.writeFileSync(path.join(dir, `${safe}.json`), JSON.stringify(snap));
+      // Force strictly increasing mtimes so the DESC sort is deterministic
+      // regardless of fs granularity. utimes takes SECONDS (integer on Win).
+      const t = 1700000000 + i;
+      fs.utimesSync(path.join(dir, `${safe}.json`), t, t);
+    }
+
+    const all = store.list();
+    expect(all).toHaveLength(500);
+    // First entry should be the one with the highest index (most recent mtime).
+    expect(all[0]!.name).toBe(`bulk_${(N - 1).toString().padStart(4, '0')}`);
+    expect(all[all.length - 1]!.name).toBe(`bulk_${(N - 500).toString().padStart(4, '0')}`);
+  });
 });

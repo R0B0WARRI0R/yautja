@@ -39,7 +39,27 @@ export interface RestoreDeps {
   navigate: (url: string) => Promise<void>;
 }
 
+/** Max snapshot name length — keeps writes bounded and `path()` safe. */
+const MAX_NAME_LEN = 64;
+/** Max entries returned from list() — caps readdir + JSON.parse work. */
+const MAX_LIST_ENTRIES = 500;
+const SAFE_NAME = /[^a-z0-9._-]/gi;
+
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+/**
+ * Validate + sanitize a snapshot name. Returns the filesystem-safe form
+ * (always non-empty for valid input), or '' on any rejection — caller must
+ * branch on empty to throw or return null. Defense in depth: even when the
+ * MCP handler has already guarded `!name`, the store itself refuses.
+ */
+function sanitizeName(name: unknown): string {
+  if (typeof name !== 'string') return '';
+  if (name.length === 0 || name.length > MAX_NAME_LEN) return '';
+  // Sanitization cannot collapse to empty: every illegal char → '_', and a
+  // non-empty input yields a non-empty output.
+  return name.replace(SAFE_NAME, '_');
+}
 
 function hostnameOf(url: string): string {
   try {
@@ -62,7 +82,8 @@ export class SessionSnapshotStore {
   }
 
   private path(name: string): string {
-    const safe = name.replace(/[^a-z0-9._-]/gi, '_');
+    const safe = sanitizeName(name);
+    if (!safe) throw new Error(`Invalid snapshot name: must be a non-empty string ≤ ${MAX_NAME_LEN} chars, allowed charset [A-Za-z0-9._-]`);
     return path.join(this.dir, `${safe}.json`);
   }
 
@@ -70,6 +91,9 @@ export class SessionSnapshotStore {
     const url = await deps.getUrl();
     let origin = '';
     try { origin = new URL(url).origin; } catch {}
+    // Eager validation — `path()` would also throw, but asserting up front
+    // means the snapshot object is never partially constructed.
+    sanitizeName(name);
     const snapshot: SessionSnapshot = {
       name,
       createdAt: new Date().toISOString(),
@@ -83,6 +107,7 @@ export class SessionSnapshotStore {
   }
 
   load(name: string): SessionSnapshot | null {
+    if (!sanitizeName(name)) return null;
     try {
       return JSON.parse(fs.readFileSync(this.path(name), 'utf8'));
     } catch {
@@ -92,17 +117,27 @@ export class SessionSnapshotStore {
 
   list(): Array<{ name: string; createdAt: string; origin: string; cookies: number }> {
     try {
-      return fs.readdirSync(this.dir)
-        .filter((f) => f.endsWith('.json'))
+      const names = fs.readdirSync(this.dir).filter((f) => f.endsWith('.json'));
+      // Sort by mtime DESC (most recent first) without paying JSON.parse per
+      // file up front; cap entries to bound the read+parse work this method
+      // can be forced to do.
+      const withMeta = names
         .map((f) => {
-          try {
-            const s = JSON.parse(fs.readFileSync(path.join(this.dir, f), 'utf8')) as SessionSnapshot;
-            return { name: s.name, createdAt: s.createdAt, origin: s.origin, cookies: s.cookies?.length ?? 0 };
-          } catch {
-            return null;
-          }
+          try { return { f, mtime: fs.statSync(path.join(this.dir, f)).mtimeMs }; }
+          catch { return null; }
         })
-        .filter((x): x is NonNullable<typeof x> => x !== null);
+        .filter((x): x is { f: string; mtime: number } => x !== null)
+        .sort((a, b) => b.mtime - a.mtime)
+        .slice(0, MAX_LIST_ENTRIES);
+
+      const out: Array<{ name: string; createdAt: string; origin: string; cookies: number }> = [];
+      for (const { f } of withMeta) {
+        try {
+          const s = JSON.parse(fs.readFileSync(path.join(this.dir, f), 'utf8')) as SessionSnapshot;
+          out.push({ name: s.name, createdAt: s.createdAt, origin: s.origin, cookies: s.cookies?.length ?? 0 });
+        } catch {}
+      }
+      return out;
     } catch {
       return [];
     }
