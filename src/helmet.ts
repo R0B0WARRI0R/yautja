@@ -1351,8 +1351,22 @@ export class Helmet {
         }
 
         // ─── P13: site profile enforcement ─────────────────────
+        // Pass-2 fix: previously the entire block was gated by
+        // `if (siteProfile.id !== 'default')`, which silently skipped
+        // every safety check on URLs that didn't match a registered
+        // profile. Since the hardcoded default profile is registered
+        // and SiteProfileStore.match() ALWAYS returns a profile, the
+        // only practical effect of that guard was to make the helmet
+        // fail-OPEN: any URL not in a profile file bypassed CAPTCHA
+          // detection, preflight, query budget, and stealth enforcement.
+        // The sub-checks below are individually self-gated by their rule
+        // values, so removing the outer wrapper is a pure structural
+        // fix — the default profile's permissive defaults still apply,
+        // but a future default that tightens any rule (e.g. captcha:
+        // 'warn' → 'stop_hard', or a global maxAgentQueriesPerSession)
+        // will now actually take effect.
         const siteProfile = this.profileStore.match(url);
-        if (siteProfile.id !== 'default') {
+        {
           // CAPTCHA stop_hard: abort before typing, never retry
           if (siteProfile.rules.onCaptcha === 'stop_hard') {
             try {

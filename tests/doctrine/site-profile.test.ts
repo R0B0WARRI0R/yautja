@@ -94,6 +94,29 @@ describe('SiteProfileStore', () => {
     fs.rmSync(empty, { recursive: true, force: true });
   });
 
+  it('a custom default.json with restrictive rules is honored on unmatched URLs (smartType pass-2 contract)', () => {
+    // The smartType path used to gate ALL safety checks behind
+    // `if (siteProfile.id !== 'default')`, which silently bypassed
+    // every rule for URLs not in a specific profile file. This test
+    // documents the load-side contract that the fix relies on: a
+    // user-supplied default.json with tight rules (e.g. captcha
+    // stop_hard, maxAgentQueriesPerSession) WILL be the profile
+    // returned for unmatched URLs, so the smartType sub-checks
+    // (now run unconditionally) will actually fire.
+    writeProfile(tmp, 'default.json', {
+      id: 'default', version: 7,
+      match: { hosts: ['*'] },
+      rules: { onCaptcha: 'stop_hard', maxAgentQueriesPerSession: 5 },
+      notes: 'Tight global default for paranoid deployments',
+    });
+    const store = new SiteProfileStore([tmp]);
+    const matched = store.match('https://anything.example/');
+    expect(matched.id).toBe('default');
+    expect(matched.rules.onCaptcha).toBe('stop_hard');
+    expect(matched.rules.maxAgentQueriesPerSession).toBe(5);
+    expect(matched.notes).toBe('Tight global default for paranoid deployments');
+  });
+
   it('matches by hostname and falls back to default', () => {
     const store = new SiteProfileStore([SHIPPED_DIR]);
     expect(store.match('https://www.perplexity.ai/search/abc').id).toBe('perplexity');
