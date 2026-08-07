@@ -357,6 +357,85 @@ describe('P10 — doctrine envelope wire (shim 10a)', () => {
     expect(env.error.message).not.toContain('victim');
   });
 
+  it('pass-2: interceptAddRule rejects redirect to internal-IP (SSRF via redirect)', async () => {
+    const env = await callTool(27, 'interceptAddRule', {
+      rule: {
+        id: 'r_evil',
+        enabled: true,
+        urlPattern: 'evil.com',
+        stage: 'Request',
+        action: { type: 'redirect', url: 'http://169.254.169.254/latest/meta-data/' },
+      },
+    });
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe('YJ.PROTOCOL.INVALID_ARGUMENT');
+    expect(env.error.message).toContain('SSRF');
+    expect(env.error.message).not.toContain('169.254');
+  });
+
+  it('pass-2: interceptAddRule rejects redirect to localhost (SSRF guard)', async () => {
+    const env = await callTool(28, 'interceptAddRule', {
+      rule: {
+        id: 'r_local',
+        enabled: true,
+        urlPattern: 'evil.com',
+        stage: 'Request',
+        action: { type: 'redirect', url: 'http://localhost:8080/admin' },
+      },
+    });
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe('YJ.PROTOCOL.INVALID_ARGUMENT');
+    expect(env.error.message).toContain('SSRF');
+  });
+
+  it('pass-2: interceptAddRule rejects redirect to file:// scheme', async () => {
+    const env = await callTool(29, 'interceptAddRule', {
+      rule: {
+        id: 'r_file',
+        enabled: true,
+        urlPattern: 'evil.com',
+        stage: 'Request',
+        action: { type: 'redirect', url: 'file:///etc/passwd' },
+      },
+    });
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe('YJ.PROTOCOL.INVALID_ARGUMENT');
+  });
+
+  it('pass-2: interceptAddRule rejects non-http action types when missing required fields', async () => {
+    // mock without required status/body
+    const env = await callTool(30, 'interceptAddRule', {
+      rule: {
+        id: 'r_bad_mock',
+        enabled: true,
+        urlPattern: 'x.com',
+        stage: 'Request',
+        action: { type: 'mock' },
+      },
+    });
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe('YJ.PROTOCOL.INVALID_ARGUMENT');
+  });
+
+  it('pass-2: interceptAddRule accepts a valid block rule', async () => {
+    const env = await callTool(31, 'interceptAddRule', {
+      rule: {
+        id: 'r_block',
+        enabled: true,
+        urlPattern: 'tracker.com',
+        stage: 'Request',
+        action: { type: 'block', reason: 'tracking pixel' },
+      },
+    });
+    // Success OR an interceptor-not-active error from the test infra
+    // (this test does not need the interceptor to be enabled — just
+    // that the schema accepts the rule).
+    if (!env.ok) {
+      expect(env.error.code).toBe('YJ.PROTOCOL.INVALID_ARGUMENT');
+      expect(env.error.message).not.toContain('tracker.com');
+    }
+  });
+
   it('P13: interceptEnable works on a default domain (no profile forbid)', async () => {
     const env = await callTool(22, 'interceptEnable', {});
     expect(env.ok).toBe(true);

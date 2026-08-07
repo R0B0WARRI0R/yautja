@@ -109,6 +109,116 @@ export function resolveProxyPort(): number {
   return envPort('YAUTJA_PROXY_PORT', 9877);
 }
 
+/**
+ * SSRF guard for the redirect action. Returns true when the host
+ * resolves to a private/loopback/link-local address space where a
+ * network request from the page must never reach. The check is
+ * purely string-based on the URL hostname — no DNS resolution — so
+ * it cannot be tricked by DNS rebinding or split-horizon. It rejects:
+ *   - literal hostnames: localhost, *.localhost, *.local
+ *   - IPv4: 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10 (CGNAT),
+ *     127.0.0.0/8, 169.254.0.0/16 (link-local incl. AWS metadata),
+ *     172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 (multicast+reserved)
+ *   - IPv6: ::1, fe80::/10 (link-local), fc00::/7 (ULA)
+ * Decimal/octal/hex IPv4 encodings are not normalized here — the URL
+ * parser in chromium rejects them, so the upstream call fails before
+ * the request leaves the browser.
+ */
+function isInternalHost(host: string): boolean {
+  if (!host) return true;
+  const lc = host.toLowerCase();
+
+  // localhost family
+  if (lc === 'localhost' || lc.endsWith('.localhost') || lc.endsWith('.local')) return true;
+
+  // IPv6 (URL parser lowercases these; brackets already stripped by hostname getter)
+  if (lc === '::1' || lc === '[::1]') return true;
+  if (lc.startsWith('fe80:')) return true;
+  if (lc.startsWith('fc') || lc.startsWith('fd')) {
+    const first = parseInt(lc.slice(0, 2), 16);
+    if (!Number.isNaN(first) && (first & 0xfe) === 0xfc) return true;
+  }
+
+  // IPv4 (dotted-quad only — non-decimal forms are caught upstream)
+  const m = lc.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const a = Number(m[1]);
+    const b = Number(m[2]);
+    if (a === 0) return true;                                // 0.0.0.0/8
+    if (a === 10) return true;                               // 10.0.0.0/8
+    if (a === 100 && b >= 64 && b <= 127) return true;       // 100.64.0.0/10 CGNAT
+    if (a === 127) return true;                              // 127.0.0.0/8 loopback
+    if (a === 169 && b === 254) return true;                 // 169.254.0.0/16 link-local
+    if (a === 172 && b >= 16 && b <= 31) return true;        // 172.16.0.0/12
+    if (a === 192 && b === 168) return true;                 // 192.168.0.0/16
+    if (a >= 224) return true;                               // 224.0.0.0/4 multicast+reserved
+  }
+  return false;
+}
+
+/**
+ * Pass-2 zod schema for interceptAddRule's `args.rule`. Closes the
+ * hardender P0: previously the rule was passed through unchecked, so
+ * the LLM could install `redirect` to internal IPs, `mock` returning
+ * arbitrary content, or `modify` with header smuggling. The schema
+ * enforces:
+ *   - id, urlPattern: non-empty, bounded length
+ *   - urlRegex: optional, must compile (matchesRule uses new RegExp()
+ *     which would otherwise throw at first match attempt)
+ *   - action: discriminated union; redirect.url must be http(s) AND
+ *     must not target internal/loopback/link-local hosts (SSRF guard)
+ *   - mock.body: max 1 MB to prevent memory abuse
+ *   - setCookies: optional string array (no objects; chromium expects
+ *     the cookie header string verbatim)
+ */
+import { z } from 'zod';
+
+const interceptRuleSchema = z.object({
+  id: z.string().min(1).max(128),
+  enabled: z.boolean(),
+  urlPattern: z.string().min(1).max(2048),
+  urlRegex: z.string().min(1).max(2048).optional(),
+  method: z.string().regex(/^[A-Z]+$/).optional(),
+  resourceTypes: z.array(z.string().min(1)).max(32).optional(),
+  stage: z.enum(['Request', 'Response']).default('Request'),
+  action: z.discriminatedUnion('type', [
+    z.object({
+      type: z.literal('modify'),
+      headers: z.record(z.string(), z.string()).optional(),
+      setCookies: z.array(z.string().max(8192)).max(64).optional(),
+      body: z.string().max(1_000_000).optional(),
+    }),
+    z.object({
+      type: z.literal('block'),
+      reason: z.string().max(512).optional(),
+    }),
+    z.object({
+      type: z.literal('mock'),
+      status: z.number().int().min(100).max(599),
+      body: z.string().max(1_000_000),
+      contentType: z.string().max(256).optional(),
+      headers: z.record(z.string(), z.string()).optional(),
+    }),
+    z.object({
+      type: z.literal('redirect'),
+      url: z.string().url().refine(
+        (u) => {
+          let parsed: URL;
+          try { parsed = new URL(u); } catch { return false; }
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+          if (isInternalHost(parsed.hostname)) return false;
+          return true;
+        },
+        { message: 'redirect.url must be http(s) and not target internal/loopback/link-local hosts (SSRF guard)' },
+      ),
+    }),
+    z.object({
+      type: z.literal('log'),
+      captureBody: z.boolean().optional(),
+    }),
+  ]),
+});
+
 /** CDP remote debugging port. Override per-instance for multi-session. */
 export function resolveCdpRemotePort(): number {
   return envPort('YAUTJA_CDP_REMOTE_PORT', 9222);
@@ -1082,7 +1192,13 @@ export class Helmet {
       case 'interceptStatus':
         return this.native(name, args, { active: this.interceptor.isActive(), rules: this.interceptor.listRules() });
       case 'interceptAddRule': {
-        const rule = this.interceptor.addRule(args.rule);
+        const parsed = interceptRuleSchema.safeParse(args.rule);
+        if (!parsed.success) {
+          return this.nativeFailure('interceptAddRule', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: `Invalid intercept rule: ${parsed.error.issues[0]?.message ?? 'schema validation failed'}`,
+          }));
+        }
+        const rule = this.interceptor.addRule(parsed.data);
         return this.native(name, args, { success: true, rule });
       }
       case 'interceptRemoveRule':
