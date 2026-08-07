@@ -132,6 +132,37 @@ export function resolvePort(): { port: number; source: PortSource } {
   return { port: 9876, source: 'default' };
 }
 
+/**
+ * Pass-2: gates profileLoad.path against path traversal and arbitrary-file
+ * reads. The hardender audit flagged that `fs.readFileSync(String(args.path), 'utf8')`
+ * with no allowlist lets the LLM read `~/.ssh/id_rsa`, `~/.aws/credentials`,
+ * or chrome's local-storage LevelDB files. The fix is a single-purpose
+ * resolver: relative path, no traversal, must land inside the profile
+ * directory. Returns `null` for any violation (caller maps to
+ * INVALID_ARGUMENT).
+ *
+ * The profile directory is the same one written by the profileStore
+ * (`~/.yautja/profiles` on POSIX, `%APPDATA%/.yautja/profiles` on Windows).
+ */
+export function resolveProfileLoadPath(rawPath: string): string | null {
+  if (typeof rawPath !== 'string' || rawPath.length === 0) return null;
+  if (path.isAbsolute(rawPath)) return null;
+  const profileDir = path.join(
+    process.env.APPDATA || process.env.HOME || '/tmp',
+    '.yautja',
+    'profiles',
+  );
+  const normalized = path.normalize(rawPath);
+  // After normalize, `../foo` becomes `../foo` or `foo` after stripping `..`.
+  // We reject any remaining `..` segment and re-check absoluteness (defense
+  // against platform-specific quirks).
+  if (normalized.split(path.sep).includes('..')) return null;
+  if (path.isAbsolute(normalized)) return null;
+  const resolved = path.resolve(profileDir, normalized);
+  if (!resolved.startsWith(profileDir + path.sep) && resolved !== profileDir) return null;
+  return resolved;
+}
+
 const DEFAULT_CONFIG: HelmetConfig = {
   port: resolvePort().port,
   autoAttach: true,
@@ -2149,8 +2180,14 @@ export class Helmet {
           return this.nativeSuccess('profileLoad', args, { profile: p });
         }
         if (args.path) {
+          const resolved = resolveProfileLoadPath(String(args.path));
+          if (!resolved) {
+            return this.nativeFailure('profileLoad', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+              message: 'profileLoad.path must be a relative path inside the profiles directory (no absolute paths, no traversal)',
+            }));
+          }
           try {
-            const raw = JSON.parse(fs.readFileSync(String(args.path), 'utf8'));
+            const raw = JSON.parse(fs.readFileSync(resolved, 'utf8'));
             const parsed = SiteProfileSchema.safeParse(raw);
             if (!parsed.success) {
               return this.nativeFailure('profileLoad', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
@@ -2160,8 +2197,11 @@ export class Helmet {
             this.profileStore.register(parsed.data);
             return this.nativeSuccess('profileLoad', args, { profile: parsed.data, registered: true });
           } catch (e: any) {
+            // Pass-2: do NOT include the user-supplied path in the error
+            // message (PII leak risk) and do NOT include the underlying
+            // fs/JSON error (can echo file head bytes).
             return this.nativeFailure('profileLoad', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
-              message: `Cannot load profile from ${args.path}: ${e.message}`,
+              message: 'profileLoad: failed to read or parse the profile file',
             }));
           }
         }

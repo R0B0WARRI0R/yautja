@@ -332,6 +332,31 @@ describe('P10 — doctrine envelope wire (shim 10a)', () => {
     expect(env.error.code).toBe('YJ.PROTOCOL.INVALID_ARGUMENT');
   });
 
+  it('P13: profileLoad rejects absolute paths (no read of ~/.ssh/id_rsa)', async () => {
+    const home = process.env.HOME || process.env.USERPROFILE || '';
+    const env = await callTool(24, 'profileLoad', { path: `${home}/.ssh/id_rsa` });
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe('YJ.PROTOCOL.INVALID_ARGUMENT');
+    // The error message must NOT echo the user-supplied path (PII leak).
+    expect(env.error.message).not.toContain('id_rsa');
+    expect(env.error.message).not.toContain(home);
+  });
+
+  it('P13: profileLoad rejects path traversal (../)', async () => {
+    const env = await callTool(25, 'profileLoad', { path: '../../../etc/passwd' });
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe('YJ.PROTOCOL.INVALID_ARGUMENT');
+    expect(env.error.message).not.toContain('etc');
+    expect(env.error.message).not.toContain('passwd');
+  });
+
+  it('P13: profileLoad rejects Windows-style absolute paths', async () => {
+    const env = await callTool(26, 'profileLoad', { path: 'C:\\Users\\victim\\.aws\\credentials' });
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe('YJ.PROTOCOL.INVALID_ARGUMENT');
+    expect(env.error.message).not.toContain('victim');
+  });
+
   it('P13: interceptEnable works on a default domain (no profile forbid)', async () => {
     const env = await callTool(22, 'interceptEnable', {});
     expect(env.ok).toBe(true);
