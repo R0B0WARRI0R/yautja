@@ -465,6 +465,42 @@ describe('P10 — doctrine envelope wire (shim 10a)', () => {
     expect(env.error.message).toContain('Tab not found');
   });
 
+  it('pass-2: switchTab emits YJ.ACT.TAB_SWITCH_MISMATCH on host mismatch (QA P1 coverage gap)', async () => {
+    // Mock the live location.href to a different host than the tab's URL.
+    // The tab registry reads location.href via Runtime.evaluate and
+    // compares against the tab.url's hostname. Returning a hostile URL
+    // from the "page" forces the mismatch branch, which helmet maps
+    // to YJ.ACT.TAB_SWITCH_MISMATCH.
+    const server = (helmet as any).server;
+    const realSend = server.send.getMockImplementation();
+    server.send.mockImplementation(async (method: string, params?: any) => {
+      if (method === 'Runtime.evaluate' && params?.expression === 'location.href') {
+        return { result: { value: 'https://evil.example/phishing' } };
+      }
+      return realSend ? realSend(method, params) : {};
+    });
+    const env = await callTool(53, 'switchTab', { tabId: 1 });
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe('YJ.ACT.TAB_SWITCH_MISMATCH');
+    expect(env.error.message).toContain('evil.example');
+    expect(env.error.message).toContain('example.com');
+  });
+
+  it('pass-2: reattach emits YJ.NET.SESSION_STATE_UNKNOWN when no attachable tab exists (QA P1 coverage gap)', async () => {
+    // Empty listTabs → attachToActiveTab throws "no attachable tab found"
+    // → reattach catch block emits YJ.NET.SESSION_STATE_UNKNOWN.
+    const server = (helmet as any).server;
+    server.listTabs.mockResolvedValueOnce([]);
+    const env = await callTool(54, 'reattach', {});
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe('YJ.NET.SESSION_STATE_UNKNOWN');
+    // The error message must be scrubbed — reattach used to leak
+    // "Helmet: no attachable tab found" which is fine, but the helper
+    // also truncates underlying chromium errors that could include
+    // absolute paths from CDP / Target.setDiscoverTargets failures.
+    expect(env.error.message).not.toMatch(/[A-Z]:\\|\\Users|\\home/);
+  });
+
   it('P14: gateStatus starts at default P0 with no grants', async () => {
     const env = await callTool(26, 'gateStatus', {});
     expect(env.ok).toBe(true);
