@@ -22,7 +22,7 @@ export interface BrokerInfo {
  * helmet o null si no responde dentro de `timeoutMs` (puerto cerrado, proceso
  * ajeno a Yautja o helmet saturado).
  */
-export function queryBrokerInfo(port: number, timeoutMs: number): Promise<BrokerInfo | null> {
+export function queryBrokerInfo(port: number, timeoutMs: number, bridgeToken?: string): Promise<BrokerInfo | null> {
   return new Promise((resolve) => {
     let settled = false;
     let ws: WebSocket | null = null;
@@ -46,7 +46,7 @@ export function queryBrokerInfo(port: number, timeoutMs: number): Promise<Broker
 
     ws.on('open', () => {
       try {
-        ws!.send(JSON.stringify({ type: 'brokerInfo' }));
+        ws!.send(JSON.stringify({ type: 'brokerInfo', ...(bridgeToken ? { bridgeToken } : {}) }));
       } catch {
         finish(null);
       }
@@ -68,15 +68,15 @@ export function queryBrokerInfo(port: number, timeoutMs: number): Promise<Broker
 }
 
 /**
- * Escaneo de la ventana: prueba los puertos EN ORDEN y devuelve el primero
- * con un helmet vivo que acepte registro. El caller pasa la ventana ordenada
- * (típicamente los puertos MENORES que el propio, de menor a mayor), así que
- * el resultado es el broker candidato de menor puerto vivo.
+ * Scan concurrently so an unresponsive peer cannot multiply the deadline.
+ * Prefer a direct extension owner; election requires one to avoid forwarding
+ * cycles through peers that are themselves clients or waiting for a browser.
  */
-export async function scanForBroker(ports: number[], timeoutMs: number): Promise<{ port: number; info: BrokerInfo } | null> {
-  for (const port of ports) {
-    const info = await queryBrokerInfo(port, timeoutMs);
-    if (info) return { port, info };
-  }
-  return null;
+export async function scanForBroker(ports: number[], timeoutMs: number, bridgeToken?: string, requireExtension = false): Promise<{ port: number; info: BrokerInfo } | null> {
+  const peers = await Promise.all(ports.map(async port => {
+    const info = await queryBrokerInfo(port, timeoutMs, bridgeToken);
+    return info ? { port, info } : null;
+  }));
+  return peers.find(peer => peer?.info.hasExtension)
+    ?? (requireExtension ? null : peers.find(peer => peer !== null) ?? null);
 }

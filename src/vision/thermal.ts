@@ -120,8 +120,18 @@ const DEFAULT_CONFIG: ThermalConfig = {
 };
 
 export class ThermalSensor extends BaseSensor<NetworkSummary> {
+  protected captureAllTabs = true;
   private config: ThermalConfig;
-  private transactions: Map<string, NetworkTransaction> = new Map();
+  private buffers = new Map<string, Map<string, NetworkTransaction>>();
+  private buffer(tabId?: number): Map<string, NetworkTransaction> {
+    const key = this.scopeKey(tabId);
+    if (!this.buffers.has(key)) {
+      if (this.buffers.size >= 8) this.buffers.delete(this.buffers.keys().next().value!);
+      this.buffers.set(key, new Map());
+    }
+    return this.buffers.get(key)!;
+  }
+  private get transactions() { return this.buffer(); }
 
   constructor(transport: Transport, config?: Partial<ThermalConfig>) {
     super(transport);
@@ -354,8 +364,8 @@ export class ThermalSensor extends BaseSensor<NetworkSummary> {
     return anomalies;
   }
 
-  clear(): void {
-    this.transactions.clear();
+  clear(tabId?: number): void {
+    this.buffer(tabId).clear();
   }
 
   getTransactions(): NetworkTransaction[] {
@@ -368,8 +378,8 @@ export class ThermalSensor extends BaseSensor<NetworkSummary> {
    * recientes (default 100; el Map conserva orden de inserción). El buffer
    * es un ring de maxTransactions (500 por defecto).
    */
-  readTransactions(opts?: { urlContains?: string; max?: number }): NetworkTransaction[] {
-    let txns = Array.from(this.transactions.values());
+  readTransactions(opts?: { urlContains?: string; max?: number; tabId?: number }): NetworkTransaction[] {
+    let txns = Array.from(this.buffer(opts?.tabId).values());
     if (opts?.urlContains) {
       txns = txns.filter((t) => t.request.url.includes(opts.urlContains!));
     }

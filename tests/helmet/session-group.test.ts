@@ -98,7 +98,7 @@ vi.mock('../../src/connection/extension-server.js', () => {
   return { ExtensionServer: MockExtensionServer };
 });
 
-import { Helmet } from '../../src/helmet.js';
+import { Helmet, PREDATOR_GROUP_NAMES, predatorGroupNameForSession } from '../../src/helmet.js';
 
 function server(): any {
   return mockState.servers[mockState.servers.length - 1];
@@ -163,6 +163,8 @@ describe('Helmet — session tab group (P8)', () => {
     expect(first.result.groupId).toBe(42);
     expect(first.result.tabId).toBe(99);
     expect(first.result.existed).toBe(false);
+    expect(PREDATOR_GROUP_NAMES).toContain(first.result.name);
+    expect(server().sessionGroupCreate).toHaveBeenCalledWith(first.result.name, 'purple');
 
     const second = await callTool('sessionGroupCreate', {});
     expect(second.ok).toBe(true);
@@ -171,20 +173,45 @@ describe('Helmet — session tab group (P8)', () => {
     expect(server().sessionGroupCreate).toHaveBeenCalledTimes(1);
   });
 
+  it('selects a stable canonical Yautja name for each session', () => {
+    const name = predatorGroupNameForSession('sess_test_wolf_clan');
+    expect(PREDATOR_GROUP_NAMES).toContain(name as any);
+    expect(predatorGroupNameForSession('sess_test_wolf_clan')).toBe(name);
+  });
+
+  it('openTab lazily creates a named group and removes the blank seed tab', async () => {
+    const env = await callTool('openTab', { url: 'https://example.com/auto-group' });
+    expect(env.ok).toBe(true);
+    expect(env.result.groupId).toBe(42);
+    expect(PREDATOR_GROUP_NAMES).toContain(env.result.groupName);
+    expect(server().sessionGroupCreate).toHaveBeenCalledWith(env.result.groupName, 'purple');
+    expect(server().openTab).toHaveBeenCalledWith('https://example.com/auto-group', 42, false);
+    expect(server().closeTab).toHaveBeenCalledWith(99, 42);
+    expect(mockState.tabs.some((t) => t.tabId === 99)).toBe(false);
+  });
+
   it('openTab creates the tab inside the session group by default', async () => {
     await callTool('sessionGroupCreate', {});
     const env = await callTool('openTab', { url: 'https://example.com/page' });
     expect(env.ok).toBe(true);
     expect(env.result.groupId).toBe(42);
-    expect(server().openTab).toHaveBeenCalledWith('https://example.com/page', 42);
+    expect(server().openTab).toHaveBeenCalledWith('https://example.com/page', 42, false);
   });
 
   it('openTab with inGroup:false stays outside the group', async () => {
-    await callTool('sessionGroupCreate', {});
     const env = await callTool('openTab', { url: 'https://example.com/outside', inGroup: false });
     expect(env.ok).toBe(true);
     expect(env.result.groupId).toBeUndefined();
-    expect(server().openTab).toHaveBeenCalledWith('https://example.com/outside', undefined);
+    expect(server().sessionGroupCreate).not.toHaveBeenCalled();
+    expect(server().openTab).toHaveBeenCalledWith('https://example.com/outside', undefined, false);
+  });
+
+  it('openTab only forwards visible focus when explicitly requested', async () => {
+    await callTool('sessionGroupCreate', {});
+    const env = await callTool('openTab', { url: 'https://example.com/focused', focus: true });
+    expect(env.ok).toBe(true);
+    expect(env.result.focused).toBe(true);
+    expect(server().openTab).toHaveBeenCalledWith('https://example.com/focused', 42, true);
   });
 
   it('listTabs reports groupId / inSessionGroup per tab', async () => {
@@ -211,10 +238,10 @@ describe('Helmet — session tab group (P8)', () => {
     await callTool('sessionGroupCreate', {});
     const inside = await callTool('closeTab', { tabId: 99 });
     expect(inside.ok).toBe(true);
-    expect(server().closeTab).toHaveBeenCalledWith(99);
+    expect(server().closeTab).toHaveBeenCalledWith(99, 42);
 
     const forced = await callTool('closeTab', { tabId: 1, force: true });
     expect(forced.ok).toBe(true);
-    expect(server().closeTab).toHaveBeenCalledWith(1);
+    expect(server().closeTab).toHaveBeenCalledWith(1, undefined);
   });
 });

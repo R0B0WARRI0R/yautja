@@ -32,6 +32,7 @@ vi.mock('../src/connection/extension-server.js', () => {
   class MockExtensionServer {
     public port: number;
     public isExtensionConnected = vi.fn(() => true);
+    public hasLocalExtension = vi.fn(() => true);
     public start = vi.fn(async () => {});
     public stop = vi.fn(async () => {});
     public listTabs = vi.fn(async () => [
@@ -172,7 +173,10 @@ describe('Helmet — MCP protocol', () => {
     expect(response.id).toBe(2);
     const names = response.result.tools.map((t: any) => t.name);
     // Core tools must always be present (many more tools exist now)
-    for (const core of ['observe', 'act', 'inspect', 'diff']) {
+    for (const core of [
+      'observe', 'act', 'inspect', 'diff',
+      'morph_compile', 'morph_list', 'morph_run', 'morph_explain',
+    ]) {
       expect(names).toContain(core);
     }
     for (const tool of response.result.tools) {

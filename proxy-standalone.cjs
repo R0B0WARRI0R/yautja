@@ -5,11 +5,8 @@
 
 const http = require('http');
 const net = require('net');
-const fs = require('fs');
-const path = require('path');
-
 const PORT = parseInt(process.env.YAUTJA_PROXY_PORT || '9877');
-const LOG_FILE = process.env.YAUTJA_PROXY_LOG || path.join(process.env.APPDATA || '/tmp', '.yautja-proxy-log.jsonl');
+const MAX_CAPTURE_BYTES = 256 * 1024;
 
 const requests = [];
 let nextId = 1;
@@ -37,10 +34,17 @@ const server = http.createServer((req, res) => {
   };
 
   // Collect request body
-  let reqBody = [];
-  req.on('data', chunk => { if (reqBody.length < 256 * 1024) reqBody.push(chunk); });
+  const reqBody = [];
+  let reqBodyBytes = 0;
+  req.on('data', chunk => {
+    if (reqBodyBytes >= MAX_CAPTURE_BYTES) return;
+    const remaining = MAX_CAPTURE_BYTES - reqBodyBytes;
+    const captured = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+    reqBody.push(captured);
+    reqBodyBytes += captured.length;
+  });
   req.on('end', () => {
-    if (reqBody.length > 0) entry.requestBody = Buffer.concat(reqBody).toString('utf8').substring(0, 256 * 1024);
+    if (reqBody.length > 0) entry.requestBody = Buffer.concat(reqBody).toString('utf8');
 
     // Forward to destination
     const proxyReq = http.request(url, {
@@ -51,18 +55,22 @@ const server = http.createServer((req, res) => {
       entry.responseHeaders = { ...proxyRes.headers };
       entry.mimeType = proxyRes.headers['content-type'] || '';
 
-      let respBody = [];
+      const respBody = [];
+      let respBodyBytes = 0;
+      res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
       proxyRes.on('data', chunk => {
         const ct = entry.mimeType;
         if ((ct.includes('json') || ct.includes('text') || ct.includes('javascript') || ct.includes('xml'))
-            && Buffer.concat(respBody).length < 256 * 1024) {
-          respBody.push(chunk);
+            && respBodyBytes < MAX_CAPTURE_BYTES) {
+          const remaining = MAX_CAPTURE_BYTES - respBodyBytes;
+          const captured = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+          respBody.push(captured);
+          respBodyBytes += captured.length;
         }
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
         res.write(chunk);
       });
       proxyRes.on('end', () => {
-        if (respBody.length > 0) entry.responseBody = Buffer.concat(respBody).toString('utf8').substring(0, 256 * 1024);
+        if (respBody.length > 0) entry.responseBody = Buffer.concat(respBody).toString('utf8');
         entry.durationMs = Date.now() - entry.timestamp;
         logRequest(entry);
         res.end();
@@ -150,8 +158,8 @@ process.stdin.on('data', (data) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  process.stderr.write('[Proxy] Listening on 0.0.0.0:' + PORT + '\n');
+server.listen(PORT, '127.0.0.1', () => {
+  process.stderr.write('[Proxy] Listening on 127.0.0.1:' + PORT + '\n');
 });
 
 // Keep alive

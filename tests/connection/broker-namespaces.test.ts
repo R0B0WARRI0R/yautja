@@ -35,15 +35,6 @@ function connectExtension(port: number, respondTo: (msg: any) => any | null): We
   return ws;
 }
 
-async function freePort(): Promise<number> {
-  const { WebSocketServer } = await import('ws');
-  const probe = new WebSocketServer({ port: 0 });
-  await new Promise<void>((res) => probe.on('listening', res));
-  const port = (probe.address() as any).port;
-  await new Promise<void>((res) => probe.close(() => res()));
-  return port;
-}
-
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe('Broker namespaces por sesión (Tanda B)', () => {
@@ -57,10 +48,10 @@ describe('Broker namespaces por sesión (Tanda B)', () => {
 
   beforeEach(async () => {
     stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    basePort = await freePort();
-    broker = new ExtensionServer(basePort);
+    broker = new ExtensionServer(0);
     broker.setBrokerSessionId('sess_broker');
     await broker.start();
+    basePort = broker.getPort();
 
     // Fake extension: sessionGroupCreate devuelve grupos correlativos
     // (100/tab 10, 200/tab 20, …); el resto de comandos responde {}.
@@ -99,6 +90,39 @@ describe('Broker namespaces por sesión (Tanda B)', () => {
     client.onEvent((payload) => events.push(payload));
     return events;
   }
+
+  it('binds commands and heartbeats to the registered socket identity', async () => {
+    const ws = (clientB as any).ws as WebSocket;
+    const heartbeat = vi.spyOn(broker, 'recordHeartbeat');
+    const response = new Promise<any>((resolve) => {
+      const listener = (data: WebSocket.RawData) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.id === 900001) { ws.off('message', listener); resolve(msg); }
+      };
+      ws.on('message', listener);
+    });
+    ws.send(JSON.stringify({ type: 'ping', sessionId: 'sess_a' }));
+    ws.send(JSON.stringify({ type: 'clientCommand', id: 900001, sessionId: 'sess_a', payload: { type: 'attach', tabId: 10 } }));
+    expect(await response).toMatchObject({ ok: false });
+    expect(heartbeat).not.toHaveBeenCalledWith('sess_a');
+    await expect(clientB.sendToBroker({ type: 'attach', tabId: 20 })).resolves.toEqual({});
+  });
+
+  it.each([
+    { sessionId: 'sess_intruder', groupId: 100 },
+    { sessionId: 'sess_a' },
+    { sessionId: 'sess_broker' },
+  ])('rejects registration that claims a live identity or foreign group: %j', async (claim) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${basePort}`);
+    try {
+      const closed = new Promise<number>(resolve => ws.on('close', code => resolve(code)));
+      await waitForOpen(ws);
+      ws.send(JSON.stringify({ type: 'register', role: 'client', ...claim }));
+      expect(await closed).toBe(4003);
+      expect((broker as any).sessionGroups.get(100).sessionId).toBe('sess_a');
+      await expect(clientA.sendToBroker({ type: 'attach', tabId: 10 })).resolves.toEqual({});
+    } finally { ws.terminate(); }
+  });
 
   it('routing: evento de tab del grupo A solo llega a A (no a B ni a clientes ajenos)', async () => {
     const eventsA = collectEvents(clientA);

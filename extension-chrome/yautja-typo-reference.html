@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Yautja — Typographic System</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d1117;
+    color: #c9d1d9;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    padding: 40px;
+  }
+
+  @font-face {
+    font-family: 'Yautja';
+    src: url('../yautja.woff') format('woff');
+    font-weight: normal;
+    font-style: normal;
+  }
+
+  .container { max-width: 720px; margin: 0 auto; }
+
+  h1, h2, h3 {
+    font-weight: 600;
+    letter-spacing: 1px;
+  }
+  h1 { font-size: 28px; margin-bottom: 4px; color: #00ff41; }
+  h2 { font-size: 18px; margin-bottom: 24px; color: #6e7681; font-weight: 400; }
+  h3 { font-size: 13px; margin-bottom: 12px; text-transform: uppercase; color: #8b949e; letter-spacing: 2px; }
+
+  section { margin-bottom: 48px; }
+
+  /* ─── Font Specimen ─── */
+  .specimen { font-family: 'Yautja'; }
+  .specimen .size-xs  { font-size: 10px; }
+  .specimen .size-sm  { font-size: 12px; }
+  .specimen .size-md  { font-size: 16px; }
+  .specimen .size-lg  { font-size: 24px; }
+  .specimen .size-xl  { font-size: 36px; }
+  .specimen .row { margin-bottom: 8px; }
+  .specimen .label { font-family: 'Segoe UI', sans-serif; font-size: 11px; color: #6e7681; display: inline-block; width: 80px; }
+
+  /* ─── Palette ─── */
+  .palette { display: flex; gap: 16px; flex-wrap: wrap; }
+  .swatch {
+    width: 120px;
+    padding: 16px;
+    border-radius: 6px;
+    border: 1px solid #30363d;
+  }
+  .swatch .hex { font-family: 'Courier New', monospace; font-size: 11px; margin-top: 8px; }
+  .swatch .name { font-size: 12px; font-weight: 600; }
+  .swatch.p-primary  { background: #00ff4111; border-color: #00ff4144; }
+  .swatch.p-danger   { background: #ff004111; border-color: #ff004144; }
+  .swatch.p-warning  { background: #ffaa0011; border-color: #ffaa0044; }
+  .swatch.p-info     { background: #00aaff11; border-color: #00aaff44; }
+  .swatch.p-subtle   { background: #6e768111; border-color: #6e768144; }
+  .swatch.p-bg       { background: #0d1117; border-color: #30363d; }
+  .swatch.p-bg .name { color: #c9d1d9; }
+  .palette .c-primary { color: #00ff41; }
+  .palette .c-danger  { color: #ff0041; }
+  .palette .c-warning { color: #ffaa00; }
+  .palette .c-info    { color: #00aaff; }
+  .palette .c-subtle  { color: #6e7681; }
+
+  /* ─── HUD Mockup ─── */
+  .hud-mock {
+    background: rgba(13, 17, 23, 0.92);
+    border: 1px solid #00ff4144;
+    border-radius: 4px;
+    padding: 10px 14px;
+    font-family: 'Yautja', 'Courier New', monospace;
+    font-size: 10px;
+    line-height: 1.5;
+    color: #00ff41;
+    display: inline-block;
+    -webkit-font-smoothing: none;
+    box-shadow: 0 0 20px rgba(0, 255, 65, 0.06);
+  }
+  .hud-mock .hdr {
+    display: flex; align-items: center; gap: 6px;
+    border-bottom: 1px solid #00ff4122;
+    padding-bottom: 4px; margin-bottom: 4px;
+    font-size: 12px; letter-spacing: 1px;
+  }
+  .hud-mock .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: #00ff41; box-shadow: 0 0 6px #00ff41;
+  }
+  .hud-mock .r { display: flex; justify-content: space-between; gap: 12px; }
+  .hud-mock .l { color: #6e7681; }
+  .hud-mock .v { color: #00ff41; }
+
+  /* ─── Layout Rules ─── */
+  .layout-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  .layout-box {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 16px;
+  }
+  .layout-box h4 { font-size: 12px; margin-bottom: 8px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
+  .layout-box p { font-size: 12px; color: #c9d1d9; line-height: 1.6; }
+
+  /* ─── Sensor Icons ─── */
+  .sensor-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+  .sensor-chip {
+    display: flex; align-items: center; gap: 6px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 3px;
+    padding: 4px 8px;
+    font-family: 'Yautja', monospace;
+    font-size: 11px;
+    color: #6e7681;
+  }
+  .sensor-chip.active { border-color: #00ff4144; color: #00ff41; }
+  .sensor-chip .sdot { width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
+  .sensor-chip.active .sdot { box-shadow: 0 0 4px currentColor; }
+
+  hr { border: none; border-top: 1px solid #21262d; margin: 40px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <h1>YAUTJA TYPOGRAPHIC SYSTEM</h1>
+  <h2>Bio-helmet visual language — HUD specification v0.1</h2>
+
+  <!-- ═══════════════════ 1. Font ─────────────────────────── -->
+  <section>
+    <h3>1. Primary Typeface — Yautja Pixel</h3>
+    <div class="specimen">
+      <div class="row"><span class="label">10px</span><span class="size-xs">A B C D E F G H I J K L M N O P Q R S T U V W X Y Z</span></div>
+      <div class="row"><span class="label">12px</span><span class="size-sm">A B C D E F G H I J K L M N O P Q R S T U V W X Y Z</span></div>
+      <div class="row"><span class="label">16px</span><span class="size-md">A B C D E F G H I J K L M N O P Q R S T U V W X Y Z</span></div>
+      <div class="row"><span class="label">24px</span><span class="size-lg">A B C D E F G H I J K L M N O P Q R S T U V W X Y Z</span></div>
+      <div class="row"><span class="label">36px</span><span class="size-xl">A B C D E F G H I J K L M N O P Q R S T U V W X Y Z</span></div>
+      <div class="row" style="margin-top:12px;"><span class="label">Digits</span><span class="size-sm">0 1 2 3 4</span></div>
+      <div class="row"><span class="label">Glyphs</span><span class="size-sm">, . space</span></div>
+    </div>
+    <p style="margin-top:8px;font-size:11px;color:#6e7681;">
+      Font: <code>yautja.woff</code> (WOFF1, 2.9KB) — pixel grid ~20×40UPEM.<br>
+      Fallback stack: <code>'Courier New', monospace</code>.<br>
+      <span style="color:#ffaa00;">Note:</span> Only uppercase A-Z, lowercase a-z, digits 0-4, comma, period, space.
+    </p>
+  </section>
+
+  <!-- ═══════════════════ 2. Color ────────────────────────── -->
+  <section>
+    <h3>2. Color Palette</h3>
+    <div class="palette">
+      <div class="swatch p-primary"><div class="name c-primary">Thermal</div><div class="hex c-primary">#00FF41</div></div>
+      <div class="swatch p-danger"><div class="name c-danger">Heat</div><div class="hex c-danger">#FF0041</div></div>
+      <div class="swatch p-warning"><div class="name c-warning">Caution</div><div class="hex c-warning">#FFAA00</div></div>
+      <div class="swatch p-info"><div class="name c-info">Data Link</div><div class="hex c-info">#00AAFF</div></div>
+      <div class="swatch p-subtle"><div class="name c-subtle">Muted</div><div class="hex c-subtle">#6E7681</div></div>
+      <div class="swatch p-bg"><div class="name" style="color:#c9d1d9;">Background</div><div class="hex" style="color:#6e7681;">#0D1117</div></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════ 3. HUD Mock ─────────────────────── -->
+  <section>
+    <h3>3. HUD Overlay — Live Injection</h3>
+    <div class="hud-mock">
+      <div class="hdr"><span class="dot"></span>YAUTJA</div>
+      <div class="r"><span class="l">REQS</span><span class="v">0</span></div>
+      <div class="r"><span class="l">FAIL</span><span class="v">0</span></div>
+      <div class="r"><span class="l">CDN</span><span class="v">-</span></div>
+      <div class="r"><span class="l">PAGE</span><span class="v">-</span></div>
+      <div class="r" style="margin-top:4px;border-top:1px solid #00ff4122;padding-top:4px;">
+        <span class="l">SENSORS</span><span class="v">TH EM AU MO THR TECH</span>
+      </div>
+      <div class="r" style="margin-top:4px;border-top:1px solid #00ff4122;padding-top:4px;">
+        <span class="l">TS</span><span class="v">-</span>
+      </div>
+    </div>
+
+    <div style="margin-top:16px;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;font-size:11px;color:#8b949e;font-family:'Courier New',monospace;">
+      <div style="color:#00ff41;margin-bottom:4px;">// Injection via CDP evaluate</div>
+      <div>fs.readFileSync('extension/yautja-hud.js','utf8');</div>
+      <div>yautja_act({type:'evaluate', expression: hudScript});</div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════ 4. Sensor Language ──────────────── -->
+  <section>
+    <h3>4. Sensor Abbreviations</h3>
+    <div class="sensor-grid">
+      <div class="sensor-chip active"><span class="sdot"></span>TH — Thermal</div>
+      <div class="sensor-chip active"><span class="sdot"></span>EM — Electromagnetic</div>
+      <div class="sensor-chip active"><span class="sdot"></span>AU — Audio</div>
+      <div class="sensor-chip active"><span class="sdot"></span>MO — Motion</div>
+      <div class="sensor-chip active"><span class="sdot"></span>THR — Threat</div>
+      <div class="sensor-chip active"><span class="sdot"></span>TECH — Technology</div>
+    </div>
+    <p style="margin-top:8px;font-size:11px;color:#6e7681;">
+      Each sensor has three states: <span style="color:#6e7681;">off (dim)</span>, <span style="color:#00ff41;">on (lit)</span>, <span style="color:#ffaa00;">alert (pulse)</span>.
+    </p>
+  </section>
+
+  <!-- ═══════════════════ 5. Layout Rules ─────────────────── -->
+  <section>
+    <h3>5. Layout &amp; Spacing</h3>
+    <div class="layout-grid">
+      <div class="layout-box">
+        <h4>Position</h4>
+        <p>Fixed bottom-right corner.<br><code>bottom: 12px; right: 12px;</code><br>
+        Layer: <code>z-index: 2147483647</code></p>
+      </div>
+      <div class="layout-box">
+        <h4>Padding</h4>
+        <p>Container: <code>8px 10px</code><br>
+        Header gap: <code>6px</code><br>
+        Row gap: <code>8px</code></p>
+      </div>
+      <div class="layout-box">
+        <h4>Typography Scale</h4>
+        <p>HUD header: <code>11px</code><br>
+        Data rows: <code>10px</code><br>
+        Sensors: <code>9px</code><br>
+        Line height: <code>1.4</code></p>
+      </div>
+      <div class="layout-box">
+        <h4>Borders</h4>
+        <p>Outer: <code>1px solid #00ff4144</code><br>
+        Radius: <code>4px</code><br>
+        Dividers: <code>#00ff4122</code><br>
+        Glow: <code>box-shadow 12px</code></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════ 6. Usage ────────────────────────── -->
+  <section>
+    <h3>6. Usage</h3>
+    <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:16px;font-family:'Courier New',monospace;font-size:11px;line-height:1.8;">
+      <div><span style="color:#6e7681;">// Inject HUD into any page:</span></div>
+      <div style="color:#00ff41;">yautja_act({</div>
+      <div style="color:#00ff41;">&nbsp;&nbsp;type: 'evaluate',</div>
+      <div style="color:#00ff41;">&nbsp;&nbsp;expression: require('fs').readFileSync('./extension/yautja-hud.js', 'utf8')</div>
+      <div style="color:#00ff41;">});</div>
+      <div style="margin-top:8px;"><span style="color:#6e7681;">// Or inject via Helmet:</span></div>
+      <div style="color:#00aaff;">Observe: "Inject Yautja HUD on this page"</div>
+      <div style="margin-top:8px;"><span style="color:#6e7681;">// Remove HUD:</span></div>
+      <div style="color:#ff0041;">yautja_act({</div>
+      <div style="color:#ff0041;">&nbsp;&nbsp;type: 'evaluate',</div>
+      <div style="color:#ff0041;">&nbsp;&nbsp;expression: `document.getElementById('yautja-hud')?.remove(); delete window.__yautjaHudLoaded`</div>
+      <div style="color:#ff0041;">});</div>
+    </div>
+  </section>
+
+  <hr>
+  <div style="text-align:center;font-size:11px;color:#30363d;letter-spacing:2px;">
+    YAUTJA BIO-HELMET v0.1 — TYPOGRAPHIC SYSTEM SPECIFICATION
+  </div>
+
+</div>
+</body>
+</html>

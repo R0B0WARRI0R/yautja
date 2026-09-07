@@ -7,10 +7,10 @@ import { ExtensionLinkDegradedError, ExtensionServer } from '../../src/connectio
  * `respondTo(msg)` devuelve el result a contestar, o null para colgar el
  * comando (simula handlers colgados contra un renderer saturado).
  */
-function connectExtension(port: number, respondTo: (msg: any) => any | null): WebSocket {
+function connectExtension(port: number, respondTo: (msg: any) => any | null, bridgeToken?: string): WebSocket {
   const ws = new WebSocket(`ws://127.0.0.1:${port}`);
   ws.on('open', () => {
-    ws.send(JSON.stringify({ type: 'hello', id: 'fake-ext', version: 'test' }));
+    ws.send(JSON.stringify({ type: 'hello', id: 'fake-ext', version: 'test', ...(bridgeToken ? { bridgeToken } : {}) }));
   });
   ws.on('message', (data) => {
     const msg = JSON.parse(data.toString());
@@ -51,6 +51,35 @@ describe('ExtensionServer — watchdog de enlace', () => {
     port = (server as any).wss.address().port;
   });
 
+  it('escucha exclusivamente en loopback IPv4', () => {
+    const address = (server as any).wss.address();
+    expect(address.address).toBe('127.0.0.1');
+  });
+
+  it('rechaza clientes sin token y acepta el token configurado', async () => {
+    const token = 't'.repeat(32);
+    const secured = new ExtensionServer(0, 500, { bridgeToken: token });
+    await secured.start();
+    const securedPort = (secured as any).wss.address().port;
+    const unauthorized = new WebSocket(`ws://127.0.0.1:${securedPort}`);
+    try {
+      await waitForOpen(unauthorized);
+      unauthorized.send(JSON.stringify({ type: 'hello', id: 'intruder' }));
+      await waitForClose(unauthorized);
+      expect(secured.isExtensionConnected()).toBe(false);
+
+      const authorized = connectExtension(securedPort, () => ({}), token);
+      try {
+        await waitForOpen(authorized);
+        await vi.waitFor(() => expect(secured.isExtensionConnected()).toBe(true));
+      } finally {
+        authorized.close();
+      }
+    } finally {
+      await secured.stop();
+    }
+  });
+
   afterEach(async () => {
     stderrSpy.mockRestore();
     for (const ws of clients) {
@@ -62,7 +91,10 @@ describe('ExtensionServer — watchdog de enlace', () => {
   function connect(respondTo: (msg: any) => any | null): Promise<WebSocket> {
     const ws = connectExtension(port, respondTo);
     clients.push(ws);
-    return waitForOpen(ws).then(() => ws);
+    return waitForOpen(ws).then(async () => {
+      await vi.waitFor(() => expect(server.isExtensionConnected()).toBe(true));
+      return ws;
+    });
   }
 
   it('comando colgado → timeout con log a stderr y contador', async () => {
@@ -174,7 +206,7 @@ describe('ExtensionServer — asignación dinámica de puerto', () => {
   it('puerto base ocupado → auto-incrementa al siguiente libre', async () => {
     const { WebSocketServer } = await import('ws');
     // Ocupante: bindea un puerto efímero y se queda con él.
-    const occupier = new WebSocketServer({ port: 0 });
+    const occupier = new WebSocketServer({ port: 0, host: '127.0.0.1' });
     await new Promise<void>((res) => occupier.on('listening', res));
     const busyPort = (occupier.address() as any).port;
 

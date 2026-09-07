@@ -43,7 +43,7 @@ function connectExtension(port: number, respondTo: (msg: any) => any | null): We
 
 async function freePort(): Promise<number> {
   const { WebSocketServer } = await import('ws');
-  const probe = new WebSocketServer({ port: 0 });
+  const probe = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise<void>((res) => probe.on('listening', res));
   const port = (probe.address() as any).port;
   await new Promise<void>((res) => probe.close(() => res()));
@@ -130,16 +130,19 @@ describe('Reelección de broker (Tanda C)', () => {
     const a = await makeServer(base, 'sess_a');
     const b = await makeServer(base, 'sess_b');
     const c = await makeServer(base, 'sess_c');
-    expect([a.getPort(), b.getPort(), c.getPort()]).toEqual([base, base + 1, base + 2]);
+    expect(a.getPort()).toBe(base);
+    expect(b.getPort()).toBeGreaterThan(a.getPort());
+    expect(c.getPort()).toBeGreaterThan(b.getPort());
 
-    const found = await scanForBroker([base, base + 1, base + 2], SCAN_TIMEOUT);
+    const brokerPorts = [a.getPort(), b.getPort(), c.getPort()];
+    const found = await scanForBroker(brokerPorts, SCAN_TIMEOUT);
     expect(found?.port).toBe(base);
     expect(found?.info.sessionId).toBe('sess_a');
 
     // Puertos muertos se saltan en orden.
     const dead = await freePort();
-    const found2 = await scanForBroker([dead, base + 2], SCAN_TIMEOUT);
-    expect(found2?.port).toBe(base + 2);
+    const found2 = await scanForBroker([dead, c.getPort()], SCAN_TIMEOUT);
+    expect(found2?.port).toBe(c.getPort());
   });
 
   it('muerte del broker: el de menor puerto promueve, el otro se re-registra y el forwarding vuelve', async () => {
@@ -221,7 +224,7 @@ describe('Reelección de broker (Tanda C)', () => {
     const base = await freePort();
     // Un proceso ajeno a Yautja ocupa el puerto base (no responde brokerInfo).
     const { WebSocketServer } = await import('ws');
-    const squatter = new WebSocketServer({ port: base });
+    const squatter = new WebSocketServer({ port: base, host: '127.0.0.1' });
     await new Promise<void>((res) => squatter.on('listening', res));
     try {
       const serverB = await makeServer(base, 'sess_b');
@@ -240,6 +243,97 @@ describe('Reelección de broker (Tanda C)', () => {
     const client = await makeClient(base, 'sess_g', 555);
     expect(await client.start()).toBe(true);
     expect((broker as any).sessionGroups.get(555).sessionId).toBe('sess_g');
+  });
+
+  it('el puerto base reaparece y comparte la extensión del broker de puerto superior', async () => {
+    const base = await freePort();
+    const original = await makeServer(base, 'sess_original');
+    const survivor = await makeServer(base, 'sess_survivor');
+    await original.stop();
+    await connectFakeExtension(survivor.getPort(), msg => msg.type === 'listTabs' ? { tabs: [{ tabId: 42 }] } : {});
+    await vi.waitFor(() => expect(survivor.isExtensionConnected()).toBe(true));
+    const ownerElection = makeReelection(survivor, 'sess_survivor', base);
+    ownerElection.start();
+
+    const restarted = await makeServer(base, 'sess_restarted');
+    expect(restarted.getPort()).toBe(base);
+    const election = makeReelection(restarted, 'sess_restarted', base, 555);
+    election.start();
+    await vi.waitFor(() => expect(election.getClient()?.getBrokerSessionId()).toBe('sess_survivor'), { timeout: 3000 });
+    expect(await restarted.sendRaw({ type: 'listTabs' })).toEqual({ tabs: [{ tabId: 42 }] });
+    expect((survivor as any).sessionGroups.get(555).sessionId).toBe('sess_restarted');
+    expect(ownerElection.getClient()).toBeNull();
+    expect((await queryBrokerInfo(base, SCAN_TIMEOUT))?.hasExtension).toBe(false);
+  });
+
+  it('un broker sin extensión sigue buscando después de promocionarse', async () => {
+    const base = await freePort();
+    const server = await makeServer(base, 'sess_base');
+    const election = makeReelection(server, 'sess_base', base);
+    election.start();
+    await vi.waitFor(() => expect(election.isPromoted()).toBe(true));
+    const later = await makeServer(base, 'sess_later');
+    await connectFakeExtension(later.getPort(), msg => msg.type === 'listTabs' ? { tabs: [{ tabId: 43 }] } : {});
+    await vi.waitFor(() => expect(election.getClient()?.getBrokerSessionId()).toBe('sess_later'), { timeout: 3000 });
+    expect(await server.sendRaw({ type: 'listTabs' })).toEqual({ tabs: [{ tabId: 43 }] });
+    expect(election.isPromoted()).toBe(false);
+  });
+
+  it('un cliente registrado se recupera si la extensión cambia de broker sin morir el anterior', async () => {
+    const base = await freePort();
+    const oldBroker = await makeServer(base, 'sess_old');
+    const server = await makeServer(base, 'sess_client');
+    const newBroker = await makeServer(base, 'sess_new');
+    const extension = await connectFakeExtension(base, () => ({}));
+    await vi.waitFor(() => expect(oldBroker.isExtensionConnected()).toBe(true));
+    const client = await makeClient(base, 'sess_client');
+    server.setBrokerClient(client);
+    expect(await client.start()).toBe(true);
+    const election = makeReelection(server, 'sess_client', base);
+    election.adopt(client);
+    extension.close();
+    await vi.waitFor(() => expect(server.isExtensionConnected()).toBe(false));
+    expect(client.isRegistered()).toBe(true);
+    await connectFakeExtension(newBroker.getPort(), msg => msg.type === 'listTabs' ? { tabs: [{ tabId: 44 }] } : {});
+    await vi.waitFor(() => expect(election.getClient()?.getBrokerSessionId()).toBe('sess_new'), { timeout: 3000 });
+    expect(await server.sendRaw({ type: 'listTabs' })).toEqual({ tabs: [{ tabId: 44 }] });
+    expect(client.isRegistered()).toBe(false);
+  });
+
+  it('los clientes de un broker que pasa a cliente buscan al propietario directo', async () => {
+    const base = await freePort();
+    const oldBroker = await makeServer(base, 'sess_old');
+    const server = await makeServer(base, 'sess_client');
+    const newBroker = await makeServer(base, 'sess_new');
+    const client = await makeClient(base, 'sess_client');
+    server.setBrokerClient(client);
+    expect(await client.start()).toBe(true);
+    const owner = makeReelection(oldBroker, 'sess_old', base);
+    owner.start();
+    await connectFakeExtension(newBroker.getPort(), msg => msg.type === 'listTabs' ? { tabs: [{ tabId: 45 }] } : {});
+    await vi.waitFor(() => expect(oldBroker.isExtensionConnected()).toBe(true));
+    // Local connectivity of the intermediate peer must not advertise a route
+    // to its clients: that route would lose the original session namespace.
+    expect(client.getBridgeState()?.connected).toBe(false);
+    await expect(client.sendToBroker({ type: 'listTabs' })).rejects.toThrow('extension not connected');
+    const election = makeReelection(server, 'sess_client', base);
+    election.adopt(client);
+    await vi.waitFor(() => expect(election.getClient()?.getBrokerSessionId()).toBe('sess_new'));
+    expect(await server.sendRaw({ type: 'listTabs' })).toEqual({ tabs: [{ tabId: 45 }] });
+  });
+
+  it('stop durante discovery descarta el resultado tardío y no registra un cliente', async () => {
+    const base = await freePort();
+    const server = await makeServer(base, 'sess_stopping');
+    const broker = await makeServer(base, 'sess_owner');
+    await connectFakeExtension(broker.getPort(), () => ({}));
+    await vi.waitFor(() => expect(broker.isExtensionConnected()).toBe(true));
+    const election = makeReelection(server, 'sess_stopping', base);
+    election.start();
+    await election.stop();
+    expect(election.getClient()).toBeNull();
+    expect((broker as any).clientSockets.size).toBe(0);
+    expect(server.isExtensionConnected()).toBe(false);
   });
 
   it('resiliencia MV3: la reconexión de la extensión al broker no rompe a los clientes', async () => {

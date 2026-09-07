@@ -42,6 +42,34 @@ describe('NetworkCapture', () => {
   let transport: MockTransport;
   let capture: NetworkCaptureType;
 
+  it('pins delayed response bodies to their source tab and generation', async () => {
+    let tabId = 1;
+    Object.assign(transport, { getCurrentTabId: () => tabId, getGeneration: () => 'g1' });
+    let resolveBody!: (body: any) => void;
+    transport.responder = () => new Promise(resolve => { resolveBody = resolve; });
+    capture.storeRequest(makeReq('same'));
+    const pending = capture.captureAndAttachResponseBody('same');
+    tabId = 2;
+    capture.storeRequest(makeReq('same'));
+    resolveBody({ body: 'from-A' });
+    await pending;
+    expect(capture.getAllRequests()[0].responseBody).toBeUndefined();
+    tabId = 1;
+    expect(capture.getAllRequests()[0].responseBody).toBe('from-A');
+  });
+
+  it('discarding a buffer invalidates an in-flight body even if the request id is reused', async () => {
+    let resolveBody!: (body: any) => void;
+    transport.responder = () => new Promise(resolve => { resolveBody = resolve; });
+    capture.storeRequest(makeReq('same'));
+    const pending = capture.captureAndAttachResponseBody('same');
+    capture.clear();
+    capture.storeRequest(makeReq('same'));
+    resolveBody({ body: 'old' });
+    await pending;
+    expect(capture.getAllRequests()[0].responseBody).toBeUndefined();
+  });
+
   beforeEach(async () => {
     originalAppData = process.env.APPDATA;
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'yautja-nc-'));
@@ -60,6 +88,31 @@ describe('NetworkCapture', () => {
   });
 
   describe('constructor / active state', () => {
+    it('redacts structured secrets in output and persisted captures without changing raw memory', () => {
+      const req = makeReq('structured', {
+        url: 'https://user:URL_PASSWORD@example.com/api?access_token=URL_SECRET&safe=yes#refresh_token=FRAGMENT_SECRET',
+        requestBody: JSON.stringify({ nested: [{ password: 'JSON_PASSWORD', accessToken: 'JSON_TOKEN', safe: 'keep' }] }),
+        responseBody: 'client_secret=FORM_SECRET&safe=keep&api%5Fkey=FORM_KEY',
+        responseHeaders: { location: 'https://example.com/?code=HEADER_SECRET', 'x-auth-token': 'HEADER_TOKEN' },
+      });
+      capture.setActive(true);
+      capture.storeRequest(req);
+      const output = capture.redactForOutput(req);
+      const persisted = fs.readFileSync(path.join(captureDir, capture.listFiles()[0]), 'utf8');
+      for (const secret of ['URL_PASSWORD', 'URL_SECRET', 'FRAGMENT_SECRET', 'JSON_PASSWORD', 'JSON_TOKEN', 'FORM_SECRET', 'FORM_KEY', 'HEADER_SECRET', 'HEADER_TOKEN']) {
+        expect(JSON.stringify(output)).not.toContain(secret);
+        expect(persisted).not.toContain(secret);
+      }
+      expect(output.requestBody).toContain('keep');
+      expect(output.url).toContain('safe=yes');
+      expect(capture.getAllRequests()[0].requestBody).toContain('JSON_PASSWORD');
+    });
+
+    it('redacts truncated JSON and multipart secret fields', () => {
+      expect(capture.redactBody('{"password":"TRUNCATED_SECRET')).not.toContain('TRUNCATED_SECRET');
+      expect(capture.redactBody('--boundary\r\nContent-Disposition: form-data; name="password"\r\n\r\nMULTIPART_SECRET\r\n--boundary--')).not.toContain('MULTIPART_SECRET');
+    });
+
     it('creates the capture directory on construction', () => {
       expect(fs.existsSync(captureDir)).toBe(true);
     });
@@ -182,6 +235,23 @@ describe('NetworkCapture', () => {
       capture.storeRequest(makeReq('r1', { requestHeaders: { authorization: 'Bearer secret' } }));
       const stored = capture.getAllRequests()[0]!;
       expect(stored.requestHeaders.authorization).toBe('Bearer secret');
+    });
+
+    it('redactForOutput oculta secretos de cabeceras y cuerpos sin mutar la captura', () => {
+      const token = 'ghp_' + 'a'.repeat(36);
+      capture.storeRequest(makeReq('r1', {
+        requestHeaders: { authorization: 'Bearer secret' },
+        requestBody: `{"token":"${token}","email":"user@example.com"}`,
+        responseBody: 'Authorization: Bearer ' + 't'.repeat(30),
+      }));
+
+      const output = capture.redactForOutput(capture.getAllRequests()[0]!);
+      expect(output.requestHeaders.authorization).toBe('[REDACTED]');
+      expect(output.requestBody).not.toContain(token);
+      expect(output.requestBody).toContain('[REDACTED:GitHub Token]');
+      expect(output.requestBody).toContain('[REDACTED:Email]');
+      expect(output.responseBody).toContain('[REDACTED:Bearer Token]');
+      expect(capture.getAllRequests()[0]!.requestBody).toContain(token);
     });
 
     it('storing the same id twice overwrites the memory entry', () => {

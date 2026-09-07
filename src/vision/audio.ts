@@ -29,10 +29,21 @@ export interface AudioConfig {
 }
 
 export class AudioSensor extends BaseSensor<ConsoleSummary> {
+  protected captureAllTabs = true;
   private config: AudioConfig;
-  private entries: ConsoleEntry[] = [];
-  private dedupMap: Map<string, ConsoleEntry> = new Map();
-  private dedupCount = 0;
+  private buffers = new Map<string, { entries: ConsoleEntry[]; dedupMap: Map<string, ConsoleEntry>; dedupCount: number }>();
+  private buffer(tabId?: number) {
+    const key = this.scopeKey(tabId);
+    if (!this.buffers.has(key)) {
+      if (this.buffers.size >= 8) this.buffers.delete(this.buffers.keys().next().value!);
+      this.buffers.set(key, { entries: [], dedupMap: new Map(), dedupCount: 0 });
+    }
+    return this.buffers.get(key)!;
+  }
+  private get entries() { return this.buffer().entries; }
+  private get dedupMap() { return this.buffer().dedupMap; }
+  private get dedupCount() { return this.buffer().dedupCount; }
+  private set dedupCount(value: number) { this.buffer().dedupCount = value; }
 
   constructor(transport: Transport, config?: Partial<AudioConfig>) {
     super(transport);
@@ -118,10 +129,11 @@ export class AudioSensor extends BaseSensor<ConsoleSummary> {
     return anomalies;
   }
 
-  clear(): void {
-    this.entries = [];
-    this.dedupMap.clear();
-    this.dedupCount = 0;
+  clear(tabId?: number): void {
+    const buffer = this.buffer(tabId);
+    buffer.entries = [];
+    buffer.dedupMap.clear();
+    buffer.dedupCount = 0;
   }
 
   getEntries(): ConsoleEntry[] {
@@ -133,8 +145,8 @@ export class AudioSensor extends BaseSensor<ConsoleSummary> {
    * (opcional) y devuelve como mucho las `max` entradas más recientes
    * (default 100). El buffer es un ring de maxEntries (500 por defecto).
    */
-  readEntries(opts?: { errorsOnly?: boolean; max?: number }): ConsoleEntry[] {
-    let list = this.entries;
+  readEntries(opts?: { errorsOnly?: boolean; max?: number; tabId?: number }): ConsoleEntry[] {
+    let list = this.buffer(opts?.tabId).entries;
     if (opts?.errorsOnly) list = list.filter((e) => e.level === 'error');
     const max = opts?.max ?? 100;
     return list.slice(-max);

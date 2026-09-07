@@ -45,6 +45,10 @@ export const operationMetaSchema = z.object({
   attempt: z.number().int().positive(),
   max_attempts: z.number().int().positive(),
   idempotency_key: z.string().nullable(),
+  status: z.enum(['pending', 'running', 'succeeded', 'failed', 'cancelled', 'outcome_unknown']).optional(),
+  phase: z.string().optional(),
+  elapsed_ms: z.number().nonnegative().optional(),
+  queue_ms: z.number().nonnegative().optional(),
 });
 
 export const stateMetaSchema = z.object({

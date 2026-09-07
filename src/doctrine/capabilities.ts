@@ -14,6 +14,7 @@ export interface CapabilityMatrix {
   trustedFileChooser: boolean;
   silentNetwork: boolean;
   browserFetch: boolean;
+  semanticCompilation: boolean;
   backends: {
     yautja: true;
     superapi?: 'configured' | 'missing';
@@ -40,6 +41,7 @@ export function detectCapabilities(env: CapabilityEnv): CapabilityMatrix {
     trustedFileChooser: env.hasEventChannel,
     silentNetwork: true, // Network domain listen (P13.5) always on
     browserFetch: true, // gated, but the capability exists
+    semanticCompilation: true, // Mecamorph module; actions still traverse Yautja policy
     backends: {
       yautja: true,
       superapi: env.superapiConfigured ? 'configured' : 'missing',

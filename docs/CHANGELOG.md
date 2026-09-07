@@ -1,5 +1,20 @@
 # Changelog
 
+## Sin publicar — 2026-08-27
+
+### Módulo Mecamorph
+
+- Integrado `@mecamorph/yautja-adapter` como capa de compilación semántica sin
+  duplicar sensores ni actuadores.
+- Nuevas herramientas MCP: `morph_compile`, `morph_list`, `morph_run` y
+  `morph_explain`.
+- `morph_compile` solo observa; los bindings generados empiezan en cuarentena.
+- `morph_run` exige `validation:true` para probar bindings en cuarentena y solo
+  promueve el binding que obtiene éxito verificado.
+- La matriz `capabilities` anuncia `semanticCompilation: true`.
+- Las acciones del adaptador vuelven a entrar por las herramientas de Yautja,
+  preservando perfiles, gates, envelopes y errores tipados.
+
 ## 0.2.0 — 2026-07-26 (Roadmap P10–P18)
 
 ### P10 — Error contract + response envelope

@@ -1,3 +1,4 @@
+import { assertOperationActive, OperationError } from './operation-scope.js';
 /**
  * TabRegistry (P13.5) — canonical tab identity.
  *
@@ -8,7 +9,7 @@
  *     BEFORE opening.
  *   - switchTab reported success without checking that the attached page
  *     is actually the requested tab. Now location.href is verified and a
- *     host mismatch surfaces as TAB_SWITCH_MISMATCH.
+ *     tab identity mismatch surfaces as TAB_SWITCH_MISMATCH.
  */
 
 export interface TabSummary {
@@ -22,7 +23,7 @@ export interface TabServerLike {
   listTabs(): Promise<TabSummary[]>;
   attachTab(tabId: number): Promise<void>;
   detachAll(): Promise<void>;
-  openTab(url: string, groupId?: number): Promise<{ tabId: number; url: string }>;
+  openTab(url: string, groupId?: number, focus?: boolean): Promise<{ tabId: number; url: string }>;
   getCurrentTabId(): number | null;
   send(method: string, params?: Record<string, any>): Promise<any>;
 }
@@ -43,14 +44,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function hostnameOf(url: string): string | null {
-  try {
-    return new URL(url).hostname || null;
-  } catch {
-    return null;
-  }
-}
-
 export class TabRegistry {
   private server: TabServerLike;
 
@@ -68,25 +61,23 @@ export class TabRegistry {
   }
 
   async locationHref(): Promise<string> {
-    try {
       const r = await this.server.send('Runtime.evaluate', { expression: 'location.href', returnByValue: true });
-      return typeof r?.result?.value === 'string' ? r.result.value : '';
-    } catch {
-      return '';
-    }
+      assertOperationActive();
+      if (typeof r?.result?.value !== 'string' || !r.result.value) throw new OperationError('TARGET_UNVERIFIED', 'Cannot verify the attached document');
+      return r.result.value;
   }
 
   /**
    * Open a tab, attach to it, and report the VERIFIED url (location.href
    * after attach) — never the previously active tab's url.
    */
-  async openVerified(url: string, opts?: { settleMs?: number; groupId?: number }): Promise<OpenTabVerified> {
+  async openVerified(url: string, opts?: { settleMs?: number; groupId?: number; focus?: boolean; onCreated?: (tab: { tabId: number; url: string }) => void }): Promise<OpenTabVerified> {
     const previousActiveTabId = await this.activeTabId();
-    const opened = await this.server.openTab(url, opts?.groupId);
+    const opened = await this.server.openTab(url, opts?.groupId, opts?.focus === true);
+    opts?.onCreated?.(opened);
 
     await sleep(opts?.settleMs ?? 1500); // let the page start loading
 
-    await this.server.detachAll();
     let attached = true;
     try {
       await this.server.attachTab(opened.tabId);
@@ -99,7 +90,13 @@ export class TabRegistry {
       }
     }
 
-    const verifiedUrl = attached ? await this.locationHref() : '';
+    let verifiedUrl = '';
+    if (attached) {
+      try {
+        verifiedUrl = await this.locationHref();
+        if (this.server.getCurrentTabId() !== opened.tabId) throw new OperationError('TARGET_MISMATCH', 'Attached tab changed during verification');
+      } catch { attached = false; verifiedUrl = ''; }
+    }
     return {
       tabId: opened.tabId,
       // Prefer the verified URL; fall back to what the extension reported.
@@ -111,9 +108,8 @@ export class TabRegistry {
   }
 
   /**
-   * Switch to a tab and verify identity. A mismatch is detected when both
-   * the registry URL and the live location.href parse as http(s) URLs and
-   * their hostnames differ (attach raced a close/redirect).
+   * Verify the transport target, allowing redirects within that exact tab.
+   * A hostname cannot distinguish two tabs from the same origin.
    */
   async switchVerified(tabId: number): Promise<SwitchVerified> {
     const previousTabId = this.server.getCurrentTabId();
@@ -121,15 +117,10 @@ export class TabRegistry {
     const target = tabs.find((t) => t.tabId === tabId);
     if (!target) return { ok: false, reason: 'not_found' };
 
-    await this.server.detachAll();
     await this.server.attachTab(tabId);
 
     const actualUrl = await this.locationHref();
-    const expectedHost = hostnameOf(target.url);
-    const actualHost = hostnameOf(actualUrl);
-    if (expectedHost && actualHost && expectedHost !== actualHost) {
-      return { ok: false, reason: 'mismatch', expectedUrl: target.url, actualUrl };
-    }
+    if (this.server.getCurrentTabId() !== tabId) return { ok: false, reason: 'mismatch', expectedUrl: target.url, actualUrl };
     return { ok: true, tabId, url: actualUrl || target.url, previousTabId };
   }
 }

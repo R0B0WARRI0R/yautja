@@ -18,6 +18,51 @@ export interface CapturedRequest {
 
 const CAPTURE_DIR = path.join(process.env.APPDATA || process.env.HOME || '/tmp', '.yautja-network-captures');
 const MAX_BODY_SIZE = 1024 * 1024;
+const REDACTED = '[REDACTED]';
+function sensitiveKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return /(?:password|passwd|passphrase|secret|token|apikey|authorization|cookie|credentials?|sessionid|csrftoken|xsrf|clientintegrity)/.test(normalized)
+    || ['code', 'otp', 'pin', 'pwd'].includes(normalized);
+}
+
+function mask(value: unknown): string {
+  // Preserve an existing pattern label, but never a partially redacted secret.
+  return typeof value === 'string' && /^\[REDACTED(?::[^\]\r\n]+)?\]$/.test(value) ? value : REDACTED;
+}
+
+function redactFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactFields);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) =>
+      [key, sensitiveKey(key) ? mask(child) : redactFields(child)]));
+  }
+  return value;
+}
+
+function redactParams(text: string): string {
+  const params = new URLSearchParams(text);
+  let changed = false;
+  for (const key of new Set(params.keys())) {
+    if (sensitiveKey(key)) { params.set(key, REDACTED); changed = true; }
+  }
+  return changed ? params.toString() : text;
+}
+
+function redactUrl(text: string): string {
+  try {
+    const url = new URL(text);
+    if (url.username) url.username = REDACTED;
+    if (url.password) url.password = REDACTED;
+    url.search = redactParams(url.search.slice(1));
+    // OAuth implicit flows and hash-router query strings can carry credentials.
+    const hash = url.hash.slice(1);
+    const queryAt = hash.indexOf('?');
+    url.hash = queryAt >= 0 ? hash.slice(0, queryAt + 1) + redactParams(hash.slice(queryAt + 1)) : redactParams(hash);
+    return url.toString();
+  } catch {
+    return text.replace(/([?&#])([^?&#]+)/g, (_match, separator: string, params: string) => separator + redactParams(params));
+  }
+}
 const PATTERNS = [
   { name: 'JWT', regex: /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g },
   { name: 'AWS Key', regex: /AKIA[0-9A-Z]{16}/g },
@@ -36,11 +81,24 @@ const PATTERNS = [
 
 export interface Transport {
   send(method: string, params?: Record<string, any>): Promise<any>;
+  getCurrentTabId?(): number | null;
+  getGeneration?(): string;
+  getDocumentEpoch?(tabId: number): number;
+  sendToTab?(tabId: number, generation: string, method: string, params?: Record<string, any>): Promise<any>;
 }
 
 export class NetworkCapture {
   private transport: Transport;
-  private requests: Map<string, CapturedRequest> = new Map();
+  private buffers = new Map<string, Map<string, CapturedRequest>>();
+  private get requests(): Map<string, CapturedRequest> {
+    const tabId = this.transport.getCurrentTabId?.() ?? 0;
+    const key = `${this.transport.getGeneration?.() ?? ''}:${tabId}:${this.transport.getDocumentEpoch?.(tabId) ?? 0}`;
+    if (!this.buffers.has(key)) {
+      this.buffers.set(key, new Map());
+      if (this.buffers.size > 8) this.buffers.delete(this.buffers.keys().next().value!);
+    }
+    return this.buffers.get(key)!;
+  }
   private active = false;
 
   constructor(transport: Transport) {
@@ -51,16 +109,37 @@ export class NetworkCapture {
   isActive(): boolean { return this.active; }
   setActive(v: boolean): void { this.active = v; }
 
+  private sendBodyCommand(method: string, requestId: string): Promise<any> {
+    const tabId = this.transport.getCurrentTabId?.();
+    const generation = this.transport.getGeneration?.();
+    if (tabId != null && generation && this.transport.sendToTab) {
+      return this.transport.sendToTab(tabId, generation, method, { requestId });
+    }
+    return this.transport.send(method, { requestId });
+  }
+
+  async captureAndAttachResponseBody(requestId: string): Promise<void> {
+    const buffer = this.requests;
+    const request = buffer.get(requestId);
+    if (!request) return;
+    const response = await this.captureResponseBody(requestId);
+    // Pin the record too: a clear/navigation or reused request id invalidates it.
+    if (!response || buffer.get(requestId) !== request) return;
+    request.responseBody = response.body;
+    request.size = response.body.length;
+    request.matches = this.detectPatterns(response.body);
+  }
+
   async captureRequestBody(requestId: string): Promise<string | null> {
     try {
-      const r = await this.transport.send('Network.getRequestPostData', { requestId });
+      const r = await this.sendBodyCommand('Network.getRequestPostData', requestId);
       return r?.postData?.substring(0, MAX_BODY_SIZE) || null;
     } catch { return null; }
   }
 
   async captureResponseBody(requestId: string): Promise<{ body: string; isBase64: boolean } | null> {
     try {
-      const r = await this.transport.send('Network.getResponseBody', { requestId });
+      const r = await this.sendBodyCommand('Network.getResponseBody', requestId);
       if (!r?.body) return null;
       const body = r.body.substring(0, MAX_BODY_SIZE);
       return { body, isBase64: !!r.base64Encoded };
@@ -69,6 +148,7 @@ export class NetworkCapture {
 
   storeRequest(req: CapturedRequest): void {
     this.requests.set(req.id, req);
+    if (this.requests.size > 500) this.requests.delete(this.requests.keys().next().value!);
     if (this.active) this.appendToFile(req);
   }
 
@@ -104,6 +184,41 @@ export class NetworkCapture {
     return Array.from(found);
   }
 
+  /** Redact bodies and sensitive headers before they cross the MCP boundary. */
+  redactForOutput(req: CapturedRequest): CapturedRequest {
+    return {
+      ...req,
+      url: redactUrl(req.url),
+      requestHeaders: this.sanitizeHeaders(req.requestHeaders) ?? {},
+      responseHeaders: this.sanitizeHeaders(req.responseHeaders),
+      requestBody: req.requestBody === undefined ? undefined : this.redactBody(req.requestBody),
+      responseBody: req.responseBody === undefined ? undefined : this.redactBody(req.responseBody),
+    };
+  }
+
+  redactBody(text: string): string {
+    let out = text;
+    for (const pattern of PATTERNS) {
+      pattern.regex.lastIndex = 0;
+      out = out.replace(pattern.regex, `[REDACTED:${pattern.name}]`);
+    }
+    try {
+      return JSON.stringify(redactFields(JSON.parse(out)));
+    } catch {
+      // Captures can be truncated or non-JSON. Handle complete/truncated scalar
+      // JSON fields too, without relying on the secret's format or length.
+      out = out.replace(/("(?:\\.|[^"\\])*")\s*:\s*("(?:\\.|[^"\\])*(?:"|$)|[^,}\]\r\n]+)/g,
+        (match, key: string, value: string) => {
+          try { return sensitiveKey(JSON.parse(key)) ? `${key}:${JSON.stringify(mask(value))}` : match; }
+          catch { return match; }
+        });
+    }
+    if (/^[^=&\s]+=[^\r\n]*$/.test(out)) out = redactParams(out);
+    out = out.replace(/(Content-Disposition:[^\r\n]*\bname="([^"]+)"[^\r\n]*\r?\n(?:[^\r\n]+\r?\n)*\r?\n)([\s\S]*?)(?=\r?\n--[^\r\n]+|$)/gi,
+      (match, prefix: string, name: string) => sensitiveKey(name) ? prefix + REDACTED : match);
+    return out;
+  }
+
   list(filters?: { urlPattern?: string; method?: string; hasMatches?: boolean; statusMin?: number; statusMax?: number; limit?: number }): CapturedRequest[] {
     let result = Array.from(this.requests.values());
     if (filters) {
@@ -137,30 +252,17 @@ export class NetworkCapture {
     try {
       const date = new Date(req.timestamp).toISOString().split('T')[0];
       const file = path.join(CAPTURE_DIR, `capture-${date}.jsonl`);
-      const sanitized: Partial<CapturedRequest> = {
-        id: req.id,
-        url: req.url,
-        method: req.method,
-        requestHeaders: this.sanitizeHeaders(req.requestHeaders),
-        requestBody: req.requestBody,
-        status: req.status,
-        responseHeaders: this.sanitizeHeaders(req.responseHeaders),
-        responseBody: req.responseBody,
-        timestamp: req.timestamp,
-        durationMs: req.durationMs,
-        size: req.size,
-        matches: req.matches,
-      };
+      const sanitized = this.redactForOutput(req);
       fs.appendFileSync(file, JSON.stringify(sanitized) + '\n');
     } catch {}
   }
 
   private sanitizeHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
     if (!headers) return undefined;
-    const sensitive = ['authorization', 'cookie', 'set-cookie', 'x-api-key', 'client-integrity'];
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(headers)) {
-      out[k] = sensitive.includes(k.toLowerCase()) ? '[REDACTED]' : v;
+      out[k] = sensitiveKey(k) ? REDACTED
+        : ['location', 'referer', 'referrer', 'content-location'].includes(k.toLowerCase()) ? redactUrl(v) : v;
     }
     return out;
   }

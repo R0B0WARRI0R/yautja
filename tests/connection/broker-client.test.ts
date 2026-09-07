@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import WebSocket from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 import { BrokerClient } from '../../src/connection/broker-client.js';
 import { BrokerDisconnectedError, ExtensionServer } from '../../src/connection/extension-server.js';
+
+const BRIDGE_TOKEN = 'b'.repeat(32);
 
 /**
  * Tests del protocolo broker↔cliente (Tanda A multi-instancia). Mismo patrón
@@ -22,7 +24,7 @@ function waitForOpen(ws: WebSocket): Promise<void> {
 function connectExtension(port: number, respondTo: (msg: any) => any | null): WebSocket {
   const ws = new WebSocket(`ws://127.0.0.1:${port}`);
   ws.on('open', () => {
-    ws.send(JSON.stringify({ type: 'hello', id: 'fake-ext', version: 'test' }));
+    ws.send(JSON.stringify({ type: 'hello', id: 'fake-ext', version: 'test', bridgeToken: BRIDGE_TOKEN }));
   });
   ws.on('message', (data) => {
     const msg = JSON.parse(data.toString());
@@ -32,15 +34,6 @@ function connectExtension(port: number, respondTo: (msg: any) => any | null): We
     }
   });
   return ws;
-}
-
-async function freePort(): Promise<number> {
-  const { WebSocketServer } = await import('ws');
-  const probe = new WebSocketServer({ port: 0 });
-  await new Promise<void>((res) => probe.on('listening', res));
-  const port = (probe.address() as any).port;
-  await new Promise<void>((res) => probe.close(() => res()));
-  return port;
 }
 
 describe('Broker↔Client — protocolo multi-instancia (Tanda A)', () => {
@@ -54,17 +47,17 @@ describe('Broker↔Client — protocolo multi-instancia (Tanda A)', () => {
   beforeEach(async () => {
     extensions = [];
     stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    basePort = await freePort();
     // BROKER: bindea el puerto base ("winner takes <base>").
-    broker = new ExtensionServer(basePort);
+    broker = new ExtensionServer(0, 500, { bridgeToken: BRIDGE_TOKEN });
     broker.setBrokerSessionId('sess_broker');
     await broker.start();
+    basePort = broker.getPort();
     expect(broker.getPort()).toBe(basePort);
     // CLIENT: mismo puerto base → auto-incrementa al siguiente libre.
-    clientServer = new ExtensionServer(basePort);
+    clientServer = new ExtensionServer(basePort, 500, { bridgeToken: BRIDGE_TOKEN });
     await clientServer.start();
-    expect(clientServer.getPort()).toBe(basePort + 1);
-    client = new BrokerClient(basePort, 'sess_client');
+    expect(clientServer.getPort()).toBeGreaterThan(basePort);
+    client = new BrokerClient(basePort, 'sess_client', undefined, BRIDGE_TOKEN);
     clientServer.setBrokerClient(client);
     client.onEvent((payload) => clientServer.dispatchBrokerEvent(payload));
   });
@@ -74,7 +67,7 @@ describe('Broker↔Client — protocolo multi-instancia (Tanda A)', () => {
     for (const ws of extensions) {
       try { ws.close(); } catch {}
     }
-    await client.stop();
+    await client?.stop();
     await clientServer.stop();
     await broker.stop();
   });
@@ -91,18 +84,34 @@ describe('Broker↔Client — protocolo multi-instancia (Tanda A)', () => {
     expect(client.isRegistered()).toBe(true);
     expect(client.getBrokerSessionId()).toBe('sess_broker');
     expect((broker as any).clientSockets.size).toBe(1);
-    // El CLIENT ve la extensión como alcanzable a través del broker.
-    expect(clientServer.isExtensionConnected()).toBe(true);
+    // Registro del cliente y disponibilidad del navegador son estados distintos.
+    expect(clientServer.isExtensionConnected()).toBe(false);
+  });
+
+  it('broker protegido rechaza el registro de un cliente sin token', async () => {
+    const intruder = new BrokerClient(basePort, 'sess_intruder', 300);
+    try {
+      expect(await intruder.start()).toBe(false);
+      expect((broker as any).clientSockets.size).toBe(0);
+    } finally {
+      await intruder.stop();
+    }
   });
 
   it('sin broker vivo en el puerto base → start() false (modo standalone)', async () => {
-    const orphanPort = await freePort();
-    const orphan = new BrokerClient(orphanPort, 'sess_orphan', 300);
+    // Reserve the port: another parallel suite must not become its broker.
+    const unavailable = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await new Promise<void>(resolve => unavailable.on('listening', resolve));
+    unavailable.on('connection', socket => socket.close(4001, 'No broker available'));
+    const orphanPort = (unavailable.address() as { port: number }).port;
+    const orphan = new BrokerClient(orphanPort, 'sess_orphan', 300, BRIDGE_TOKEN);
     try {
       expect(await orphan.start()).toBe(false);
       expect(orphan.isRegistered()).toBe(false);
     } finally {
       await orphan.stop();
+      for (const socket of unavailable.clients) socket.terminate();
+      await new Promise<void>(resolve => unavailable.close(() => resolve()));
     }
   });
 
@@ -176,7 +185,8 @@ describe('Broker↔Client — protocolo multi-instancia (Tanda A)', () => {
 
   it('pérdida del broker → modo degradado con BrokerDisconnectedError tipado', async () => {
     await client.start();
-    expect(clientServer.isExtensionConnected()).toBe(true);
+    expect(client.isRegistered()).toBe(true);
+    expect(clientServer.isExtensionConnected()).toBe(false);
 
     await broker.stop();
     await vi.waitFor(() => expect(client.isRegistered()).toBe(false), { timeout: 2000, interval: 20 });
@@ -196,7 +206,7 @@ describe('Broker↔Client — protocolo multi-instancia (Tanda A)', () => {
   it('la extensión no ocupa el slot de los clientes (y viceversa)', async () => {
     await client.start();
     // Un segundo cliente con otro sessionId también cabe.
-    const client2 = new BrokerClient(basePort, 'sess_client_2');
+    const client2 = new BrokerClient(basePort, 'sess_client_2', undefined, BRIDGE_TOKEN);
     try {
       expect(await client2.start()).toBe(true);
       expect((broker as any).clientSockets.size).toBe(2);

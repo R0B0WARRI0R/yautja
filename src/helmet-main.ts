@@ -1,9 +1,11 @@
-import { Helmet, resolvePort } from './helmet.js';
+import { Helmet, resolveBridgeToken, resolvePort } from './helmet.js';
 
 async function main() {
   const { port, source } = resolvePort();
+  const bridgeToken = resolveBridgeToken(port);
   process.stderr.write(`[Yautja] Port: ${port} (source: ${source})\n`);
-  const helmet = new Helmet({ port });
+  process.stderr.write(`[Yautja] bridge authentication: ${bridgeToken ? 'enabled' : 'disabled (set YAUTJA_BRIDGE_TOKEN to enable)'}\n`);
+  const helmet = new Helmet({ port, bridgeToken });
 
   // Graceful shutdown on signals: stop() kills the MITM proxy child and
   // restores the Windows proxy registry — without this, a taskkill leaves

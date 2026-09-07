@@ -57,6 +57,10 @@ export interface YautjaError {
 }
 
 export interface OperationMeta {
+  status?: string;
+  phase?: string;
+  elapsed_ms?: number;
+  queue_ms?: number;
   tool: string;
   action_type: string;
   operation_id: string;

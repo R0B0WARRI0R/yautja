@@ -17,7 +17,12 @@ vi.mock('../../src/connection/extension-server.js', () => {
     getCurrentTabId = vi.fn(() => 1);
     setNetworkCaptureCallback = vi.fn();
     on = vi.fn(() => () => {});
-    send = vi.fn(async () => ({}));
+    send = vi.fn(async (method: string) => method === 'Runtime.evaluate' ? { result: { value: JSON.stringify({
+      url: 'https://example.com', readyState: 'complete',
+      semantic: { title: 'Example', pageType: 'article', headings: [], mainContentPreview: '', language: 'en' },
+      interactive: { buttons: [], links: [], inputs: [], total: 0 },
+      structural: { totalElements: 1, depth: 1, iframes: 0, images: 0, scripts: 0, forms: 0, stylesheets: 0 },
+    }) } } : {});
   }
   return { ExtensionServer: MES };
 });

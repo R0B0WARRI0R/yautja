@@ -52,6 +52,7 @@ export interface StructuralView {
 
 export interface DOMSummary {
   url: string;
+  readyState?: 'loading' | 'interactive' | 'complete';
   semantic: SemanticView;
   interactive: InteractiveView;
   structural: StructuralView;
@@ -233,6 +234,7 @@ const EXTRACTION_SCRIPT = `(function() {
 
   return JSON.stringify({
     url: location.href,
+    readyState: document.readyState,
     semantic: {
       pageType: pageType,
       title: title,
@@ -262,6 +264,8 @@ export class EMSensor extends BaseSensor<DOMSummary> {
   private config: EMConfig;
   private cached: DOMSummary | null = null;
   private cachedAt = 0;
+  private cachedScope = '';
+  private revision = 0;
 
   constructor(transport: Transport, config?: Partial<EMConfig>) {
     super(transport);
@@ -269,13 +273,15 @@ export class EMSensor extends BaseSensor<DOMSummary> {
   }
 
   protected doSubscribe(): void {
-    this.on('Page.frameNavigated', () => { this.cached = null; });
-    this.on('Page.loadEventFired', () => { this.cached = null; });
+    this.on('Page.frameNavigated', () => this.clear());
+    this.on('Page.loadEventFired', () => this.clear());
   }
 
   async summarize(query?: DOMQuery): Promise<DOMSummary> {
     void query;
-    if (this.cached && Date.now() - this.cachedAt < this.config.cacheTtlMs) {
+    const scope = this.scopeKey();
+    const revision = this.revision;
+    if (this.cached && this.cachedScope === scope && Date.now() - this.cachedAt < this.config.cacheTtlMs) {
       return this.cached;
     }
 
@@ -290,7 +296,9 @@ export class EMSensor extends BaseSensor<DOMSummary> {
     }
 
     const data = JSON.parse(json) as DOMSummary;
+    if (scope !== this.scopeKey() || revision !== this.revision) throw new Error('Document changed during DOM capture; observe again');
     this.cached = data;
+    this.cachedScope = scope;
     this.cachedAt = Date.now();
     return data;
   }
@@ -310,6 +318,7 @@ export class EMSensor extends BaseSensor<DOMSummary> {
   }
 
   clear(): void {
+    this.revision++;
     this.cached = null;
     this.cachedAt = 0;
   }

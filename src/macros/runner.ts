@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { bindMacroScope, currentMacroSignal, MacroTimeoutError, withMacroDeadline } from './execution-scope.js';
 import type { RegisterResult, DeleteResult } from './types.js';
 import { MACRO_NAME_PATTERN } from './types.js';
 import { resolveUserDir } from './loader.js';
@@ -11,13 +13,6 @@ import type { BrowserAction } from '../arsenal/action-types.js';
 /** Inline duck-typed surface required by MacroRunner — exactly the 6 Helmet
  *  instance methods the curated MacroContext exposes. Avoids a separate interface. */
 type HostSurface = Pick<MacroContext, 'observe' | 'act' | 'inspect' | 'diff' | 'reattach' | 'callTool'>;
-
-class TimeoutError extends Error {
-  constructor(ms: number) {
-    super(`timeout after ${ms}ms`);
-    this.name = 'TimeoutError';
-  }
-}
 
 export class MacroRunner {
   private registry = new Map<string, MacroRegistryEntry>();
@@ -142,12 +137,14 @@ export class MacroRunner {
     }
 
     const effectiveTimeout = timeoutMsOverride ?? def.timeoutMs ?? DEFAULT_MACRO_TIMEOUT_MS;
+    if (!Number.isFinite(effectiveTimeout) || effectiveTimeout <= 0 || effectiveTimeout > 2_147_483_647) {
+      return { success: false, stage: 'validation', error: 'timeout must be between 0 and 2147483647ms (exclusive of 0)' };
+    }
     const logBuffer: string[] = [];
-    const ctx = this.buildCtx(logBuffer);
 
     const start = Date.now();
     try {
-      const result = await this.raceWithTimeout(def.run(args as any, ctx), effectiveTimeout);
+      const result = await withMacroDeadline(effectiveTimeout, () => def.run(args as any, this.buildCtx(logBuffer)));
       return {
         success: true,
         result,
@@ -157,7 +154,7 @@ export class MacroRunner {
       };
     } catch (err) {
       const elapsedMs = Date.now() - start;
-      const isTimeout = err instanceof TimeoutError;
+      const isTimeout = err instanceof MacroTimeoutError;
       return {
         success: false,
         error: isTimeout
@@ -198,29 +195,17 @@ export class MacroRunner {
     return null;
   }
 
-  private async raceWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new TimeoutError(ms)), ms);
-    });
-    try {
-      return await Promise.race([promise, timeout]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
   private buildCtx(logBuffer: string[]): MacroContext {
     const h = this.host;
     return {
-      observe: (q: string) => h.observe(q),
-      act: (a: BrowserAction) => h.act(a),
-      inspect: (d: 'network' | 'dom' | 'console' | 'performance' | 'security') => h.inspect(d),
-      diff: () => h.diff(),
-      reattach: () => h.reattach(),
-      callTool: (name: string, args?: Record<string, unknown>) => h.callTool(name, args),
-      sleep: (ms: number) => new Promise<void>(r => setTimeout(r, ms)),
-      log: (m: string) => { logBuffer.push(m); },
+      observe: bindMacroScope((q: string) => h.observe(q)),
+      act: bindMacroScope((a: BrowserAction) => h.act(a)),
+      inspect: bindMacroScope((d: 'network' | 'dom' | 'console' | 'performance' | 'security') => h.inspect(d)),
+      diff: bindMacroScope(() => h.diff()),
+      reattach: bindMacroScope(() => h.reattach()),
+      callTool: bindMacroScope((name: string, args?: Record<string, unknown>) => h.callTool(name, args)),
+      sleep: bindMacroScope((ms: number) => sleep(ms, undefined, { signal: currentMacroSignal() })),
+      log: bindMacroScope((m: string) => { logBuffer.push(m); }),
     };
   }
 }

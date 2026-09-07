@@ -25,6 +25,26 @@ node dist/helmet-main.js
 | Network captures | `~/.yautja-network-captures/` | — | Compartido (OK: append-only) |
 | Traces/HAR/snapshots | `~/.yautja/{traces,har,snapshots}` | — | Compartido (OK) |
 
+## Autenticación del bridge local
+
+El bridge escucha solo en `127.0.0.1`, pero puedes exigir además un secreto
+compartido para que un proceso local ajeno no pueda registrarse como extensión
+ni como cliente broker. El arranque normal (`helmet-main.js`) carga el token
+desde el `config.json` de la extensión cuyo `yjPort` coincide con el helmet.
+El archivo es local y está ignorado por Git.
+
+```powershell
+$token = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+@{ yjPort = 9876; yjBridgeToken = $token } | ConvertTo-Json | Set-Content extension/config.json
+node dist/helmet-main.js
+```
+
+Para Victoria, usa su puerto y su copia de la extensión (`9999` y
+`extension-chrome/config.json`). Los helmets que comparten broker deben usar
+el mismo token. Recarga la extensión desde `chrome://extensions` después de
+cambiar su configuración. `YAUTJA_BRIDGE_TOKEN` sigue disponible para
+despliegues que no usen el directorio local de extensiones y tiene prioridad.
+
 ## Limitaciones honestas
 
 - **Un navegador = un casco.** Dos cascos contra el mismo Chrome compiten por las pestañas (attach es exclusivo por pestaña en la práctica). Multi-sesión real = varios navegadores (perfiles o instalaciones distintas), cada uno con su extensión y su casco.

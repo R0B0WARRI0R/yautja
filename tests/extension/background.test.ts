@@ -44,6 +44,7 @@ class FakeWebSocket {
 const chromeMock = {
   runtime: {
     id: 'test-ext-id',
+    getURL: vi.fn((path: string) => `chrome-extension://test-ext-id/${path}`),
     onStartup: { addListener: vi.fn() },
     onInstalled: { addListener: vi.fn() },
     lastError: null as any,
@@ -73,7 +74,10 @@ const chromeMock = {
   },
   tabGroups: { update: vi.fn(async () => {}) },
   windows: { update: vi.fn(async () => {}) },
-  storage: { local: { get: vi.fn(async () => ({})) }, onChanged: { addListener: vi.fn() } },
+  storage: {
+    local: { get: vi.fn(async () => ({})), set: vi.fn(async () => {}) },
+    onChanged: { addListener: vi.fn() },
+  },
   management: { getAll: vi.fn(async () => []), setEnabled: vi.fn(async () => {}) },
   proxy: {
     settings: {
@@ -92,16 +96,64 @@ function lastResponse(id: number): any {
   return sent.filter((m) => m.id === id).pop();
 }
 
-describe('extension/background.js — health y timeouts de handler', () => {
+describe.each(['extension', 'extension-chrome'])('%s/background.js — transport and lifecycle', (variant) => {
   beforeAll(async () => {
     (globalThis as any).chrome = chromeMock;
     (globalThis as any).WebSocket = FakeWebSocket;
-    await import('../../extension/background.js');
+    (globalThis as any).fetch = vi.fn(async () => ({ ok: false }));
+    chromeMock.storage.local.get.mockResolvedValue({});
+    FakeWebSocket.instances.length = 0;
+    if (variant === 'extension') await import('../../extension/background.js');
+    else await import('../../extension-chrome/background.js');
+    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
   });
 
   beforeEach(() => {
     sent.length = 0;
+    chromeMock.tabs.create.mockClear();
+    chromeMock.tabs.update.mockClear();
+    chromeMock.tabs.get.mockClear();
+    chromeMock.windows.update.mockClear();
+    chromeMock.tabs.remove.mockClear();
+    chromeMock.tabs.group.mockClear();
     ws().open();
+  });
+
+  it('usa el endpoint loopback del helmet por defecto', () => {
+    expect(ws().url).toBe('ws://127.0.0.1:9876');
+  });
+
+  it('openTab abre en segundo plano por defecto y solo roba foco con focus:true', async () => {
+    ws().receive({ id: 20, type: 'openTab', url: 'https://example.com/background' });
+    await vi.waitFor(() => expect(lastResponse(20)?.type).toBe('result'));
+    expect(chromeMock.tabs.create).toHaveBeenLastCalledWith({
+      url: 'https://example.com/background',
+      active: false,
+    });
+    expect(lastResponse(20).result.focused).toBe(false);
+
+    ws().receive({ id: 21, type: 'openTab', url: 'https://example.com/focused', focus: true });
+    await vi.waitFor(() => expect(lastResponse(21)?.type).toBe('result'));
+    expect(chromeMock.tabs.create).toHaveBeenLastCalledWith({
+      url: 'https://example.com/focused',
+      active: true,
+    });
+    expect(lastResponse(21).result.focused).toBe(true);
+  });
+
+  it('switchToTab no activa la pestaña ni la ventana salvo focus:true', async () => {
+    ws().receive({ id: 22, type: 'switchToTab', tabId: 5 });
+    await vi.waitFor(() => expect(lastResponse(22)?.type).toBe('result'));
+    expect(chromeMock.tabs.get).toHaveBeenCalledWith(5);
+    expect(chromeMock.tabs.update).not.toHaveBeenCalled();
+    expect(chromeMock.windows.update).not.toHaveBeenCalled();
+    expect(lastResponse(22).result.focused).toBe(false);
+
+    ws().receive({ id: 23, type: 'switchToTab', tabId: 5, focus: true });
+    await vi.waitFor(() => expect(lastResponse(23)?.type).toBe('result'));
+    expect(chromeMock.tabs.update).toHaveBeenLastCalledWith(5, { active: true });
+    expect(chromeMock.windows.update).toHaveBeenLastCalledWith(1, { focused: true });
+    expect(lastResponse(23).result.focused).toBe(true);
   });
 
   afterEach(() => {
@@ -117,6 +169,40 @@ describe('extension/background.js — health y timeouts de handler', () => {
     expect(typeof res.result.uptimeMs).toBe('number');
     expect(typeof res.result.pendingHandlers).toBe('number');
     expect(res.result.attachedTabs).toEqual([]);
+  });
+
+  it('rejects a command from an old connection generation before touching Chrome', async () => {
+    ws().receive({ type: 'helloAck', generation: 'current' });
+    ws().receive({ id: 30, type: 'openTab', generation: 'old', url: 'https://example.com' });
+    await vi.waitFor(() => expect(lastResponse(30)?.type).toBe('error'));
+    expect(chromeMock.tabs.create).not.toHaveBeenCalled();
+  });
+
+  it('cancellation stops group mutation after a pending create resolves', async () => {
+    let resolveCreate!: (tab: any) => void;
+    chromeMock.tabs.create.mockReturnValueOnce(new Promise(resolve => { resolveCreate = resolve; }));
+    ws().receive({ type: 'helloAck', generation: 'cancel-test' });
+    ws().receive({ id: 31, type: 'openTab', generation: 'cancel-test', groupId: 42, url: 'https://example.com' });
+    ws().receive({ type: 'cancelCommand', commandId: 31, generation: 'cancel-test' });
+    resolveCreate({ id: 7, url: 'https://example.com' });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(chromeMock.tabs.group).not.toHaveBeenCalled();
+    expect(lastResponse(31)).toBeUndefined();
+  });
+
+  it('failed grouping returns an error and cleans the newly created tab', async () => {
+    chromeMock.tabs.group.mockRejectedValueOnce(new Error('group disappeared'));
+    ws().receive({ id: 32, type: 'openTab', groupId: 42, url: 'https://example.com' });
+    await vi.waitFor(() => expect(lastResponse(32)?.type).toBe('error'));
+    expect(lastResponse(32).error).toContain('cleaned=true');
+    expect(chromeMock.tabs.remove).toHaveBeenCalledWith(7);
+  });
+
+  it('finish cannot close a tab moved out of the group at the last moment', async () => {
+    chromeMock.tabs.get.mockResolvedValueOnce({ id: 5, windowId: 1, groupId: 99 } as any);
+    ws().receive({ id: 33, type: 'closeTab', tabId: 5, expectedGroupId: 42 });
+    await vi.waitFor(() => expect(lastResponse(33)?.type).toBe('error'));
+    expect(chromeMock.tabs.remove).not.toHaveBeenCalled();
   });
 
   it('handler colgado en CDP → error "timed out" a los 20s y health delata el wedge', async () => {
@@ -170,5 +256,30 @@ describe('extension/background.js — health y timeouts de handler', () => {
     const err = lastResponse(11);
     expect(err.type).toBe('error');
     expect(err.error).toMatch(/timed out after 45000ms/);
+  });
+
+  it('un puerto de paquete o legado rota por la ventana; source=user queda fijado', async () => {
+    vi.useFakeTimers();
+
+    // Estado legado: yjPort existe pero las versiones antiguas no guardaban
+    // yjPortSource. Debe tratarse como puerto base y probar base+1 al fallar.
+    chromeMock.storage.local.get.mockResolvedValue({ yjPort: 9990 });
+    ws().close();
+    await vi.advanceTimersByTimeAsync(2_001);
+    expect(ws().url).toBe('ws://127.0.0.1:9990');
+
+    ws().close();
+    await vi.advanceTimersByTimeAsync(2_001);
+    expect(ws().url).toBe('ws://127.0.0.1:9991');
+
+    // Un override manual explícito nunca salta a otro puerto.
+    chromeMock.storage.local.get.mockResolvedValue({ yjPort: 9990, yjPortSource: 'user' });
+    ws().close();
+    await vi.advanceTimersByTimeAsync(2_001);
+    expect(ws().url).toBe('ws://127.0.0.1:9990');
+
+    ws().close();
+    await vi.advanceTimersByTimeAsync(2_001);
+    expect(ws().url).toBe('ws://127.0.0.1:9990');
   });
 });

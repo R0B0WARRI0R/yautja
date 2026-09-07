@@ -10,8 +10,9 @@ import {
 } from '../../src/doctrine/registry.js';
 
 describe('Error code registry', () => {
-  it('has exactly 27 MVP codes (26 product + 1 sentinel UNKNOWN_ERROR_CODE)', () => {
-    expect(MVP_CODES).toHaveLength(27);
+  it('has 27 original codes and 12 runtime reliability codes', () => {
+    expect(MVP_CODES).toHaveLength(39);
+    expect(MVP_CODES.filter(c => c.code.startsWith('YJ.RUNTIME.'))).toHaveLength(12);
   });
 
   it('REGISTRY size matches MVP_CODES length (no duplicates, no missing)', () => {
@@ -112,7 +113,7 @@ describe('lookupCode', () => {
 describe('codesInFamily', () => {
   it('returns all 11 action codes', () => {
     const actionCodes = codesInFamily('action');
-    expect(actionCodes).toHaveLength(11);
+    expect(actionCodes).toHaveLength(23);
     expect(actionCodes.map(c => c.code)).toContain('YJ.ACT.DOM_TARGET_STALE');
     expect(actionCodes.map(c => c.code)).toContain('YJ.ACT.TYPE_PARTIAL');
     expect(actionCodes.map(c => c.code)).toContain('YJ.ACT.WAIT_TIMEOUT');
@@ -143,7 +144,7 @@ describe('codesInFamily', () => {
     expect(codesInFamily('opsec')).toHaveLength(2);
   });
 
-  it('known categories sum to 27', () => {
+  it('known categories account for every registered code', () => {
     const total = (['protocol', 'action', 'capture', 'net', 'policy', 'opsec'] as const)
       .reduce((acc, cat) => acc + codesInFamily(cat).length, 0);
     expect(total).toBe(MVP_CODES.length);

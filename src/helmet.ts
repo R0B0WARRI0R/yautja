@@ -1,7 +1,10 @@
 import { createInterface } from 'readline';
+import { OperationManager, currentOperation, OperationError, assertOperationActive, operationPhase } from './connection/operation-scope.js';
+import { SessionWorkspace } from './connection/session-workspace.js';
+import { createHash } from 'node:crypto';
+import { yautjaResponseSchema } from './doctrine/schemas.js';
 import fs from 'fs';
 import { ExtensionServer } from './connection/extension-server.js';
-import { BrokerClient } from './connection/broker-client.js';
 import { BrokerReelection } from './connection/broker-reelection.js';
 import { ThermalSensor } from './vision/thermal.js';
 import { EMSensor } from './vision/em.js';
@@ -85,15 +88,87 @@ import type { Anomaly } from './vision/base-sensor.js';
 import type { BrowserAction, ActionResult } from './arsenal/action-types.js';
 import { arsenalToDoctrine, makeError } from './arsenal/errors.js';
 import type { ArsenalErrorType } from './arsenal/errors.js';
+import { MecamorphModule, YautjaBrowserAdapter } from '@mecamorph/yautja-adapter';
+
+const BUILD_ID = createHash('sha256').update(fs.readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 16);
+const RESPONSE_OUTPUT_SCHEMA = z.toJSONSchema(yautjaResponseSchema);
 
 export interface HelmetConfig {
   port: number;
   autoAttach: boolean;
+  /** Shared secret for extension and local broker authentication. */
+  bridgeToken?: string;
   /** Post-action settle delay in ms (P12: conditional — skipped for wait actions). 0 disables. */
   postActionDelayMs: number;
+  operationTimeoutMs?: number;
 }
 
 export type PortSource = 'cli' | 'env' | 'default';
+
+/** Canonical Yautja names used for per-session browser tab groups. */
+export const PREDATOR_GROUP_NAMES = [
+  'Wolf',
+  'Scar',
+  'Celtic',
+  'Chopper',
+  'Berserker',
+  'Falconer',
+  'Tracker',
+  'Jungle Hunter',
+  'City Hunter',
+  'Crucified',
+  'Feral',
+  'Greyback',
+] as const;
+
+/** Stable name selection: the same MCP session always gets the same hunter. */
+export function predatorGroupNameForSession(sessionId: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < sessionId.length; i++) {
+    hash ^= sessionId.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return PREDATOR_GROUP_NAMES[(hash >>> 0) % PREDATOR_GROUP_NAMES.length]!;
+}
+
+/**
+ * Optional migration path: when set, every local bridge peer must present
+ * this token in its first WebSocket message. A short token is rejected rather
+ * than silently creating a weak protection boundary.
+ */
+export function resolveBridgeToken(port?: number): string | undefined {
+  const token = process.env.YAUTJA_BRIDGE_TOKEN?.trim();
+  if (token) {
+    if (token.length < 32) {
+      throw new Error('YAUTJA_BRIDGE_TOKEN must contain at least 32 characters');
+    }
+    return token;
+  }
+  if (port === undefined) return undefined;
+
+  // helmet-main is launched from this local checkout. Loading the token from
+  // the matching unpacked extension config keeps every broker/client process
+  // on the machine in sync, even when different MCP hosts spawn them.
+  const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  for (const relativeConfig of ['extension/config.json', 'extension-chrome/config.json']) {
+    try {
+      const rawConfig = fs.readFileSync(path.join(projectRoot, relativeConfig), 'utf8').replace(/^\uFEFF/, '');
+      const config = JSON.parse(rawConfig);
+      if (Number(config?.yjPort) !== port || typeof config?.yjBridgeToken !== 'string') continue;
+      const configToken = config.yjBridgeToken.trim();
+      if (configToken.length < 32) {
+        throw new Error(`${relativeConfig} yjBridgeToken must contain at least 32 characters`);
+      }
+      return configToken;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        throw new Error(`Invalid JSON in ${relativeConfig}`);
+      }
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+  }
+  return undefined;
+}
 
 function envPort(name: string, fallback: number): number {
   const v = process.env[name]?.trim();
@@ -348,6 +423,8 @@ export class Helmet {
   private cdpRemote: CdpRemoteClient;
   private mitmProxy: MitmProxyServer;
   private tabRegistry: TabRegistry;
+  /** Semantic capability compiler. Browser ownership and policy remain in Yautja. */
+  private mecamorph: MecamorphModule;
   private telemetry = new TelemetryCollector();
   private recoveryStats = createRecoveryStatsTool(this.telemetry);
   private sessionId = `sess_${generateOperationId().slice(3)}`;
@@ -413,20 +490,28 @@ export class Helmet {
     onOutcome: (outcome) => this.telemetry.record(outcome),
   });
   private attached = false;
+  private readonly operations = new OperationManager();
+  private readonly cancelledRequests = new Set<string | number>();
+  private mcpProtocolVersion = '2024-11-05';
+  private dataTarget = '';
+  private readonly workspace = new SessionWorkspace();
+  private finishingWorkspace = false;
+  private workspaceBrowserId: string | null = null;
+  private groupSeedTabId: number | null = null;
   /**
    * P8: id del grupo de pestañas de sesión (sandbox estilo "MCP tab group"
-   * de Claude in Chrome). null hasta que se cree con sessionGroupCreate.
+   * de Claude in Chrome). Se crea al abrir la primera pestaña salvo opt-out.
    * Persiste en memoria del helmet durante la sesión MCP.
    */
   private sessionGroupId: number | null = null;
-  /** Multi-instancia (Tanda A): enlace al broker cuando este helmet es CLIENT. */
-  private brokerClient: BrokerClient | null = null;
+  /** Stable Yautja name so each agent/session is recognizable in Brave. */
+  private sessionGroupName = predatorGroupNameForSession(this.sessionId);
   /** Multi-instancia (Tanda C): bucle de reelección/re-registro de broker. */
   private brokerReelection: BrokerReelection | null = null;
 
   constructor(config?: Partial<HelmetConfig>) {
-    this.config = { ...DEFAULT_CONFIG, ...config };
-    this.server = new ExtensionServer(this.config.port);
+    this.config = { ...DEFAULT_CONFIG, ...config, bridgeToken: config?.bridgeToken ?? resolveBridgeToken() };
+    this.server = new ExtensionServer(this.config.port, 500, { bridgeToken: this.config.bridgeToken });
     this.router = new AttentionRouter();
     this.memory = new WorkingMemory(5);
 
@@ -475,6 +560,9 @@ export class Helmet {
     this.cdpRemote = new CdpRemoteClient(resolveCdpRemotePort());
     this.mitmProxy = new MitmProxyServer(resolveProxyPort());
     this.tabRegistry = new TabRegistry(this.server);
+    this.mecamorph = new MecamorphModule(new YautjaBrowserAdapter({
+      callTool: (name, toolArgs) => this.callTool(name, toolArgs),
+    }));
     this.server.setNetworkCaptureCallback((msg: any) => {
       if (msg.action === 'add' && msg.entry) {
         this.networkCapture.storeRequest(msg.entry);
@@ -500,52 +588,29 @@ export class Helmet {
       );
     });
     this.server.on('Network.loadingFinished', (p: any) => {
-      this.networkCapture.captureResponseBody(p.requestId).then((r) => {
-        if (r) this.networkCapture.attachBodyToRequest(p.requestId, 'response', r.body);
-      }).catch(() => {});
+      this.networkCapture.captureAndAttachResponseBody(p.requestId).catch(() => {});
     });
   }
 
   async start(): Promise<void> {
     await this.server.start();
 
-    // Multi-instancia (Tanda A): "winner takes <puerto base>". El helmet que
-    // bindeó el puerto base es BROKER (acepta clientes en el mismo listener);
-    // los demás se registran como CLIENT y enrutan sus comandos vía broker.
-    // Sin broker vivo, este helmet arranca en standalone y el bucle de
-    // reelección (Tanda C) lo re-registra o lo promueve a broker.
-    // El sessionId propio se expone siempre: en `registered` (como broker) y
-    // en las respuestas brokerInfo del discovery (Tanda C).
+    // Port ownership does not imply extension ownership after a restart.
+    // Every process reconciles against the direct owner in its own window.
     this.server.setBrokerSessionId(this.sessionId);
 
     // Iniciar heartbeat sweep y MCP silence watchdog (zombie detection).
     this.server.startGroupSweep?.();
     this.server.startMcpWatchdog?.();
 
-    if (this.server.getPort() === this.config.port) {
-      process.stderr.write(`[Yautja] multi-instance role=broker (port ${this.server.getPort()}, session ${this.sessionId})\n`);
-    } else {
-      const client = new BrokerClient(this.config.port, this.sessionId);
-      this.server.setBrokerClient(client);
-      // Tanda C: ante pérdida del broker o fallo del registro inicial, el
-      // bucle re-escanea la ventana y re-registra o promueve este helmet.
-      this.brokerReelection = new BrokerReelection({
-        server: this.server,
-        sessionId: this.sessionId,
-        windowBasePort: this.config.port,
-        getGroupId: () => this.sessionGroupId,
-      });
-      if (await client.start()) {
-        this.brokerClient = client;
-        client.onEvent((payload) => this.server.dispatchBrokerEvent(payload));
-        this.brokerReelection.adopt(client);
-        process.stderr.write(`[Yautja] multi-instance role=client → registered with broker :${this.config.port} (session ${this.sessionId})\n`);
-      } else {
-        this.server.setBrokerClient(null);
-        this.brokerReelection.start();
-        process.stderr.write(`[Yautja] multi-instance: no broker at :${this.config.port} — standalone (port ${this.server.getPort()})\n`);
-      }
-    }
+    this.brokerReelection = new BrokerReelection({
+      server: this.server,
+      sessionId: this.sessionId,
+      windowBasePort: this.config.port,
+      getGroupId: () => this.sessionGroupId,
+      bridgeToken: this.config.bridgeToken,
+    });
+    this.brokerReelection.start();
 
     if (!this.server.isExtensionConnected()) {
       // Espera ACOTADA: el host MCP mata el proceso si no arrancamos en ~30s,
@@ -604,6 +669,10 @@ export class Helmet {
 
   async stop(): Promise<void> {
     this.sessionScheduler.stop();
+    this.operations.cancelAll();
+    if (this.sessionGroupId !== null && this.server.isExtensionConnected()) {
+      await this.callTool('session_finish', {}).catch(() => {});
+    }
     this.thermal.unsubscribe();
     this.em.unsubscribe();
     this.audio.unsubscribe();
@@ -617,10 +686,6 @@ export class Helmet {
     if (this.brokerReelection) {
       await this.brokerReelection.stop();
       this.brokerReelection = null;
-    }
-    if (this.brokerClient) {
-      await this.brokerClient.stop();
-      this.brokerClient = null;
     }
     await this.server.stop();
   }
@@ -644,6 +709,17 @@ export class Helmet {
   }
 
   async ensureAttached(): Promise<void> {
+    assertOperationActive();
+    const selected = this.server.getSelectedTabId?.() ?? this.server.getCurrentTabId();
+    if (selected !== null) {
+      if (this.server.isSelectedBrowserCurrent?.() === false) throw new OperationError('STALE_GENERATION', 'Browser instance changed; select a target explicitly');
+      const tabs = await this.server.listTabs();
+      if (!tabs.some(t => t.tabId === selected)) throw new OperationError('TARGET_MISSING', `Selected tab ${selected} no longer exists; select a new target explicitly`);
+      if (!this.attached || this.server.getCurrentTabId() !== selected || this.server.isAttachmentCurrent?.() === false) await this.server.attachTab(selected);
+      this.attached = true;
+      this.resetTargetData();
+      return;
+    }
     if (this.attached) {
       try {
         const tabs = await this.server.listTabs();
@@ -657,7 +733,46 @@ export class Helmet {
 
   async reattach(): Promise<void> {
     this.attached = false;
-    await this.attachToActiveTab();
+    await this.ensureAttached();
+  }
+
+  /** Ensure this MCP session owns a live, named tab group. */
+  private async ensureSessionGroup(): Promise<{
+    groupId: number;
+    tabId: number;
+    existed: boolean;
+    name: string;
+  }> {
+    if (this.sessionGroupId !== null && this.workspaceBrowserId && this.server.getLinkState?.().browserInstanceId !== this.workspaceBrowserId) {
+      throw new OperationError('STALE_GENERATION', 'Browser instance changed; session group provenance must be reconciled before reuse');
+    }
+    if (this.sessionGroupId != null) {
+      try {
+        const tabs = await this.server.listTabs();
+        const alive = tabs.find((t) => t.groupId === this.sessionGroupId);
+        if (alive) {
+          return {
+            groupId: this.sessionGroupId,
+            tabId: alive.tabId,
+            existed: true,
+            name: this.sessionGroupName,
+          };
+        }
+      } catch {}
+      this.sessionGroupId = null;
+    }
+
+    const created = await this.server.sessionGroupCreate(this.sessionGroupName, 'purple');
+    this.sessionGroupId = created.groupId;
+    this.workspaceBrowserId = this.server.getLinkState?.().browserInstanceId ?? null;
+    this.groupSeedTabId = created.tabId;
+    this.workspace.trackCreated(created.tabId, created.groupId);
+    return {
+      groupId: created.groupId,
+      tabId: created.tabId,
+      existed: false,
+      name: this.sessionGroupName,
+    };
   }
 
   /** Current page URL via CDP, falling back to the memory snapshot. */
@@ -680,7 +795,7 @@ export class Helmet {
   }
 
   private async observeCore(question: string): Promise<{ text: string; state: BrowserState }> {
-    await this.ensureAttached().catch(() => {});
+    await this.ensureAttached();
     const { state, anomalies } = await this.gatherState();
     const observation = this.router.observe(question, state, anomalies);
     return { text: observation.text, state };
@@ -704,11 +819,14 @@ export class Helmet {
     before: BrowserState;
     after: BrowserState;
     changes: string[];
+    verified: boolean;
   }> {
-    await this.ensureAttached().catch(() => {});
-    const { state: beforeState } = await this.gatherState();
+    await this.ensureAttached();
+    operationPhase('preflight');
+    const { state: beforeState } = await this.gatherState(true);
     this.memory.update(beforeState);
 
+    operationPhase('action');
     const result = await this.translator.execute(action);
 
     // P12: the post-action sleep is conditional — a wait action already
@@ -717,11 +835,15 @@ export class Helmet {
       await sleep(this.config.postActionDelayMs);
     }
 
-    const { state: afterState } = await this.gatherState();
+    operationPhase('verification');
+    this.em.clear();
+    // Telemetry cannot turn an acknowledged action into a repeatable failure.
+    let verified = true;
+    const afterState = (await this.gatherState(true).catch(() => { verified = false; return { state: beforeState }; })).state;
     this.memory.update(afterState);
 
     const diff = this.memory.diff();
-    return { result, before: beforeState, after: afterState, changes: diff?.fields ?? [] };
+    return { result, before: beforeState, after: afterState, changes: diff?.fields ?? [], verified };
   }
 
   /**
@@ -758,11 +880,11 @@ export class Helmet {
     if (action?.type === 'screenshot' || action?.type === 'screenshotZoom') {
       await this.maybeStripInterference();
     }
-    const { result, before, after, changes } = await this.actCore(action);
+    const { result, before, after, changes, verified } = await this.actCore(action);
     const stateMeta: Partial<StateMeta> = {
       url_before: before.url || undefined,
       url_after: after.url || undefined,
-      state_integrity: 'known',
+      state_integrity: verified ? 'known' : 'unknown',
     };
     if (!result.ok) {
       return this.nativeFailure(name, args, arsenalToDoctrine(result.error), stateMeta);
@@ -788,7 +910,7 @@ export class Helmet {
   }
 
   async inspect(domain: string): Promise<string> {
-    await this.ensureAttached().catch(() => {});
+    await this.ensureAttached();
     const { state } = await this.gatherState();
     switch (domain) {
       case 'network': return JSON.stringify(state.network, null, 2);
@@ -812,7 +934,7 @@ export class Helmet {
    * en línea con el resto de métodos expuestos en MacroContext.
    */
   async callTool(name: string, args?: Record<string, unknown>): Promise<string> {
-    return JSON.stringify(await this.handleToolCall(name, args ?? {}));
+    return this.envelopeToolCall(name, args ?? {});
   }
 
   serveMCP(): void {
@@ -824,14 +946,6 @@ export class Helmet {
     rl.on('close', () => {
       const force = setTimeout(() => process.exit(0), 3000);
       force.unref();
-
-      // Cleanup proactivo (Solución 3): liberar los grupos de la broker-session
-      // ANTES de morir, para que la próxima sesión no los encuentre secuestrados.
-      // Solo si somos broker (el server tiene los sessionGroups).
-      const brokerSessionId = this.server.getBrokerSessionId?.();
-      if (brokerSessionId) {
-        this.server.forceForgetSession?.(brokerSessionId);
-      }
 
       this.stop()
         .catch(() => {})
@@ -851,8 +965,9 @@ export class Helmet {
       try {
         switch (method) {
           case 'initialize':
+            this.mcpProtocolVersion = ['2024-11-05', '2025-03-26', '2025-06-18'].includes(params?.protocolVersion) ? params.protocolVersion : '2025-06-18';
             this.sendMCP(id, {
-              protocolVersion: '2024-11-05',
+              protocolVersion: this.mcpProtocolVersion,
               capabilities: { tools: {}, resources: {} },
               serverInfo: { name: 'yautja', version: '0.2.0' },
               schema_version: SCHEMA_VERSION,
@@ -863,16 +978,26 @@ export class Helmet {
             break;
 
           case 'tools/list':
-            this.sendMCP(id, { tools: MCP_TOOLS });
+            this.sendMCP(id, { tools: MCP_TOOLS.map(tool => ({ ...tool, outputSchema: RESPONSE_OUTPUT_SCHEMA })) });
             break;
 
           case 'tools/call': {
-            const result = await this.envelopeToolCall(params.name, params.arguments || {});
+            const result = await this.envelopeToolCall(params.name, params.arguments || {}, id);
+            if (this.cancelledRequests.delete(id)) break;
+            const structuredContent = JSON.parse(result);
             this.sendMCP(id, {
               content: [{ type: 'text', text: result }],
+              structuredContent,
+              isError: !structuredContent.ok,
             });
             break;
           }
+
+          case 'notifications/cancelled':
+            if (typeof params?.requestId === 'string' || typeof params?.requestId === 'number') {
+              if (this.operations.cancel(params.requestId)) this.cancelledRequests.add(params.requestId);
+            }
+            break;
 
           case 'ping':
             this.sendMCP(id, {});
@@ -931,9 +1056,48 @@ export class Helmet {
   }
 
   private async handleToolCall(name: string, args: any): Promise<YautjaResponse<unknown>> {
+    assertOperationActive();
+    this.resetTargetData();
     // Cualquier tool call cuenta como actividad MCP para el watchdog.
     this.server.markMcpActivity?.();
     switch (name) {
+      case 'sessionGroupAddTab': {
+        if (!Number.isInteger(args.tabId)) throw new OperationError('TARGET_MISSING', 'An integer tabId is required');
+        const group = await this.ensureSessionGroup();
+        await this.workspace.adopt(this.server, args.tabId, group.groupId);
+        if (this.groupSeedTabId !== null && this.groupSeedTabId !== args.tabId) {
+          await this.server.closeTab(this.groupSeedTabId, group.groupId);
+          this.groupSeedTabId = null;
+        }
+        return this.nativeSuccess(name, args, { groupId: group.groupId, tabId: args.tabId, borrowed: true });
+      }
+      case 'sessionGroupRename': {
+        if (typeof args.name !== 'string' || !args.name.trim() || args.name.length > 100) throw new Error('Group name must contain 1–100 characters');
+        const group = await this.ensureSessionGroup();
+        await this.server.renameGroup(group.groupId, args.name);
+        this.sessionGroupName = args.name;
+        return this.nativeSuccess(name, args, { groupId: group.groupId, name: args.name });
+      }
+      case 'session_finish': {
+        if (this.sessionGroupId === null) { this.finishingWorkspace = false; return this.nativeSuccess(name, args, { groupClosed: true, closed: [], restored: [], remaining: [], failed: [] }); }
+        const currentBrowser = this.server.getLinkState?.().browserInstanceId;
+        if (this.workspaceBrowserId && currentBrowser !== this.workspaceBrowserId) throw new OperationError('STALE_GENERATION', 'Browser instance changed; group ownership must be reconciled before cleanup');
+        const result = await this.workspace.finish(this.server, this.sessionGroupId);
+        if (result.groupClosed) { this.sessionGroupId = null; this.groupSeedTabId = null; this.finishingWorkspace = false; }
+        return result.failed.length || result.remaining.length
+          ? { ...this.nativeFailure(name, args, toYautjaError('YJ.RUNTIME.TARGET_UNVERIFIED', { message: 'Session cleanup incomplete; inspect result and retry session_finish' })), result }
+          : this.nativeSuccess(name, args, result);
+      }
+      case 'connection_status':
+        return this.nativeSuccess(name, args, {
+          mcp: 'ready', pid: process.pid, sessionId: this.sessionId,
+          build: BUILD_ID,
+          protocolVersion: this.mcpProtocolVersion, link: this.server.getLinkState?.() ?? { connected: this.server.isExtensionConnected() },
+        });
+      case 'operation_list':
+        return this.nativeSuccess(name, args, { operations: this.operations.list() });
+      case 'operation_cancel':
+        return this.nativeSuccess(name, args, { cancelled: this.operations.cancel(String(args.operationId)) });
       case 'observe': {
         const { text, state } = await this.observeCore(args.question || 'overview');
         return this.nativeSuccess('observe', args, { text }, {
@@ -1017,21 +1181,19 @@ export class Helmet {
         });
       }
       case 'read_console_messages': {
-        // Sensor buffers track the attached tab only; tabId just guards
-        // against reading a stale buffer thinking it's another tab.
+        // Read the requested tab's bounded buffer without changing selection.
         const currentTab = this.server.getCurrentTabId();
-        if (args.tabId !== undefined && currentTab != null && args.tabId !== currentTab) {
-          return this.nativeFailure('read_console_messages', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
-            message: `Console buffer tracks the attached tab (${currentTab}). Use switchTab(${args.tabId}) first.`,
-          }));
-        }
+        const tabId = args.tabId ?? currentTab;
+        await this.server.assertTabAccess?.(tabId);
         const messages = this.audio.readEntries({
+          tabId: tabId ?? undefined,
           errorsOnly: args.errorsOnly === true,
           max: args.max ?? 100,
         });
-        if (args.clear === true) this.audio.clear();
+        if (args.clear === true) this.audio.clear(tabId ?? undefined);
         return this.nativeSuccess('read_console_messages', args, {
           count: messages.length,
+          tabId, generation: this.server.getGeneration?.(), documentEpoch: tabId === null ? null : this.server.getDocumentEpoch?.(tabId), captureComplete: false,
           cleared: args.clear === true,
           messages: messages.map((m) => ({
             level: m.level,
@@ -1045,18 +1207,17 @@ export class Helmet {
       }
       case 'read_network_requests': {
         const currentTab = this.server.getCurrentTabId();
-        if (args.tabId !== undefined && currentTab != null && args.tabId !== currentTab) {
-          return this.nativeFailure('read_network_requests', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
-            message: `Network buffer tracks the attached tab (${currentTab}). Use switchTab(${args.tabId}) first.`,
-          }));
-        }
+        const tabId = args.tabId ?? currentTab;
+        await this.server.assertTabAccess?.(tabId);
         const txns = this.thermal.readTransactions({
+          tabId: tabId ?? undefined,
           urlContains: args.filter,
           max: args.max ?? 100,
         });
-        if (args.clear === true) this.thermal.clear();
+        if (args.clear === true) this.thermal.clear(tabId ?? undefined);
         return this.nativeSuccess('read_network_requests', args, {
           count: txns.length,
+          tabId, generation: this.server.getGeneration?.(), documentEpoch: tabId === null ? null : this.server.getDocumentEpoch?.(tabId), captureComplete: false,
           cleared: args.clear === true,
           requests: txns.map((t) => ({
             id: t.id,
@@ -1092,27 +1253,12 @@ export class Helmet {
         }
       }
       case 'sessionGroupCreate': {
-        // P8: idempotente — si el grupo existe y sigue vivo, se devuelve tal cual.
-        if (this.sessionGroupId != null) {
-          try {
-            const tabs = await this.server.listTabs();
-            const alive = tabs.find((t) => t.groupId === this.sessionGroupId);
-            if (alive) {
-              return this.nativeSuccess('sessionGroupCreate', args, {
-                groupId: this.sessionGroupId,
-                tabId: alive.tabId,
-                existed: true,
-              });
-            }
-          } catch {}
-          this.sessionGroupId = null; // stale — recrear
-        }
-        const created = await this.server.sessionGroupCreate('Yautja', 'purple');
-        this.sessionGroupId = created.groupId;
+        const created = await this.ensureSessionGroup();
         return this.nativeSuccess('sessionGroupCreate', args, {
           groupId: created.groupId,
           tabId: created.tabId,
-          existed: false,
+          existed: created.existed,
+          name: created.name,
         });
       }
       case 'listTabs': {
@@ -1125,6 +1271,7 @@ export class Helmet {
           tabs: enriched,
           currentTabId: this.server.getCurrentTabId(),
           sessionGroupId: this.sessionGroupId,
+          sessionGroupName: this.sessionGroupId != null ? this.sessionGroupName : null,
         });
       }
       case 'switchTab': {
@@ -1150,6 +1297,7 @@ export class Helmet {
           try { await this.server.enableDomains([domain]); } catch {}
         }
         this.attached = true;
+        this.resetTargetData();
         return this.nativeSuccess('switchTab', args, {
           success: true,
           tabId: sw.tabId,
@@ -1159,25 +1307,36 @@ export class Helmet {
       }
       case 'openTab': {
         const targetUrl = args.url || 'about:blank';
-        // P8: con grupo de sesión activo, las tabs nuevas nacen dentro del
-        // grupo salvo inGroup: false explícito.
-        const inGroup = this.sessionGroupId != null && args.inGroup !== false;
+        // P8: auto-crear el sandbox al abrir la primera tab. La pestaña
+        // auxiliar about:blank mantiene vivo el grupo hasta que la pestaña
+        // real entra; después se elimina para no dejar basura visual.
+        const wantsGroup = args.inGroup !== false;
+        const group = wantsGroup ? await this.ensureSessionGroup() : null;
         // P13.5: canonical open — verified URL post-attach, previous active
         // tab captured BEFORE opening (fixes wrong-URL reports).
         const opened = await this.tabRegistry.openVerified(targetUrl, {
-          groupId: inGroup ? this.sessionGroupId! : undefined,
+          groupId: group?.groupId,
+          focus: args.focus === true,
+          onCreated: tab => { if (group) this.workspace.trackCreated(tab.tabId, group.groupId); },
         });
+        if (group) this.workspace.trackCreated(opened.tabId, group.groupId);
+        if (group && this.groupSeedTabId !== null && this.groupSeedTabId !== opened.tabId) {
+          try { await this.server.closeTab(this.groupSeedTabId, group.groupId); this.groupSeedTabId = null; } catch {}
+        }
         for (const domain of ['Network', 'Page', 'Runtime', 'Performance', 'Security']) {
           try { await this.server.enableDomains([domain]); } catch {}
         }
         this.attached = opened.attached;
+        this.resetTargetData();
         return this.nativeSuccess('openTab', args, {
           success: opened.attached,
           tabId: opened.tabId,
           url: opened.url,
           attached: opened.attached,
           previousActiveTabId: opened.previousActiveTabId,
-          groupId: inGroup ? this.sessionGroupId : undefined,
+          groupId: group?.groupId,
+          groupName: group?.name,
+          focused: args.focus === true,
         }, { state_integrity: opened.attached ? 'known' : 'unknown' });
       }
       case 'closeTab': {
@@ -1194,18 +1353,7 @@ export class Helmet {
             ));
           }
         }
-        if (this.server.getCurrentTabId() === tabId) {
-          const tabs = await this.server.listTabs();
-          const yt = tabs.find((t) => t.url.includes('youtube.com'));
-          if (yt) {
-            await this.server.detachAll();
-            await this.server.attachTab(yt.tabId);
-            for (const domain of ['Network', 'Page', 'Runtime', 'Performance', 'Security']) {
-              try { await this.server.enableDomains([domain]); } catch {}
-            }
-          }
-        }
-        try { await this.server.closeTab(tabId); } catch (e: any) {
+        try { await this.server.closeTab(tabId, args.force === true ? undefined : this.sessionGroupId ?? undefined); } catch (e: any) {
           return this.native(name, args, { success: false, error: scrubErrorMessage(e?.message ?? e) });
         }
         return this.native(name, args, { success: true, closed: tabId });
@@ -1470,6 +1618,7 @@ export class Helmet {
           policy_key: 'smartType',
           trace_id: generateTraceId(),
           idempotency_key: args.idempotency_key ?? null,
+          idempotency_input: { query, text, submit, stealth: useStealth, transactional, verify: doVerify, clearFirst, onPartial },
           session_id: this.sessionId,
           tab_id: this.server.getCurrentTabId() ?? 0,
           origin,
@@ -1678,7 +1827,11 @@ export class Helmet {
         }
         const body = await this.networkCapture.captureRequestBody(args.requestId);
         if (body) this.networkCapture.attachBodyToRequest(args.requestId, 'request', body);
-        return this.native(name, args, { requestId: args.requestId, body, length: body?.length || 0 });
+        return this.native(name, args, {
+          requestId: args.requestId,
+          body: body ? this.networkCapture.redactBody(body) : null,
+          length: body?.length || 0,
+        });
       }
       case 'captureResponse': {
         if (!args.requestId) {
@@ -1695,7 +1848,7 @@ export class Helmet {
         if (args.method) filters.method = args.method;
         if (args.hasMatches) filters.hasMatches = true;
         if (args.limit) filters.limit = args.limit;
-        const list = this.networkCapture.list(filters);
+        const list = this.networkCapture.list(filters).map((item) => this.networkCapture.redactForOutput(item));
         return this.native(name, args, { count: list.length, items: list });
       }
       case 'captureStats': {
@@ -2832,8 +2985,61 @@ export class Helmet {
           selector,
         });
       }
+      case 'morph_compile': {
+        try {
+          const compiled = await this.mecamorph.compile();
+          return this.nativeSuccess('morph_compile', args, compiled);
+        } catch (err) {
+          return this.nativeFailure('morph_compile', args, toYautjaError('YJ.PROTOCOL.CAPABILITY_MISSING', {
+            message: err instanceof Error ? err.message : String(err),
+          }));
+        }
+      }
+      case 'morph_list': {
+        const capabilities = this.mecamorph.list();
+        return this.nativeSuccess('morph_list', args, {
+          capabilities,
+          count: capabilities.length,
+        });
+      }
+      case 'morph_run': {
+        const capabilityId = args.capabilityId as string | undefined;
+        const input = args.input as Record<string, unknown> | undefined;
+        if (!capabilityId || !input || typeof input !== 'object' || Array.isArray(input)) {
+          return this.nativeFailure('morph_run', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: 'capabilityId and input object are required',
+          }));
+        }
+        try {
+          const result = await this.mecamorph.run({
+            capabilityId,
+            input,
+            validation: args.validation === true,
+          });
+          return this.nativeSuccess('morph_run', args, result);
+        } catch (err) {
+          return this.nativeFailure('morph_run', args, toYautjaError('YJ.PROTOCOL.CAPABILITY_MISSING', {
+            message: err instanceof Error ? err.message : String(err),
+          }));
+        }
+      }
+      case 'morph_explain': {
+        const capabilityId = args.capabilityId as string | undefined;
+        if (!capabilityId) {
+          return this.nativeFailure('morph_explain', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: 'capabilityId is required',
+          }));
+        }
+        try {
+          return this.nativeSuccess('morph_explain', args, this.mecamorph.explain(capabilityId));
+        } catch (err) {
+          return this.nativeFailure('morph_explain', args, toYautjaError('YJ.PROTOCOL.INVALID_ARGUMENT', {
+            message: err instanceof Error ? err.message : String(err),
+          }));
+        }
+      }
       case 'capabilities': {
-        const profile = this.profileStore.match(await this.currentPageUrl());
+        const profile = this.profileStore.match(this.memory.snapshot()?.url ?? '');
         const backends = loadBackendConfig();
         const matrix = detectCapabilities({
           hasEventChannel: typeof this.server.on === 'function',
@@ -2842,7 +3048,15 @@ export class Helmet {
           superapiConfigured: isSuperapiConfigured(backends),
           chromeDevtoolsConfigured: isChromeDevtoolsConfigured(backends),
         });
-        return this.nativeSuccess('capabilities', args, matrix);
+        const link = this.server.getLinkState?.();
+        const ready = (link?.connected ?? this.server.isExtensionConnected()) && this.attached && this.server.getCurrentTabId() !== null && this.server.isAttachmentCurrent?.() !== false && !link?.linkDegraded;
+        const operational = Object.fromEntries(Object.entries(matrix).filter(([, value]) => typeof value === 'boolean').map(([capability, supported]) => [capability, {
+          supported: capability === 'intercept' ? true : supported,
+          ready: Boolean((capability === 'intercept' || supported) && ready),
+          authorized: capability === 'browserFetch' ? 'requires_preflight' : capability === 'intercept' && !isInterceptAllowed(profile) ? false : 'unknown',
+          reason: capability === 'intercept' && !isInterceptAllowed(profile) ? 'profile_denied' : !supported ? 'unsupported' : !ready ? 'browser_not_ready' : 'check_action_policy',
+        }]));
+        return this.nativeSuccess('capabilities', args, { ...matrix, operational, link });
       }
       case 'delegate': {
         const capability = args.capability as DelegableCapability | undefined;
@@ -2952,7 +3166,7 @@ export class Helmet {
     return {
       tool,
       action_type: tool === 'act' ? (args?.action?.type ?? 'unknown') : tool,
-      operation_id: generateOperationId(),
+      operation_id: currentOperation()?.id ?? generateOperationId(),
       trace_id: generateTraceId(),
       attempt: 1,
       max_attempts: 1,
@@ -3045,6 +3259,10 @@ export class Helmet {
    * error instead of the legacy INVALID_ARGUMENT bucket.
    */
   private classifyCaughtError(err: unknown): YautjaError {
+    if (err instanceof OperationError) return toYautjaError(`YJ.RUNTIME.${err.code}`, { message: err.message });
+    if (err && typeof err === 'object' && 'code' in err && ['BROKER_DISCONNECTED', 'EXTENSION_LINK_DEGRADED', 'TAB_OWNED_BY_OTHER_SESSION'].includes(String(err.code))) {
+      return toYautjaError(`YJ.RUNTIME.${err.code}`, { message: err instanceof Error ? err.message : String(err) });
+    }
     if (err && typeof err === 'object' && 'code' in err && typeof (err as { code: unknown }).code === 'string' && (err as { code: string }).code.startsWith('YJ.')) {
       return err as YautjaError;
     }
@@ -3069,11 +3287,25 @@ export class Helmet {
     });
   }
 
-  private async envelopeToolCall(name: string, args: any): Promise<string> {
+  private async envelopeToolCall(name: string, args: any, requestId?: string | number): Promise<string> {
     const operation = this.buildOperationMeta(name, args);
     const started = Date.now();
     try {
-      const raw = await this.handleToolCall(name, args);
+      if (name === 'session_finish' && !currentOperation()) {
+        this.finishingWorkspace = true;
+        this.operations.cancelAll();
+      } else if (this.finishingWorkspace && !['session_finish', 'connection_status', 'operation_list', 'operation_cancel', 'listTabs', 'capabilities'].includes(name)) {
+        throw new OperationError('OPERATION_CANCELLED', 'Session cleanup in progress; retry session_finish before starting another task');
+      }
+      let raw = await this.operations.run(name, () => this.handleToolCall(name, args), {
+        id: operation.operation_id, requestId, timeoutMs: this.config.operationTimeoutMs ?? 60_000,
+        concurrent: ['connection_status', 'capabilities', 'operation_list', 'operation_cancel'].includes(name),
+      });
+      const record = this.operations.list().find(record => record.id === raw.operation.operation_id);
+      if (record?.state === 'outcome_unknown') {
+        raw = { ...raw, ok: false, error: toYautjaError('YJ.RUNTIME.OUTCOME_UNKNOWN', raw.error ? { message: `Action outcome is unknown: ${scrubErrorMessage(raw.error.message)}` } : undefined) };
+      }
+      if (record) raw = { ...raw, operation: { ...raw.operation, status: record.state, phase: record.phase, elapsed_ms: record.elapsedMs, queue_ms: record.queueMs } };
       this.recordToolCall(name, args, raw.ok, raw);
       if (!raw.ok && raw.error) {
         this.telemetry.record({
@@ -3093,7 +3325,9 @@ export class Helmet {
       this.recordToolCall(name, args, false, null);
       const message = err instanceof Error ? err.message : String(err);
       const context = this.buildContextMeta(message.length);
-      const yerr = this.classifyCaughtError(err);
+      const record = this.operations.list().find(record => record.id === operation.operation_id);
+      const yerr = record?.state === 'outcome_unknown' ? toYautjaError('YJ.RUNTIME.OUTCOME_UNKNOWN', { message: `Action outcome is unknown: ${scrubErrorMessage(message)}` }) : this.classifyCaughtError(err);
+      if (record) Object.assign(operation, { status: record.state, phase: record.phase, elapsed_ms: record.elapsedMs, queue_ms: record.queueMs });
       this.recordFailure(operation, yerr, started, context);
       return JSON.stringify(failure(yerr, { operation, state: this.buildStateMeta(), context }));
     }
@@ -3138,16 +3372,28 @@ export class Helmet {
     process.stdout.write(JSON.stringify(msg) + '\n');
   }
 
-  private async gatherState(): Promise<{ state: BrowserState; anomalies: Anomaly[] }> {
+  private resetTargetData(): void {
+    const tabId = this.server.getCurrentTabId();
+    const key = `${this.server.getGeneration?.() ?? ''}:${tabId}:${tabId === null ? 0 : this.server.getDocumentEpoch?.(tabId) ?? 0}`;
+    if (key === this.dataTarget) return;
+    this.dataTarget = key;
+    this.memory.clear();
+    this.em.clear(); this.motion.clear(); this.threat.clear();
+    this.wsInspector.clear(); this.networkCapture.clear();
+  }
+
+  private async gatherState(light = false): Promise<{ state: BrowserState; anomalies: Anomaly[] }> {
+    assertOperationActive();
+    this.resetTargetData();
     const [network, dom, console, performance, security] = await Promise.all([
       this.thermal.summarize(),
-      this.em.summarize().catch(() => FALLBACK_DOM),
+      this.em.summarize(),
       this.audio.summarize(),
       this.motion.summarize(),
       this.threat.summarize(),
     ]);
 
-    const anomalies: Anomaly[] = [
+    const anomalies: Anomaly[] = light ? [] : [
       ...this.thermal.getAnomalies(),
       ...await this.em.getAnomalies().catch(() => []),
       ...await this.audio.getAnomalies(),
@@ -3159,7 +3405,7 @@ export class Helmet {
       state: {
         url: dom.url || '',
         title: dom.semantic.title,
-        readyState: 'complete',
+        readyState: dom.readyState ?? 'loading',
         timestamp: Date.now(),
         network, dom, console, performance, security,
       },
@@ -3169,6 +3415,12 @@ export class Helmet {
 }
 
 const MCP_TOOLS = [
+  { name: 'connection_status', description: 'Local diagnostic: loaded build, process, broker/extension connectivity, generation and selected target. Does not evaluate the browser.', inputSchema: { type: 'object' as const, properties: {} } },
+  { name: 'operation_list', description: 'Inspect bounded operation history including state, phase, elapsed time and target. Available while browser commands wait.', inputSchema: { type: 'object' as const, properties: {} } },
+  { name: 'operation_cancel', description: 'Cancel an active or queued operation. Dispatched actions cannot be undone; an unknown outcome must be verified before repetition.', inputSchema: { type: 'object' as const, properties: { operationId: { type: 'string' } }, required: ['operationId'] } },
+  { name: 'sessionGroupAddTab', description: 'Borrow an existing authorized tab into the session group. session_finish restores it instead of closing it.', inputSchema: { type: 'object' as const, properties: { tabId: { type: 'integer' } }, required: ['tabId'] } },
+  { name: 'sessionGroupRename', description: 'Rename this session group.', inputSchema: { type: 'object' as const, properties: { name: { type: 'string', minLength: 1, maxLength: 100 } }, required: ['name'] } },
+  { name: 'session_finish', description: 'Finish the browser task: cancel pending work, close tabs created by this session and restore borrowed tabs. Idempotent; reports partial cleanup. Call before ending the task.', inputSchema: { type: 'object' as const, properties: {} } },
   {
     name: 'observe',
     description: 'Get a focused observation of the browser state based on a question.',
@@ -3217,7 +3469,7 @@ const MCP_TOOLS = [
         errorsOnly: { type: 'boolean', description: 'Only error-level messages (default false)' },
         max: { type: 'number', description: 'Max messages to return, most recent first (default 100)' },
         clear: { type: 'boolean', description: 'Empty the buffer after reading (default false)' },
-        tabId: { type: 'number', description: 'Guard: must match the attached tab (buffers are per attached tab)' },
+        tabId: { type: 'number', description: 'Authorized source tab to read without changing selection (defaults to selected tab)' },
       },
     },
   },
@@ -3230,7 +3482,7 @@ const MCP_TOOLS = [
         filter: { type: 'string', description: 'Only requests whose URL contains this substring' },
         max: { type: 'number', description: 'Max requests to return, most recent first (default 100)' },
         clear: { type: 'boolean', description: 'Empty the buffer after reading (default false)' },
-        tabId: { type: 'number', description: 'Guard: must match the attached tab (buffers are per attached tab)' },
+        tabId: { type: 'number', description: 'Authorized source tab to read without changing selection (defaults to selected tab)' },
       },
     },
   },
@@ -3260,12 +3512,13 @@ const MCP_TOOLS = [
   },
   {
     name: 'openTab',
-    description: 'Open a new tab with a URL and attach to it. Does NOT overwrite current tab. With an active session group (sessionGroupCreate), the tab is created inside the group unless inGroup:false.',
+    description: 'Open a new tab with a URL and attach to it in the background by default. Automatically creates a per-session tab group named after a Yautja hunter and opens inside it unless inGroup:false. Does NOT overwrite or focus away from the current tab. Set focus:true only when visible browser focus is required.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         url: { type: 'string', description: 'URL to open' },
-        inGroup: { type: 'boolean', description: 'Create inside the session group when one is active (default true)' },
+        inGroup: { type: 'boolean', description: 'Create inside the auto-created session group (default true)' },
+        focus: { type: 'boolean', description: 'Visibly activate the new tab and focus its window (default false)' },
       },
       required: ['url'],
     },
@@ -3284,7 +3537,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'sessionGroupCreate',
-    description: 'Create (or return) the Yautja session tab group — a sandbox tab group ("Yautja", purple) that owns every tab Yautja opens. Idempotent: returns the existing group if alive.',
+    description: 'Create (or return) the session sandbox tab group, named after a Yautja hunter (for example Wolf, Scar or Celtic). Idempotent: returns the existing group if alive. openTab creates it automatically unless inGroup:false.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
@@ -4183,8 +4436,42 @@ const MCP_TOOLS = [
     },
   },
   {
+    name: 'morph_compile',
+    description: 'Inspect the current page and compile observed semantic affordances into quarantined Mecamorph Capability IR. Observe-only: does not execute the generated bindings.',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'morph_list',
+    description: 'List capabilities compiled in this Yautja session with binding kinds and lifecycle status.',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'morph_run',
+    description: 'Run a compiled semantic capability through Yautja actions and independent verification. Quarantined bindings require validation:true; a verified binding is promoted for later active runs.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        capabilityId: { type: 'string', description: 'Canonical capability id returned by morph_compile' },
+        input: { type: 'object', description: 'Typed capability input, for example {"query":"keyboard"}' },
+        validation: { type: 'boolean', description: 'Allow quarantined bindings for a read-only validation run' },
+      },
+      required: ['capabilityId', 'input'],
+    },
+  },
+  {
+    name: 'morph_explain',
+    description: 'Return the canonical Capability IR, bindings, verifiers and evidence for one compiled capability.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        capabilityId: { type: 'string', description: 'Canonical capability id' },
+      },
+      required: ['capabilityId'],
+    },
+  },
+  {
     name: 'capabilities',
-    description: 'Capability matrix for this session (P16): stealth, intercept (profile-aware), trustedClick, trustedFileChooser, silentNetwork, browserFetch, and configured backends (yautja/superapi/chromeDevtools). Check before choosing an action path.',
+    description: 'Capability matrix for this session (P16): stealth, intercept (profile-aware), trustedClick, trustedFileChooser, silentNetwork, browserFetch, semanticCompilation (Mecamorph), and configured backends (yautja/superapi/chromeDevtools). Check before choosing an action path.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
@@ -4240,13 +4527,6 @@ const MCP_TOOLS = [
     },
   },
 ];
-
-const FALLBACK_DOM = {
-  url: '',
-  semantic: { pageType: 'unknown', title: '', headings: [] as string[], mainContentPreview: '', language: '' },
-  interactive: { buttons: [] as any[], links: [] as any[], inputs: [] as any[], total: 0 },
-  structural: { totalElements: 0, depth: 0, iframes: 0, images: 0, scripts: 0, forms: 0, stylesheets: 0 },
-};
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

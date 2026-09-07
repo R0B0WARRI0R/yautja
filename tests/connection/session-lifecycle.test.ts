@@ -158,7 +158,7 @@ describe('Session lifecycle — zombie detection', () => {
       expect((server as any).mcpWatchdogFired).toBe(false);
     });
 
-    it('tras silencio > TTL, checkMcpSilence libera grupos del broker-session', () => {
+    it('retains broker groups during prolonged reasoning without tool calls', () => {
       const brokerSessionId = (server as any).brokerSessionId;
       const groupId = 3333;
 
@@ -176,7 +176,7 @@ describe('Session lifecycle — zombie detection', () => {
       (server as any).checkMcpSilence();
 
       expect((server as any).mcpWatchdogFired).toBe(true);
-      expect((server as any).sessionGroups.has(groupId)).toBe(false);
+      expect((server as any).sessionGroups.has(groupId)).toBe(true);
     });
 
     it('checkMcpSilence NO se repite tras dispararse una vez', () => {

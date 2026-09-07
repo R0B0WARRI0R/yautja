@@ -17,6 +17,7 @@ describe('detectCapabilities', () => {
       trustedFileChooser: true,
       silentNetwork: true,
       browserFetch: true,
+      semanticCompilation: true,
       backends: { yautja: true, superapi: 'configured', chromeDevtools: 'configured' },
     });
   });

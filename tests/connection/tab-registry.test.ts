@@ -14,6 +14,7 @@ function makeServer(opts: {
     attachCalls: [] as number[],
     attachFailsLeft: opts.attachFails ?? 0,
     detached: false,
+    openCalls: [] as Array<{ url: string; groupId?: number; focus?: boolean }>,
     currentTabId: opts.tabs.find((t) => t.active)?.tabId ?? null as number | null,
   };
   return {
@@ -28,7 +29,8 @@ function makeServer(opts: {
       state.currentTabId = tabId;
     },
     async detachAll() { state.detached = true; state.currentTabId = null; },
-    async openTab(url: string) {
+    async openTab(url: string, groupId?: number, focus?: boolean) {
+      state.openCalls.push({ url, groupId, focus });
       const tabId = Math.max(...state.tabs.map((t) => t.tabId), 0) + 1;
       state.tabs.push({ tabId, url, title: '', active: false });
       return { tabId, url };
@@ -58,6 +60,18 @@ describe('TabRegistry.openVerified', () => {
     expect(r.verifiedUrl).toBe('https://example.com/new-page');
     expect(r.attached).toBe(true);
     expect(r.previousActiveTabId).toBe(1); // gemini tab was active
+    expect(server.state.openCalls).toEqual([{
+      url: 'https://example.com/new-page',
+      groupId: undefined,
+      focus: false,
+    }]);
+  });
+
+  it('forwards focus only when explicitly requested', async () => {
+    const server = makeServer({ tabs: [...TABS.map((t) => ({ ...t }))], liveHref: 'https://example.com/focused' });
+    const registry = new TabRegistry(server);
+    await registry.openVerified('https://example.com/focused', { settleMs: 1, focus: true });
+    expect(server.state.openCalls[0]?.focus).toBe(true);
   });
 
   it('falls back to the extension-reported URL when verification returns empty', async () => {
@@ -66,6 +80,7 @@ describe('TabRegistry.openVerified', () => {
     const r = await registry.openVerified('https://example.com/x', { settleMs: 1 });
     expect(r.url).toBe('https://example.com/x');
     expect(r.verifiedUrl).toBe('');
+    expect(r.attached).toBe(false);
   });
 
   it('retries attach once, then reports attached:false', async () => {
@@ -103,9 +118,10 @@ describe('TabRegistry.switchVerified', () => {
     if (!r.ok) expect(r.reason).toBe('not_found');
   });
 
-  it('host mismatch after attach → mismatch with expected/actual', async () => {
+  it('rejects a different tab even when a location was returned', async () => {
     const server = makeServer({ tabs: [...TABS.map((t) => ({ ...t }))], liveHref: 'https://evil.example/phishing' });
     const registry = new TabRegistry(server);
+    server.send = async () => { server.state.currentTabId = 1; return { result: { value: 'https://evil.example/phishing' } }; };
     const r = await registry.switchVerified(2);
     expect(r.ok).toBe(false);
     if (!r.ok) {
@@ -121,5 +137,10 @@ describe('TabRegistry.switchVerified', () => {
     const registry = new TabRegistry(server);
     const r = await registry.switchVerified(5);
     expect(r.ok).toBe(true);
+  });
+
+  it('allows a redirect when the transport still proves the same tab', async () => {
+    const server = makeServer({ tabs: TABS.map(t => ({ ...t })), liveHref: 'https://redirect.example/destination' });
+    expect(await new TabRegistry(server).switchVerified(2)).toMatchObject({ ok: true, tabId: 2, url: 'https://redirect.example/destination' });
   });
 });

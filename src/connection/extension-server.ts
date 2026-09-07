@@ -1,3 +1,5 @@
+import { timingSafeEqual, randomUUID } from 'node:crypto';
+import { assertOperationActive, currentOperation, operationSignal, OperationError, pinOperationTarget, remainingOperationMs, selectOperationTarget } from './operation-scope.js';
 import { WebSocketServer, WebSocket } from 'ws';
 import { RollingBuffer } from '../memory/rolling-buffer.js';
 import type { BrokerClient } from './broker-client.js';
@@ -86,6 +88,9 @@ const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
 const DEFAULT_MCP_SILENCE_TTL_MS = 300_000;
 /** Intervalo del watchdog de silencio MCP. */
 const DEFAULT_MCP_WATCHDOG_INTERVAL_MS = 30_000;
+const LOOPBACK_HOST = '127.0.0.1';
+const MAX_WS_PAYLOAD_BYTES = 1_048_576;
+const FIRST_MESSAGE_TIMEOUT_MS = 5_000;
 
 export interface ExtensionTab {
   tabId: number;
@@ -104,6 +109,8 @@ export interface ExtensionEvent {
   params: any;
   /** Present only for events originating from an extension service-worker target. */
   targetId?: string;
+  generation?: string;
+  documentEpoch?: number;
 }
 
 type EventHandler = (event: ExtensionEvent) => void;
@@ -124,6 +131,7 @@ export interface CdpTarget {
 }
 
 interface PendingCommand {
+  tabId?: number;
   resolve: (result: any) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -139,6 +147,15 @@ export class ExtensionServer {
   private statusHandlers: Set<StatusHandler> = new Set();
   private connected = false;
   private currentTabId: number | null = null;
+  private attachmentGeneration: string | null = null;
+  private selectedBrowserInstanceId: string | null = null;
+  private generation = randomUUID();
+  private extensionVersion: string | null = null;
+  private browserInstanceId: string | null = null;
+  private selectedTabId: number | null = null;
+  private tabEpochs = new Map<number, number>();
+  private sessionAttachments = new Map<string, Set<number>>();
+  private clientCancellations = new Map<string, AbortController>();
   private extensionId: string | null = null;
   private enabledDomains: Set<string> = new Set();
   private eventBuffer: RollingBuffer<ExtensionEvent>;
@@ -180,17 +197,22 @@ export class ExtensionServer {
   private readonly mcpSilenceTtlMs: number;
   /** Si el watchdog ya liberó los grupos (evita repeticiones). */
   private mcpWatchdogFired = false;
+  /** Shared secret for the local bridge. Null keeps the migration-compatible mode. */
+  private readonly bridgeToken: Buffer | null;
 
   constructor(port = 9876, maxBufferedEvents = 500, opts?: {
     groupTtlMs?: number;
     sweepIntervalMs?: number;
     mcpSilenceTtlMs?: number;
+    bridgeToken?: string;
   }) {
     this.port = port;
     this.eventBuffer = new RollingBuffer(maxBufferedEvents);
     this.groupTtlMs = opts?.groupTtlMs ?? DEFAULT_GROUP_TTL_MS;
     this.sweepIntervalMs = opts?.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
     this.mcpSilenceTtlMs = opts?.mcpSilenceTtlMs ?? DEFAULT_MCP_SILENCE_TTL_MS;
+    const token = opts?.bridgeToken?.trim();
+    this.bridgeToken = token ? Buffer.from(token, 'utf8') : null;
   }
 
   async start(): Promise<void> {
@@ -224,7 +246,13 @@ export class ExtensionServer {
     return new Promise((resolve, reject) => {
       let wss: WebSocketServer;
       try {
-        wss = new WebSocketServer({ port });
+        // The bridge is a privileged local-control plane. Binding explicitly
+        // to IPv4 loopback avoids exposing browser control to the LAN.
+        wss = new WebSocketServer({
+          port,
+          host: LOOPBACK_HOST,
+          maxPayload: MAX_WS_PAYLOAD_BYTES,
+        });
       } catch (err) {
         reject(new Error(`ExtensionServer: failed to bind port ${port}: ${err}`));
         return;
@@ -238,6 +266,7 @@ export class ExtensionServer {
       wss.on('listening', () => {
         wss.off('error', onError);
         this.wss = wss;
+        this.port = (wss.address() as { port: number }).port;
         this.wss.on('connection', (socket) => this.handleNewConnection(socket));
         this.wss.on('error', (err) => {
           process.stderr.write(`[Yautja] ExtensionServer error post-listen: ${err.message}\n`);
@@ -270,13 +299,13 @@ export class ExtensionServer {
    * Heartbeat: `{type:'ping'}` del cliente → `{type:'pong'}` del broker.
    */
   private handleNewConnection(socket: WebSocket): void {
-    const slotFree = !(this.socket && this.socket.readyState === WebSocket.OPEN);
-    if (slotFree) {
-      // Asignación optimista del slot de extensión (compat: el socket queda
-      // usable para comandos desde la conexión TCP, sin esperar al hello).
-      this.socket = socket;
-    }
+    let firstMessageHandled = false;
+    const firstMessageTimer = setTimeout(() => {
+      if (!firstMessageHandled) socket.close(4001, 'First message timeout');
+    }, FIRST_MESSAGE_TIMEOUT_MS);
     const onFirstMessage = (data: WebSocket.RawData) => {
+      firstMessageHandled = true;
+      clearTimeout(firstMessageTimer);
       let msg: any;
       try {
         msg = JSON.parse(data.toString());
@@ -285,14 +314,15 @@ export class ExtensionServer {
         return;
       }
       socket.off('message', onFirstMessage);
+      if (!this.isValidBridgeToken(msg?.bridgeToken)) {
+        socket.close(4003, 'Unauthorized bridge client');
+        return;
+      }
       if (msg?.type === 'brokerInfo') {
-        // Sonda de discovery (Tanda C): responde siempre y libera el slot de
-        // extensión si la sonda lo ocupó optimistamente al conectar.
+        // Sonda de discovery (Tanda C): no ocupa el slot de extensión.
         const hasExtension = this.connected
           && this.socket !== null
-          && this.socket !== socket
           && this.socket.readyState === WebSocket.OPEN;
-        if (this.socket === socket) this.socket = null;
         try {
           socket.send(JSON.stringify({
             type: 'brokerInfo',
@@ -306,20 +336,23 @@ export class ExtensionServer {
       }
       if (msg?.type === 'register' && msg.role === 'client' && typeof msg.sessionId === 'string' && msg.sessionId) {
         // Cliente broker: no ocupa el slot de la extensión.
-        if (this.socket === socket) this.socket = null;
         this.acceptClient(socket, msg.sessionId, typeof msg.groupId === 'number' ? msg.groupId : undefined);
         return;
       }
-      if (!slotFree) {
+      if (this.socket && this.socket.readyState === WebSocket.OPEN) {
         socket.close(4000, 'Another extension already connected');
         return;
       }
+      // No reservar el slot antes de conocer y autenticar el primer mensaje:
+      // evita que un cliente local no autenticado bloquee la extensión real.
+      this.socket = socket;
       this.setupSocket(socket);
       this.handleExtensionMessage(msg);
     };
     socket.on('message', onFirstMessage);
     socket.on('close', () => {
-      // Si murió sin identificarse y ocupaba el slot optimista, liberarlo.
+      clearTimeout(firstMessageTimer);
+      // Liberar el slot si esta conexión llegó a autenticarse como extensión.
       if (this.socket === socket) {
         this.socket = null;
         this.connected = false;
@@ -330,10 +363,21 @@ export class ExtensionServer {
     });
   }
 
+  private isValidBridgeToken(value: unknown): boolean {
+    if (this.bridgeToken === null) return true;
+    if (typeof value !== 'string') return false;
+    const provided = Buffer.from(value, 'utf8');
+    return provided.length === this.bridgeToken.length && timingSafeEqual(provided, this.bridgeToken);
+  }
+
   private acceptClient(socket: WebSocket, sessionId: string, groupId?: number): void {
     const prev = this.clientSockets.get(sessionId);
-    if (prev && prev !== socket && prev.readyState === WebSocket.OPEN) {
-      prev.close(4002, 'session re-registered');
+    const owner = groupId === undefined ? undefined : this.sessionGroups.get(groupId);
+    if (sessionId === this.brokerSessionId
+      || (prev && prev !== socket && prev.readyState !== WebSocket.CLOSED)
+      || (owner && owner.sessionId !== sessionId)) {
+      socket.close(4003, 'Session identity or group already owned');
+      return;
     }
     this.clientSockets.set(sessionId, socket);
     // Re-registro tras reelección (Tanda C): el cliente trae su grupo de
@@ -352,7 +396,8 @@ export class ExtensionServer {
       } catch {
         return;
       }
-      this.handleClientMessage(socket, msg);
+      // Identity comes from registration, never from an individual message.
+      if (this.clientSockets.get(sessionId) === socket) this.handleClientMessage(socket, msg, sessionId);
     });
     socket.on('close', () => {
       if (this.clientSockets.get(sessionId) === socket) {
@@ -363,50 +408,53 @@ export class ExtensionServer {
     socket.on('error', () => {
       // close handler will fire
     });
-    socket.send(JSON.stringify({ type: 'registered', brokerSessionId: this.brokerSessionId }));
+    socket.send(JSON.stringify({ type: 'registered', brokerSessionId: this.brokerSessionId, bridgeState: this.getBrokerBridgeState() }));
   }
 
-  private handleClientMessage(socket: WebSocket, msg: any): void {
+  private handleClientMessage(socket: WebSocket, msg: any, sessionId: string): void {
     switch (msg?.type) {
       case 'ping':
-        // Refrescar heartbeat si el cliente incluye su sessionId.
-        if (typeof msg.sessionId === 'string' && msg.sessionId) {
-          this.recordHeartbeat(msg.sessionId);
-        }
+        this.recordHeartbeat(sessionId);
         if (socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: 'pong' }));
         }
         break;
       case 'clientCommand':
-        this.executeClientCommand(socket, msg);
+        this.executeClientCommand(socket, msg, sessionId);
+        break;
+      case 'clientCancel':
+        this.clientCancellations.get(`${sessionId}:${msg.id}`)?.abort(new OperationError('OPERATION_CANCELLED', 'Client cancelled command'));
         break;
     }
   }
 
-  private executeClientCommand(socket: WebSocket, msg: any): void {
+  private executeClientCommand(socket: WebSocket, msg: any, sessionId: string): void {
     const reply = (ok: boolean, result?: any, error?: string, errorType?: string) => {
       if (socket.readyState !== WebSocket.OPEN) return;
       socket.send(JSON.stringify(ok
         ? { type: 'clientResult', id: msg.id, ok, result }
         : { type: 'clientResult', id: msg.id, ok, error, ...(errorType ? { errorType } : {}) }));
     };
-    if (!this.isExtensionConnected()) {
-      reply(false, undefined, 'broker: extension not connected');
+    if (!this.hasLocalExtension()) {
+      reply(false, undefined, 'broker: extension not connected', 'EXTENSION_DISCONNECTED');
       return;
     }
-    const sessionId = typeof msg.sessionId === 'string' ? msg.sessionId : null;
     // Política de tabs (Tanda B): namespaces por sesión.
     const violation = this.checkClientTabPolicy(sessionId, msg.payload);
     if (violation) {
       reply(false, undefined, violation.message, violation.code);
       return;
     }
-    this.sendCommand(msg.payload)
+    const controller = new AbortController();
+    const cancellationKey = `${sessionId}:${msg.id}`;
+    this.clientCancellations.set(cancellationKey, controller);
+    this.sendCommand({ ...msg.payload, _sessionId: sessionId }, msg.timeoutMs, controller.signal)
       .then((result) => {
         this.trackClientCommand(sessionId, msg.payload, result);
         reply(true, result);
       })
-      .catch((err) => reply(false, undefined, err instanceof Error ? err.message : String(err)));
+      .catch((err) => reply(false, undefined, err instanceof Error ? err.message : String(err), err?.code))
+      .finally(() => this.clientCancellations.delete(cancellationKey));
   }
 
   /**
@@ -420,7 +468,7 @@ export class ExtensionServer {
   private checkClientTabPolicy(sessionId: string | null, payload: any): TabOwnedByOtherSessionError | null {
     if (!payload || typeof payload !== 'object') return null;
     // openTab con groupId ajeno → denegar (sin groupId es tab suelta: permitir).
-    if (payload.type === 'openTab' && typeof payload.groupId === 'number' && payload.groupId >= 0) {
+    if (typeof payload.groupId === 'number' && payload.groupId >= 0) {
       const entry = this.sessionGroups.get(payload.groupId);
       if (entry !== undefined && entry.sessionId !== sessionId) {
         return new TabOwnedByOtherSessionError(`group ${payload.groupId}`, entry.sessionId);
@@ -470,6 +518,8 @@ export class ExtensionServer {
     if (payload.type === 'openTab' && typeof payload.groupId === 'number' && payload.groupId >= 0 && typeof result.tabId === 'number') {
       this.tabToGroup.set(result.tabId, payload.groupId);
     }
+    if (payload.type === 'groupTab') this.tabToGroup.set(payload.tabId, payload.groupId);
+    if (payload.type === 'restoreTab' || payload.type === 'closeTab') this.tabToGroup.delete(payload.tabId);
   }
 
   /** Sincroniza tabToGroup con una respuesta listTabs (fuente de verdad). */
@@ -498,6 +548,10 @@ export class ExtensionServer {
    * en el close handler).
    */
   private forgetSessionGroups(sessionId: string): void {
+    for (const [key, controller] of this.clientCancellations) {
+      if (key.startsWith(`${sessionId}:`)) controller.abort(new OperationError('OPERATION_CANCELLED', 'Session disconnected'));
+    }
+    this.sessionAttachments.delete(sessionId);
     const ownedGroups = new Set<number>();
     for (const [groupId, entry] of this.sessionGroups) {
       if (entry.sessionId === sessionId) ownedGroups.add(groupId);
@@ -541,6 +595,7 @@ export class ExtensionServer {
     const now = Date.now();
     const dead: number[] = [];
     for (const [groupId, entry] of this.sessionGroups) {
+      if (entry.sessionId === this.brokerSessionId) { entry.lastHeartbeat = now; continue; }
       if (now - entry.lastHeartbeat > this.groupTtlMs) {
         dead.push(groupId);
       }
@@ -582,9 +637,11 @@ export class ExtensionServer {
     if (this.mcpWatchdogFired) return;
     if (Date.now() - this.mcpLastActivity > this.mcpSilenceTtlMs) {
       process.stderr.write(
-        `[broker] MCP silence >${this.mcpSilenceTtlMs / 1000}s — releasing broker-session groups\n`,
+        `[broker] MCP silence >${this.mcpSilenceTtlMs / 1000}s — retaining live session groups\n`,
       );
-      this.forgetSessionGroups(this.brokerSessionId);
+      // Tool silence means the agent may be reasoning. Only actual lifecycle
+      // disconnect/shutdown releases ownership, never a lack of tool calls.
+      this.refreshSessionHeartbeat(this.brokerSessionId);
       this.mcpWatchdogFired = true;
     }
   }
@@ -600,7 +657,7 @@ export class ExtensionServer {
     const brokerGroups = [...this.sessionGroups]
       .filter(([, e]) => e.sessionId === this.brokerSessionId)
       .map(([gid]) => gid);
-    const brokerAlive = this.socket !== null && this.socket.readyState === WebSocket.OPEN;
+    const brokerAlive = this.wss !== null;
     result.push({
       sessionId: this.brokerSessionId,
       isBroker: true,
@@ -676,7 +733,13 @@ export class ExtensionServer {
     const tabId = typeof msg.tabId === 'number' ? msg.tabId : null;
     if (tabId === null) return;
     const groupId = this.tabToGroup.get(tabId);
-    if (groupId === undefined) return;
+    if (groupId === undefined) {
+      for (const [sessionId, tabs] of this.sessionAttachments) {
+        const client = this.clientSockets.get(sessionId);
+        if (tabs.has(tabId) && client?.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: 'clientEvent', payload: msg }));
+      }
+      return;
+    }
     const owner = this.sessionGroups.get(groupId);
     if (owner === undefined || owner.sessionId === this.brokerSessionId) return;
     const client = this.clientSockets.get(owner.sessionId);
@@ -694,9 +757,11 @@ export class ExtensionServer {
     this.brokerClient = client;
     if (client) {
       client.onStatusChange((registered) => {
-        this.notifyStatus(registered ? { connected: true } : { connected: false });
+        if (this.brokerClient !== client) return;
+        this.notifyStatus({ connected: registered && this.isExtensionConnected() });
       });
     }
+    this.notifyStatus({ connected: this.isExtensionConnected() });
   }
 
   /** sessionId que este helmet (BROKER) expone a sus clientes. */
@@ -757,12 +822,16 @@ export class ExtensionServer {
     }
   }
 
+  hasLocalExtension(): boolean {
+    return this.connected && this.socket !== null && this.socket.readyState === WebSocket.OPEN;
+  }
+
   isExtensionConnected(): boolean {
-    if (this.connected && this.socket !== null && this.socket.readyState === WebSocket.OPEN) {
+    if (this.hasLocalExtension()) {
       return true;
     }
     // Modo CLIENT registrado: la extensión es alcanzable a través del broker.
-    return this.brokerClient?.isRegistered() ?? false;
+    return (this.brokerClient?.isRegistered() ?? false) && (this.brokerClient?.getBridgeState?.()?.connected ?? true);
   }
 
   getPort(): number {
@@ -780,12 +849,24 @@ export class ExtensionServer {
   // Matches CDPSessionManager.on(event, handler) interface.
   on(event: string, handler: (params: any) => void): () => void {
     const filtered: EventHandler = (e) => {
-      if (e.method === event) {
+      if (e.method === event && e.tabId === this.currentTabId && !e.targetId) {
         handler(e.params);
       }
     };
     this.eventHandlers.add(filtered);
     return () => this.eventHandlers.delete(filtered);
+  }
+
+  onAnyTab(method: string, handler: (params: any, context: ExtensionEvent) => void): () => void {
+    return this.onEvent(event => {
+      if (event.method === method && !event.targetId && (this.brokerClient || event.tabId === this.currentTabId || this.sessionAttachments.get(this.brokerSessionId)?.has(event.tabId))) handler(event.params, event);
+    });
+  }
+
+  async assertTabAccess(tabId: number | null): Promise<void> {
+    if (tabId === null) throw new OperationError('TARGET_MISSING', 'Select a tab before reading its buffer');
+    await this.listTabs();
+    await this.sendCommand({ type: 'tabAccess', tabId });
   }
 
   onStatusChange(handler: StatusHandler): () => void {
@@ -811,8 +892,16 @@ export class ExtensionServer {
   }
 
   async attachTab(tabId: number): Promise<void> {
+    const generation = this.getGeneration();
     await this.sendCommand({ type: 'attach', tabId });
+    assertOperationActive();
+    if (generation !== this.getGeneration()) throw new OperationError('STALE_GENERATION', 'Connection changed during attach');
     this.currentTabId = tabId;
+    this.attachmentGeneration = generation;
+    this.selectedBrowserInstanceId = this.getLinkState().browserInstanceId;
+    this.selectedTabId = tabId;
+    this.enabledDomains.clear();
+    selectOperationTarget(tabId, this.getGeneration());
   }
 
   async detachTab(tabId: number): Promise<void> {
@@ -822,8 +911,8 @@ export class ExtensionServer {
     }
   }
 
-  async openTab(url: string, groupId?: number): Promise<{ tabId: number; url: string }> {
-    const result = await this.sendCommand({ type: 'openTab', url, groupId });
+  async openTab(url: string, groupId?: number, focus = false): Promise<{ tabId: number; url: string }> {
+    const result = await this.sendCommand({ type: 'openTab', url, groupId, focus });
     if (this.socket && this.socket.readyState === WebSocket.OPEN && typeof groupId === 'number' && groupId >= 0) {
       this.tabToGroup.set(result.tabId, groupId);
     }
@@ -862,8 +951,8 @@ export class ExtensionServer {
     return this.extensionId;
   }
 
-  async closeTab(tabId: number): Promise<void> {
-    await this.sendCommand({ type: 'closeTab', tabId });
+  async closeTab(tabId: number, expectedGroupId?: number): Promise<void> {
+    await this.sendCommand({ type: 'closeTab', tabId, expectedGroupId });
     if (this.currentTabId === tabId) {
       this.currentTabId = null;
     }
@@ -878,13 +967,29 @@ export class ExtensionServer {
   }
 
   async detachAll(): Promise<void> {
-    await this.sendCommand({ type: 'detachAll' });
+    // The extension's global detachAll would also detach other sessions.
+    if (this.currentTabId !== null) await this.detachTab(this.currentTabId);
     this.currentTabId = null;
     this.enabledDomains.clear();
   }
 
-  async switchToTab(tabId: number): Promise<void> {
-    await this.sendCommand({ type: 'switchToTab', tabId });
+  async switchToTab(tabId: number, focus = false): Promise<void> {
+    await this.sendCommand({ type: 'switchToTab', tabId, focus });
+  }
+
+  async groupTab(tabId: number, groupId: number): Promise<void> {
+    await this.listTabs();
+    await this.sendCommand({ type: 'groupTab', tabId, groupId });
+    this.tabToGroup.set(tabId, groupId);
+  }
+  async renameGroup(groupId: number, title: string): Promise<void> {
+    await this.sendCommand({ type: 'groupRename', groupId, title });
+  }
+  async restoreTab(tabId: number, original: { groupId?: number; windowId: number; index: number }, expectedGroupId: number): Promise<void> {
+    await this.listTabs();
+    await this.sendCommand({ type: 'restoreTab', tabId, original, groupId: original.groupId, expectedGroupId });
+    if (original.groupId !== undefined && original.groupId >= 0) this.tabToGroup.set(tabId, original.groupId);
+    else this.tabToGroup.delete(tabId);
   }
 
   // ─── Extension target commands ──────────────────────────────────
@@ -953,11 +1058,12 @@ export class ExtensionServer {
 
   async send(method: string, params?: Record<string, any>): Promise<any> {
     if (!this.isExtensionConnected()) {
-      throw new Error(`ExtensionServer: cannot send '${method}' — extension not connected`);
+      throw new OperationError('EXTENSION_DISCONNECTED', `ExtensionServer: cannot send '${method}' — extension not connected`);
     }
     if (this.currentTabId === null) {
-      throw new Error(`ExtensionServer: cannot send '${method}' — no tab attached`);
+      throw new OperationError('TARGET_MISSING', `ExtensionServer: cannot send '${method}' — no tab attached`);
     }
+    pinOperationTarget(this.currentTabId, this.getGeneration());
     const result = await this.sendCommand({
       type: 'command',
       tabId: this.currentTabId,
@@ -987,6 +1093,17 @@ export class ExtensionServer {
     return this.currentTabId;
   }
 
+  getSelectedTabId(): number | null { return this.selectedTabId; }
+  getGeneration(): string { return this.hasLocalExtension() ? this.generation : this.brokerClient?.getBridgeState?.()?.generation ?? this.generation; }
+  isAttachmentCurrent(): boolean { return this.currentTabId !== null && this.attachmentGeneration === this.getGeneration(); }
+  isSelectedBrowserCurrent(): boolean { return !this.selectedBrowserInstanceId || this.selectedBrowserInstanceId === this.getLinkState().browserInstanceId; }
+  getDocumentEpoch(tabId: number): number { return this.tabEpochs.get(tabId) ?? 0; }
+  /** For asynchronous response-body reads: selection changes cannot redirect them. */
+  async sendToTab(tabId: number, generation: string, method: string, params: Record<string, any> = {}): Promise<any> {
+    if (generation !== this.getGeneration()) throw new OperationError('STALE_GENERATION', 'Connection generation changed');
+    return this.sendCommand({ type: 'command', tabId, method, params, generation });
+  }
+
   getEnabledDomains(): string[] {
     return Array.from(this.enabledDomains);
   }
@@ -995,6 +1112,7 @@ export class ExtensionServer {
 
   private setupSocket(socket: WebSocket): void {
     socket.on('message', (data) => {
+      if (socket !== this.socket) return;
       let msg: any;
       try {
         msg = JSON.parse(data.toString());
@@ -1002,22 +1120,25 @@ export class ExtensionServer {
         return;
       }
       if (process.env.YAUTJA_DEBUG) {
-        console.log(`  [WS<-] ${msg.type} ${msg.method || ''} ${msg.tabId != null ? 'tab=' + msg.tabId : ''}`);
+        process.stderr.write(`  [WS<-] ${msg.type} ${msg.method || ''} ${msg.tabId != null ? 'tab=' + msg.tabId : ''}\n`);
       }
       this.handleExtensionMessage(msg);
     });
 
     socket.on('close', () => {
+      // handleNewConnection's close listener may already have cleared socket.
+      if (this.socket && socket !== this.socket) return;
       this.connected = false;
       this.socket = null;
       this.currentTabId = null;
+      this.enabledDomains.clear();
       // Rechazar pendientes: con el socket cerrado ya no llegarán respuestas.
       // Si el cierre lo provocó el watchdog, el error tipado permite fallar rápido.
       for (const [, p] of this.pending) {
         clearTimeout(p.timer);
         p.reject(this.linkDegraded
           ? new ExtensionLinkDegradedError()
-          : new Error('ExtensionServer: connection closed'));
+          : new OperationError('EXTENSION_DISCONNECTED', 'ExtensionServer: connection closed'));
       }
       this.pending.clear();
       this.notifyStatus({ connected: false });
@@ -1039,6 +1160,18 @@ export class ExtensionServer {
         this.handleGqlCapture(msg);
         return;
       case 'hello':
+        if (this.browserInstanceId && msg.browserInstanceId && this.browserInstanceId !== msg.browserInstanceId) {
+          this.sessionGroups.clear();
+          this.tabToGroup.clear();
+          this.sessionAttachments.clear();
+          this.tabEpochs.clear();
+        }
+        this.generation = randomUUID();
+        this.extensionVersion = msg.version ?? null;
+        this.browserInstanceId = msg.browserInstanceId ?? msg.id ?? null;
+        this.socket?.send(JSON.stringify({ type: 'helloAck', generation: this.generation }));
+        this.currentTabId = null;
+        this.enabledDomains.clear();
         this.connected = true;
         this.consecutiveTimeouts = 0;
         if (typeof msg.id === 'string' && msg.id) this.extensionId = msg.id;
@@ -1062,12 +1195,17 @@ export class ExtensionServer {
 
       case 'result':
       case 'error': {
+        if (msg.generation && msg.generation !== this.getGeneration()) break;
         const pending = id ? this.pending.get(id) : undefined;
         if (pending) {
           clearTimeout(pending.timer);
           this.pending.delete(id);
           // Cualquier respuesta (OK o error) demuestra que el SW responde.
           this.consecutiveTimeouts = 0;
+          if (pending.tabId !== undefined && msg.sourceTabId !== undefined && pending.tabId !== msg.sourceTabId) {
+            pending.reject(new OperationError('TARGET_MISMATCH', 'Response came from a different tab'));
+            break;
+          }
           if (type === 'result') {
             pending.resolve(msg.result);
           } else {
@@ -1091,10 +1229,20 @@ export class ExtensionServer {
       }
 
       case 'event': {
+        if (msg.generation && msg.generation !== this.getGeneration()) break;
+        this.routeEventToClients(msg);
+        const owner = this.sessionGroups.get(this.tabToGroup.get(msg.tabId) ?? -1);
+        if (owner && owner.sessionId !== this.brokerSessionId && !this.brokerClient) break;
+        if (msg.method === 'Page.frameNavigated' && !msg.params?.frame?.parentId) {
+          this.tabEpochs.set(msg.tabId, (this.tabEpochs.get(msg.tabId) ?? 0) + 1);
+        }
         const event: ExtensionEvent = {
           tabId: msg.tabId,
           method: msg.method,
           params: msg.params,
+          targetId: msg.targetId,
+          generation: this.getGeneration(),
+          documentEpoch: this.getDocumentEpoch(msg.tabId),
         };
         this.eventBuffer.push(event);
         for (const handler of this.eventHandlers) {
@@ -1103,27 +1251,17 @@ export class ExtensionServer {
           } catch {}
         }
 
-        // Also forward target-based events (extension service workers)
-        if (msg.targetId) {
-          const targetEvent = { ...event, targetId: msg.targetId };
-          for (const handler of this.eventHandlers) {
-            try {
-              handler(targetEvent as ExtensionEvent);
-            } catch {}
-          }
-        }
-
         // Multi-instancia (Tanda B): enrutar el evento solo al dueño del grupo.
-        this.routeEventToClients(msg);
         break;
       }
 
+      case 'detached':
+      case 'tabClosed':
+        if (msg.tabId === this.currentTabId) { this.currentTabId = null; this.enabledDomains.clear(); }
+        break;
       case 'targetAttached':
       case 'targetDetached':
       case 'attached':
-      case 'detached':
-      case 'tabClosed':
-        // Lifecycle notifications — could notify status handlers
         break;
 
       case 'info':
@@ -1138,16 +1276,32 @@ export class ExtensionServer {
   }
 
   /** Estado del enlace extensión↔helmet (para session_summary y diagnóstico). */
-  getLinkState(): { connected: boolean; consecutiveTimeouts: number; linkDegraded: boolean; lastHealthMs: number | null } {
+  getLinkState() {
+    const remote = this.hasLocalExtension() ? null : this.brokerClient?.getBridgeState?.();
     return {
-      connected: this.isExtensionConnected(),
-      consecutiveTimeouts: this.consecutiveTimeouts,
-      linkDegraded: this.linkDegraded,
-      lastHealthMs: this.lastHealthMs,
+      connected: remote?.connected ?? this.isExtensionConnected(),
+      brokerConnected: this.brokerClient ? this.brokerClient.isRegistered() : null,
+      role: this.brokerClient ? 'client' : 'broker',
+      generation: remote?.generation ?? this.generation,
+      extensionVersion: remote?.extensionVersion ?? this.extensionVersion,
+      browserInstanceId: remote?.browserInstanceId ?? this.browserInstanceId,
+      selectedTabId: this.selectedTabId,
+      attachedTabId: this.currentTabId,
+      consecutiveTimeouts: remote?.consecutiveTimeouts ?? this.consecutiveTimeouts,
+      linkDegraded: remote?.linkDegraded ?? this.linkDegraded,
+      lastHealthMs: remote?.lastHealthMs ?? this.lastHealthMs,
     };
   }
 
-  private sendCommand(msg: any, timeoutMs?: number): Promise<any> {
+  private sendCommand(msg: any, timeoutMs?: number, externalSignal?: AbortSignal): Promise<any> {
+    try { assertOperationActive(); } catch (err) { return Promise.reject(err); }
+    const sessionId = msg._sessionId ?? this.brokerSessionId;
+    const signal = externalSignal ?? operationSignal();
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (msg.generation && msg.generation !== this.getGeneration()) return Promise.reject(new OperationError('STALE_GENERATION', 'Connection generation changed'));
+    timeoutMs = remainingOperationMs(timeoutMs ?? this.timeoutFor(msg));
+    msg = { ...msg, generation: this.getGeneration(), sessionId };
+    delete msg._sessionId;
     // Cualquier comando (local o reenviado) cuenta como actividad MCP.
     this.markMcpActivity();
     // Routing transparente (Tanda A): sin extensión local, un CLIENT registrado
@@ -1156,7 +1310,21 @@ export class ExtensionServer {
       if (!this.brokerClient.isRegistered()) {
         return Promise.reject(new BrokerDisconnectedError());
       }
-      return this.brokerClient.sendToBroker(msg, timeoutMs ?? this.timeoutFor(msg) + 5_000);
+      const op = currentOperation();
+      const mutation = ExtensionServer.isMutation(msg);
+      if (op && mutation) op.pendingMutations++;
+      return this.brokerClient.sendToBroker(msg, timeoutMs, signal).then(result => {
+        if (op && mutation) op.pendingMutations--;
+        return result;
+      });
+    }
+    const violation = this.checkClientTabPolicy(sessionId, msg);
+    if (violation) return Promise.reject(violation);
+    if (msg.type === 'tabAccess') return Promise.resolve({ allowed: true });
+    if (msg.type === 'detachAll') return Promise.reject(new OperationError('TARGET_MISMATCH', 'Global detachAll is not allowed; release session attachments individually'));
+    if (msg.type === 'detach') {
+      this.sessionAttachments.get(sessionId)?.delete(msg.tabId);
+      if ([...this.sessionAttachments.values()].some(tabs => tabs.has(msg.tabId))) return Promise.resolve({ detached: false, shared: true });
     }
     return new Promise((resolve, reject) => {
       // Enlace degradado: fallar rápido (la sonda health sí pasa).
@@ -1165,16 +1333,17 @@ export class ExtensionServer {
         return;
       }
       if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-        reject(new Error('ExtensionServer: extension not connected'));
+        reject(new OperationError('EXTENSION_DISCONNECTED', 'ExtensionServer: extension not connected'));
         return;
       }
 
       const id = this.nextId++;
-      const fullMsg = { id, ...msg };
+      const fullMsg = { ...msg, id, deadline: Date.now() + timeoutMs! };
       const timeout = timeoutMs ?? this.timeoutFor(msg);
       const startedAt = Date.now();
 
       const timer = setTimeout(() => {
+        const pending = this.pending.get(id);
         this.pending.delete(id);
         this.consecutiveTimeouts++;
         const label = msg.method ? `${msg.type}:${msg.method}` : String(msg.type);
@@ -1185,22 +1354,53 @@ export class ExtensionServer {
         if (this.consecutiveTimeouts >= DEGRADED_THRESHOLD) {
           this.declareLinkDegraded();
         }
-        reject(new Error(`ExtensionServer: command timed out after ${timeout}ms`));
+        try { this.socket?.send(JSON.stringify({ type: 'cancelCommand', commandId: id, generation: this.generation })); } catch {}
+        pending?.reject(new OperationError('OPERATION_TIMEOUT', `ExtensionServer: command timed out after ${timeout}ms`));
       }, timeout);
 
-      this.pending.set(id, { resolve, reject, timer });
+      const onAbort = () => {
+        clearTimeout(timer); this.pending.delete(id);
+        try { this.socket?.send(JSON.stringify({ type: 'cancelCommand', commandId: id, generation: this.generation })); } catch {}
+        reject(signal?.reason ?? new OperationError('OPERATION_CANCELLED', 'Command cancelled'));
+      };
+      const cleanup = () => signal?.removeEventListener('abort', onAbort);
+      const op = currentOperation();
+      const mutation = ExtensionServer.isMutation(msg);
+      if (op && mutation) op.pendingMutations++;
+      this.pending.set(id, {
+        tabId: msg.tabId,
+        resolve: result => {
+          cleanup();
+          if (op && mutation) op.pendingMutations--;
+          if (msg.type === 'attach') {
+            if (!this.sessionAttachments.has(sessionId)) this.sessionAttachments.set(sessionId, new Set());
+            this.sessionAttachments.get(sessionId)!.add(msg.tabId);
+          }
+          resolve(result);
+        },
+        reject: err => { cleanup(); reject(err); }, timer,
+      });
+      signal?.addEventListener('abort', onAbort, { once: true });
 
       try {
         this.socket.send(JSON.stringify(fullMsg));
       } catch (err) {
         clearTimeout(timer);
         this.pending.delete(id);
+        cleanup();
         reject(new Error(`ExtensionServer: failed to send: ${err}`));
       }
     });
   }
 
   /** Timeout por clase de comando (ver COMMAND_TIMEOUT_MS). */
+  private static isMutation(msg: any): boolean {
+    if (msg.type === 'command' || msg.type === 'commandTarget') {
+      return !/^(DOM\.(get|describe|resolve)|Network\.(get|enable|disable)|Page\.(get|capture|enable|disable)|Runtime\.(enable|disable)|Performance\.(get|enable|disable)|Security\.)/.test(msg.method ?? '');
+    }
+    return !new Set(['listTabs', 'listAllTargets', 'managementGetAll', 'storageGet', 'getCapturedGql', 'webRequestList', 'health', 'ping', 'tabAccess', 'attach', 'detach', 'attachTarget', 'detachTarget']).has(msg.type);
+  }
+
   private timeoutFor(msg: any): number {
     if (msg.type === 'health') return COMMAND_TIMEOUT_MS.health;
     if (msg.type === 'command' || msg.type === 'commandTarget') {
@@ -1248,6 +1448,7 @@ export class ExtensionServer {
           `[Yautja] extension link recovered (health ok, pendingHandlers=${health?.pendingHandlers ?? '?'})${retry}\n`,
         );
         this.lastFailedRetryable = null;
+        this.notifyStatus({ connected: true });
       })
       .catch(() => {
         // SW todavía colgado: seguimos degradados; los próximos timeouts
@@ -1257,11 +1458,19 @@ export class ExtensionServer {
   }
 
   private notifyStatus(status: ExtensionStatus): void {
+    for (const socket of this.clientSockets.values()) {
+      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'bridgeState', state: this.getBrokerBridgeState() }));
+    }
     for (const handler of this.statusHandlers) {
       try {
         handler(status);
       } catch {}
     }
+  }
+
+  private getBrokerBridgeState() {
+    // A client must find the direct owner instead of forwarding through us.
+    return { ...this.getLinkState(), connected: this.hasLocalExtension() };
   }
 
   setNetworkCaptureCallback(cb: (msg: any) => void): void {
@@ -1273,6 +1482,8 @@ export class ExtensionServer {
   }
 
   private handleNetworkCapture(msg: any): void {
+    if (typeof msg.tabId !== 'number' || msg.tabId !== this.currentTabId) return;
+    if (msg.generation && msg.generation !== this.getGeneration()) return;
     if (this.networkCaptureCallback) {
       try { this.networkCaptureCallback(msg); } catch {}
     }

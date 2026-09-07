@@ -8,6 +8,8 @@ coverage/
 .superpowers/sdd/progress.md
 extension.crx
 extension.pem
+extension/config.json
+extension-chrome/config.json
 yautja-woff2.b64
 yautja.ttf
 yautja.woff

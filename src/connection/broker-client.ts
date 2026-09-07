@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import { BrokerDisconnectedError, TabOwnedByOtherSessionError } from './extension-server.js';
+import { OperationError } from './operation-scope.js';
 
 /**
  * BrokerClient — lado CLIENT del protocolo broker↔cliente (Tanda A
@@ -49,6 +50,7 @@ type BrokerEventHandler = (payload: any) => void;
 export class BrokerClient {
   private ws: WebSocket | null = null;
   private registered = false;
+  private bridgeState: { connected: boolean; generation: string; extensionVersion?: string | null; browserInstanceId?: string | null; linkDegraded?: boolean; consecutiveTimeouts?: number; lastHealthMs?: number | null } | null = null;
   private brokerSessionId: string | null = null;
   private nextId = 1;
   private pending: Map<number, PendingBrokerCommand> = new Map();
@@ -62,11 +64,13 @@ export class BrokerClient {
     private readonly port: number,
     private readonly sessionId: string,
     private readonly connectTimeoutMs = 2_000,
+    private readonly bridgeToken?: string,
   ) {}
 
   isRegistered(): boolean {
     return this.registered && this.ws !== null && this.ws.readyState === WebSocket.OPEN;
   }
+  getBridgeState() { return this.bridgeState; }
 
   /** sessionId del broker (del `registered`); null hasta registrarse. */
   getBrokerSessionId(): string | null {
@@ -124,6 +128,7 @@ export class BrokerClient {
           role: 'client',
           sessionId: this.sessionId,
           ...(this.groupId !== null ? { groupId: this.groupId } : {}),
+          ...(this.bridgeToken ? { bridgeToken: this.bridgeToken } : {}),
         }));
       });
       ws.on('message', (data) => {
@@ -145,8 +150,9 @@ export class BrokerClient {
   }
 
   /** Envía un comando al broker y espera su `clientResult`. */
-  sendToBroker(payload: any, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<any> {
+  sendToBroker(payload: any, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS, signal?: AbortSignal): Promise<any> {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) { reject(signal.reason); return; }
       if (!this.isRegistered()) {
         reject(new BrokerDisconnectedError());
         return;
@@ -154,18 +160,28 @@ export class BrokerClient {
       const id = this.nextId++;
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        cleanup();
+        try { this.ws?.send(JSON.stringify({ type: 'clientCancel', id })); } catch {}
         const label = payload?.method ? `${payload.type}:${payload.method}` : String(payload?.type);
         process.stderr.write(`[Yautja] broker command timeout (${label}) after ${timeoutMs}ms\n`);
-        reject(new Error(`BrokerClient: command timed out after ${timeoutMs}ms`));
+        reject(new OperationError('OPERATION_TIMEOUT', `BrokerClient: command timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
-      this.pending.set(id, { resolve, reject, timer });
+      const cleanup = () => signal?.removeEventListener('abort', onAbort);
+      const onAbort = () => {
+        clearTimeout(timer); this.pending.delete(id); cleanup();
+        try { this.ws?.send(JSON.stringify({ type: 'clientCancel', id })); } catch {}
+        reject(signal?.reason);
+      };
+      this.pending.set(id, { resolve: value => { cleanup(); resolve(value); }, reject: err => { cleanup(); reject(err); }, timer });
+      signal?.addEventListener('abort', onAbort, { once: true });
 
       try {
-        this.ws!.send(JSON.stringify({ type: 'clientCommand', sessionId: this.sessionId, id, payload }));
+        this.ws!.send(JSON.stringify({ type: 'clientCommand', sessionId: this.sessionId, id, payload, timeoutMs }));
       } catch (err) {
         clearTimeout(timer);
         this.pending.delete(id);
+        cleanup();
         reject(new Error(`BrokerClient: failed to send: ${err}`));
       }
     });
@@ -188,9 +204,15 @@ export class BrokerClient {
     switch (msg?.type) {
       case 'registered':
         this.registered = true;
+        this.bridgeState = msg.bridgeState ?? null;
         this.brokerSessionId = typeof msg.brokerSessionId === 'string' ? msg.brokerSessionId : null;
         this.startHeartbeat();
         this.notifyStatus(true);
+        break;
+
+      case 'bridgeState':
+        this.bridgeState = msg.state;
+        this.notifyStatus(this.isRegistered());
         break;
 
       case 'clientResult': {
@@ -207,7 +229,7 @@ export class BrokerClient {
             if (msg.error) typed.message = String(msg.error);
             pending.reject(typed);
           } else {
-            pending.reject(new Error(msg.error || 'broker: unknown error'));
+            pending.reject(msg.errorType ? new OperationError(msg.errorType, msg.error || 'broker error') : new Error(msg.error || 'broker: unknown error'));
           }
         }
         break;
@@ -229,6 +251,7 @@ export class BrokerClient {
   private handleClose(): void {
     const wasRegistered = this.registered;
     this.registered = false;
+    if (this.bridgeState) this.bridgeState = { ...this.bridgeState, connected: false };
     this.stopHeartbeat();
     this.ws = null;
     for (const [, p] of this.pending) {

@@ -376,6 +376,27 @@ function assertInvariants(codes: readonly ErrorCodeDef[]): void {
 }
 
 // Module-load invariants (throws on malformed registry; survives frozensharing).
+for (const [code, message] of Object.entries({
+  EXTENSION_DISCONNECTED: 'Browser extension is disconnected.',
+  BROKER_DISCONNECTED: 'Browser broker is disconnected.',
+  EXTENSION_LINK_DEGRADED: 'Browser link is degraded.',
+  TAB_OWNED_BY_OTHER_SESSION: 'Target belongs to another session.',
+  TARGET_MISSING: 'Selected target is missing.',
+  TARGET_MISMATCH: 'Operation target changed.',
+  TARGET_UNVERIFIED: 'Target could not be verified.',
+  STALE_GENERATION: 'Connection generation changed.',
+  OPERATION_TIMEOUT: 'Operation deadline exceeded.',
+  OPERATION_CANCELLED: 'Operation cancelled.',
+  OPERATION_ENDED: 'Operation has ended.',
+  OUTCOME_UNKNOWN: 'A dispatched mutation has an unknown outcome; verify before repeating.',
+})) {
+  MVP_CODES_RAW.push({
+    code: `YJ.RUNTIME.${code}`, introduced_in: '2.0', category: 'action', severity: 'recoverable',
+    retryable: false, default_retry_strategy: 'ABORT', user_confirmation_required: false,
+    default_message_en: message, default_agent_summary_en: message,
+    default_recovery_allowed: [...RECOVERY.abort], default_recovery_recommended: 'ABORT',
+  });
+}
 assertInvariants(MVP_CODES_RAW);
 
 /**

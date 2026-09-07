@@ -34,16 +34,19 @@ vi.mock('../../src/connection/extension-server.js', () => {
     public listTabs = vi.fn(async () => [
       { tabId: 1, url: 'https://example.com', title: 'Example', active: true, index: 0, windowId: 1 },
     ]);
-    public attachTab = vi.fn(async (_tabId: number) => {});
+    private currentTabId = 1;
+    public attachTab = vi.fn(async (tabId: number) => { this.currentTabId = tabId; });
     public detachTab = vi.fn(async (_tabId: number) => {});
     public detachAll = vi.fn(async () => {});
+    public sessionGroupCreate = vi.fn(async (_title: string, _color: string) => ({ groupId: 7, tabId: 99 }));
     public openTab = vi.fn(async (url: string) => ({ tabId: 42, url }));
+    public closeTab = vi.fn(async (_tabId: number) => {});
     public switchToTab = vi.fn(async (_tabId: number) => {});
     public enableDomains = vi.fn(async (_domains: string[]) => {});
     public disableDomains = vi.fn(async (_domains: string[]) => {});
     public onStatusChange = vi.fn(() => () => {});
     public getBufferedEvents = vi.fn(() => []);
-    public getCurrentTabId = vi.fn(() => 1);
+    public getCurrentTabId = vi.fn(() => this.currentTabId);
     public getEnabledDomains = vi.fn(() => []);
     public getPort = vi.fn(() => 9876);
     public send = vi.fn(async (method: string, params?: any) => {
@@ -153,6 +156,27 @@ describe('P10 — doctrine envelope wire (shim 10a)', () => {
     expect(env.context).toHaveProperty('consumed_tokens_estimate');
     expect(env.context).toHaveProperty('available_window_tokens');
   }
+
+  it('connection_status and capabilities remain local when the browser is disconnected', async () => {
+    const server = (helmet as any).server;
+    server.isExtensionConnected.mockReturnValue(false);
+    const status = await callTool(800, 'connection_status', {});
+    expect(status.ok).toBe(true);
+    expect(status.result.link.connected).toBe(false);
+    expect(status.result.build).toMatch(/^[a-f0-9]{16}$/);
+    const capabilities = await callTool(801, 'capabilities', {});
+    expect(capabilities.result.operational.trustedClick).toMatchObject({ supported: true, ready: false });
+    expect(server.send).not.toHaveBeenCalled();
+    expect(server.listTabs).not.toHaveBeenCalled();
+  });
+
+  it('the MCP wire exposes the same envelope as structuredContent and marks failures', async () => {
+    const env = await callTool(802, 'unknown_reliability_tool', {});
+    const wire = JSON.parse(stdoutLines[stdoutLines.length - 1]);
+    expect(wire.result.structuredContent).toEqual(env);
+    expect(wire.result.isError).toBe(true);
+    expect(env.operation.status).toBe('failed');
+  });
 
   it('success path: observe returns native ok:true envelope with text result', async () => {
     const env = await callTool(1, 'observe', { question: 'what is on this page?' });
@@ -466,16 +490,12 @@ describe('P10 — doctrine envelope wire (shim 10a)', () => {
     expect(env.error.message).toContain('Tab not found');
   });
 
-  it('pass-2: switchTab emits YJ.ACT.TAB_SWITCH_MISMATCH on host mismatch (QA P1 coverage gap)', async () => {
-    // Mock the live location.href to a different host than the tab's URL.
-    // The tab registry reads location.href via Runtime.evaluate and
-    // compares against the tab.url's hostname. Returning a hostile URL
-    // from the "page" forces the mismatch branch, which helmet maps
-    // to YJ.ACT.TAB_SWITCH_MISMATCH.
+  it('switchTab emits YJ.ACT.TAB_SWITCH_MISMATCH when the transport target changes', async () => {
     const server = (helmet as any).server;
     const realSend = server.send.getMockImplementation();
     server.send.mockImplementation(async (method: string, params?: any) => {
       if (method === 'Runtime.evaluate' && params?.expression === 'location.href') {
+        server.getCurrentTabId.mockReturnValue(2);
         return { result: { value: 'https://evil.example/phishing' } };
       }
       return realSend ? realSend(method, params) : {};

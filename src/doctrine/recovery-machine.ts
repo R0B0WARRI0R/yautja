@@ -3,7 +3,9 @@ import { failure, success } from './types.js';
 import { toYautjaError, lookupCode } from './registry.js';
 import { RetryEngine, type RetryPolicy } from './retry-engine.js';
 import type { StateIntegrityTracker } from './state-integrity.js';
-import type { IdempotencyRegistry } from './idempotency.js';
+import { IdempotencyConflictError, type IdempotencyRegistry } from './idempotency.js';
+import { createHash } from 'node:crypto';
+import { assertMacroActive } from '../macros/execution-scope.js';
 import { generateOperationId } from './ids.js';
 
 type ExecResult<T> =
@@ -16,6 +18,8 @@ export interface ExecuteOptions<T> {
   policy_key: string;
   trace_id: string;
   idempotency_key?: string | null;
+  /** JSON-compatible effective arguments; hashed, never stored as plaintext. */
+  idempotency_input?: unknown;
   fn: () => Promise<ExecResult<T>>;
   verify?: (result: T) => Promise<boolean>;
   session_id?: string;
@@ -50,19 +54,34 @@ export class RecoveryMachine {
   }
 
   async execute<T>(opts: ExecuteOptions<T>): Promise<YautjaResponse<T>> {
+    assertMacroActive();
     const policy = this.config.policies[opts.policy_key] ?? this.config.policies['default'];
-    const engine = new RetryEngine(policy);
 
     // PREFLIGHT: check contaminated state
     if (this.config.tracker.current() === 'contaminated') {
       return this.makeError('YJ.OPSEC.ANOMALY_RISK_ELEVATED', opts, 1, policy.max_attempts);
     }
 
-    // PREFLIGHT: check idempotency cache
     if (opts.idempotency_key) {
-      const cached = this.config.idempotency.get<T>(opts.idempotency_key);
-      if (cached) return cached;
+      const key = JSON.stringify([opts.session_id ?? this.config.tracker.session_id(), opts.idempotency_key]);
+      const fingerprint = createHash('sha256').update(JSON.stringify({
+        tool: opts.tool, action: opts.action_type, policy: opts.policy_key,
+        tab: opts.tab_id ?? 0, origin: opts.origin ?? '', input: opts.idempotency_input ?? null,
+      }, (_key, value) => value && typeof value === 'object' && !Array.isArray(value)
+        ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) : value)).digest('hex');
+      try {
+        return await this.config.idempotency.run(key, fingerprint, () => this.executeUncached(opts));
+      } catch (err) {
+        if (!(err instanceof IdempotencyConflictError)) throw err;
+        return this.makeError('YJ.PROTOCOL.INVALID_ARGUMENT', opts, 1, policy.max_attempts);
+      }
     }
+    return this.executeUncached(opts);
+  }
+
+  private async executeUncached<T>(opts: ExecuteOptions<T>): Promise<YautjaResponse<T>> {
+    const policy = this.config.policies[opts.policy_key] ?? this.config.policies['default'];
+    const engine = new RetryEngine(policy);
 
     // EXECUTE with retries
     const operation_id = generateOperationId();
@@ -70,6 +89,7 @@ export class RecoveryMachine {
     const started = Date.now();
 
     for (let attempt = 1; attempt <= policy.max_attempts; attempt++) {
+      assertMacroActive();
       this.config.tracker.beginOperation();
 
       const execResult = await opts.fn();
@@ -91,10 +111,6 @@ export class RecoveryMachine {
           state: this.makeState(opts),
           context: this.makeContext(0),
         });
-
-        if (opts.idempotency_key) {
-          this.config.idempotency.set(opts.idempotency_key, response);
-        }
 
         // Telemetry: a success after a prior failed attempt IS a recovery
         if (attempt > 1 && lastErrorCode) {

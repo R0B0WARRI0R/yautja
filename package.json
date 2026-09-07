@@ -5,7 +5,10 @@
   "type": "module",
   "main": "dist/helmet.js",
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/sync-extensions.mjs && tsc",
+    "sync:extensions": "node scripts/sync-extensions.mjs",
+    "check:extensions": "node scripts/sync-extensions.mjs --check",
+    "test:browser-reliability": "npm run build && node scripts/verify-browser-reliability.mjs",
     "test": "vitest",
     "test:unit": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration",
@@ -15,6 +18,7 @@
     "thermal": "tsc && node dist/thermal-monitor.js"
   },
   "dependencies": {
+    "@mecamorph/yautja-adapter": "file:../Mecamorph/packages/yautja-adapter",
     "classic-level": "^3.0.0",
     "http-mitm-proxy": "^1.1.0",
     "playwright": "^1.49.0",

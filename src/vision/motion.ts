@@ -41,6 +41,7 @@ export class MotionSensor extends BaseSensor<PerformanceSummary> {
   private previousHeapUsed: number | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private longTaskCount = 0;
+  private revision = 0;
 
   constructor(transport: Transport, config?: Partial<MotionConfig>) {
     super(transport);
@@ -53,8 +54,11 @@ export class MotionSensor extends BaseSensor<PerformanceSummary> {
   }
 
   private async poll(): Promise<void> {
+    const scope = this.scopeKey();
+    const revision = this.revision;
     try {
       const result = await this.transport.send('Performance.getMetrics');
+      if (scope !== this.scopeKey() || revision !== this.revision) return;
       const metrics = result?.metrics ?? [];
       for (const m of metrics) {
         this.currentMetrics.set(m.name, m.value);
@@ -123,6 +127,7 @@ export class MotionSensor extends BaseSensor<PerformanceSummary> {
   }
 
   clear(): void {
+    this.revision++;
     this.currentMetrics.clear();
     this.previousHeapUsed = null;
     this.longTaskCount = 0;
